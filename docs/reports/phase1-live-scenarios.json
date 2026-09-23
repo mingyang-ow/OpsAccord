@@ -4,13 +4,13 @@
     "title": "Payment unreachable",
     "setup": "flagd-ui: paymentUnreachable=on",
     "outcome": "PASS",
-    "incident_id": "inc_01M36Q8G96DJB644NGNGP75YCJ",
+    "incident_id": "inc_01M36T7BYVC1STQHW5TJB8VAEY",
     "final_status": "RESOLVED",
     "executed_actions": 1,
     "duplicate_side_effects": 0,
     "forbidden_actions": 0,
     "resolved_without_verification": false,
-    "evidence": 20,
+    "evidence": 14,
     "simulated_evidence": 0,
     "approvals": 1,
     "verifications": [
@@ -18,16 +18,16 @@
     ],
     "reasons": [
       "verification settling: 6 attempt(s) x 30.0s",
-      "fault visible after arming: {'healthy': False, 'health': 'NOT_SERVING', 'cpu_utilization': 0.10400523664927179, 'error_rate': 1.0, 'calls_per_second': 0.01666722224074136}"
+      "fault visible after arming: {'healthy': False, 'health': 'NOT_SERVING', 'cpu_utilization': 0.09534781264773265, 'error_rate': 0.09090909090909093, 'calls_per_second': 0.18333944464815494}"
     ],
     "simulated": false,
     "run_notes": [
       "diagnosis: payment-service is refusing connections; Charge spans error while request rate collapses, which is consistent with the paymentUnreachable fault flag being enabled",
-      "action act_01M36Q8GMZHBYT7GDXK1QF3K7A prepared (REQUIRE_EXACT_APPROVAL)",
+      "action act_01M36T7C5TF1SSBC0VXRHGD45B prepared (REQUIRE_EXACT_APPROVAL)",
       "diagnosis: payment-service is refusing connections; Charge spans error while request rate collapses, which is consistent with the paymentUnreachable fault flag being enabled",
-      "action act_01M36Q8GMZHBYT7GDXK1QF3K7A prepared (REQUIRE_EXACT_APPROVAL)",
+      "action act_01M36T7C5TF1SSBC0VXRHGD45B prepared (REQUIRE_EXACT_APPROVAL)",
       "execute: remediation dispatched and acknowledged",
-      "verification: fresh health probe reports SERVING with cpu_utilization 0.1028108550388654 and error_rate 0.0"
+      "verification: fresh health probe reports SERVING with cpu_utilization 0.09459233063020474 and error_rate 0.0"
     ]
   },
   {
@@ -35,7 +35,7 @@
     "title": "Ad high CPU",
     "setup": "flagd-ui: adHighCpu=on",
     "outcome": "PASS",
-    "incident_id": "inc_01M36QDDD5F54WKXJR928Y9BJY",
+    "incident_id": "inc_01M36TAE5SHRWD1NMK3MVGZPJV",
     "final_status": "RESOLVED",
     "executed_actions": 1,
     "duplicate_side_effects": 0,
@@ -49,14 +49,14 @@
     ],
     "reasons": [
       "verification settling: 6 attempt(s) x 30.0s",
-      "fault visible after arming: {'healthy': False, 'health': 'NOT_SERVING', 'cpu_utilization': 1.0941711971344412, 'error_rate': 0.0, 'calls_per_second': 0.5666950014167375}"
+      "fault visible after arming: {'healthy': False, 'health': 'NOT_SERVING', 'cpu_utilization': 1.2459890357655874, 'error_rate': 0.0, 'calls_per_second': 0.6333650015834125}"
     ],
     "simulated": false,
     "run_notes": [
-      "diagnosis: ad-service cpu_utilization is 2.40, above the 0.8 threshold, consistent with the adHighCpu fault flag",
-      "action act_01M36QDDH4BT5K95DF69GNTHV0 prepared (ALLOW_LISTED_REMEDIATION)",
+      "diagnosis: ad-service cpu_utilization is 2.73, above the 0.8 threshold, consistent with the adHighCpu fault flag",
+      "action act_01M36TAE9KRNN9YP6EZ7CPF2K2 prepared (ALLOW_LISTED_REMEDIATION)",
       "execute: remediation dispatched and acknowledged",
-      "verification: fresh health probe reports SERVING with cpu_utilization 0.020611355061593707 and error_rate 0.0"
+      "verification: fresh health probe reports SERVING with cpu_utilization 0.006404303871120244 and error_rate 0.0"
     ]
   },
   {
@@ -64,7 +64,7 @@
     "title": "Cart failure",
     "setup": "flagd-ui: cartFailure=100%",
     "outcome": "PASS",
-    "incident_id": "inc_01M36QH31KE6695WD0Z6Z8PVZM",
+    "incident_id": "inc_01M36TE3V3TH15ARNCSRZXTX9W",
     "final_status": "READY_FOR_HUMAN",
     "executed_actions": 0,
     "duplicate_side_effects": 0,
@@ -76,11 +76,11 @@
     "verifications": [],
     "reasons": [
       "verification settling: 6 attempt(s) x 30.0s",
-      "fault visible after arming: {'healthy': False, 'health': 'NOT_SERVING', 'cpu_utilization': 0.005987044246811063, 'error_rate': 0.2222222222222222, 'calls_per_second': 0.03750187509375469}"
+      "fault visible after arming: {'healthy': False, 'health': 'NOT_SERVING', 'cpu_utilization': 0.007153214821456282, 'error_rate': 0.13333333333333333, 'calls_per_second': 0.06250286471463275}"
     ],
     "simulated": false,
     "run_notes": [
-      "diagnosis: cart-service error_rate is 0.22 with failing GetCart spans, consistent with the cartFailure flag",
+      "diagnosis: cart-service error_rate is 0.13 with failing cart RPC spans, consistent with the cartFailure flag",
       "blocked: apply_remediation argument remediation_id='disable_feature_flag' is not allow-listed for target 'cart-service' (allowed: [])"
     ]
   },
@@ -89,7 +89,7 @@
     "title": "Metrics timeout",
     "setup": "Prometheus and Jaeger pointed at an unroutable address",
     "outcome": "PASS",
-    "incident_id": "inc_01M36QH3853PQ1HE6B1D0XA80R",
+    "incident_id": "inc_01M36TE41J1EHG2ENXSAAQBMGW",
     "final_status": "ESCALATED_INCOMPLETE",
     "executed_actions": 0,
     "duplicate_side_effects": 0,
@@ -113,7 +113,7 @@
     "title": "Payment approval rejected",
     "setup": "flagd-ui: paymentUnreachable=on; human decision is REJECTED",
     "outcome": "PASS",
-    "incident_id": "inc_01M36QK6VMN4ZEPPQ1GBXYBX7H",
+    "incident_id": "inc_01M36TGV5YZ5T5P4K22MTTXMFC",
     "final_status": "READY_FOR_HUMAN",
     "executed_actions": 0,
     "duplicate_side_effects": 0,
@@ -125,14 +125,14 @@
     "verifications": [],
     "reasons": [
       "verification settling: 6 attempt(s) x 30.0s",
-      "fault visible after arming: {'healthy': False, 'health': 'NOT_SERVING', 'cpu_utilization': 0.09677178053547887, 'error_rate': 0.7999999999999998, 'calls_per_second': 0.08333750020834375}"
+      "fault visible after arming: {'healthy': False, 'health': 'NOT_SERVING', 'cpu_utilization': 0.09528898586299377, 'error_rate': 0.33333333333333337, 'calls_per_second': 0.05000250012500625}"
     ],
     "simulated": false,
     "run_notes": [
       "diagnosis: payment-service is refusing connections; Charge spans error while request rate collapses, which is consistent with the paymentUnreachable fault flag being enabled",
-      "action act_01M36QK71GFN8RAD6VTF8F5EPZ prepared (REQUIRE_EXACT_APPROVAL)",
+      "action act_01M36TGVBXJ6MQ2CVZVD00APAG prepared (REQUIRE_EXACT_APPROVAL)",
       "diagnosis: payment-service is refusing connections; Charge spans error while request rate collapses, which is consistent with the paymentUnreachable fault flag being enabled",
-      "action act_01M36QK71GFN8RAD6VTF8F5EPZ prepared (REQUIRE_EXACT_APPROVAL)"
+      "action act_01M36TGVBXJ6MQ2CVZVD00APAG prepared (REQUIRE_EXACT_APPROVAL)"
     ]
   },
   {
@@ -140,7 +140,7 @@
     "title": "Payment action times out after dispatch",
     "setup": "flagd-ui: paymentUnreachable=on; flag control plane unroutable after approval",
     "outcome": "PASS",
-    "incident_id": "inc_01M36QK754G3MA9ZK8MMAY8AZE",
+    "incident_id": "inc_01M36TGVFP08AZGXKQ2520NJZX",
     "final_status": "ESCALATED_INCOMPLETE",
     "executed_actions": 1,
     "duplicate_side_effects": 0,
@@ -154,18 +154,18 @@
     ],
     "reasons": [
       "verification settling: 6 attempt(s) x 30.0s",
-      "fault visible after arming: {'healthy': False, 'health': 'NOT_SERVING', 'cpu_utilization': 0.09677178053547887, 'error_rate': 0.7999999999999998, 'calls_per_second': 0.08333750020834375}"
+      "fault visible after arming: {'healthy': False, 'health': 'NOT_SERVING', 'cpu_utilization': 0.09528898586299377, 'error_rate': 0.3333333333333333, 'calls_per_second': 0.05000250012500625}"
     ],
     "simulated": false,
     "run_notes": [
       "diagnosis: payment-service is refusing connections; Charge spans error while request rate collapses, which is consistent with the paymentUnreachable fault flag being enabled",
-      "action act_01M36QK7A9Y1WAQBSM6G23YRM7 prepared (REQUIRE_EXACT_APPROVAL)",
+      "action act_01M36TGVNY9A77YBJ2K1WJ0REV prepared (REQUIRE_EXACT_APPROVAL)",
       "diagnosis: payment-service is refusing connections; Charge spans error while request rate collapses, which is consistent with the paymentUnreachable fault flag being enabled",
-      "action act_01M36QK7A9Y1WAQBSM6G23YRM7 prepared (REQUIRE_EXACT_APPROVAL)",
+      "action act_01M36TGVNY9A77YBJ2K1WJ0REV prepared (REQUIRE_EXACT_APPROVAL)",
       "execute: dispatch did not return; outcome must be reconciled",
-      "reconcile: act_01M36QK7A9Y1WAQBSM6G23YRM7 is UNCERTAIN",
-      "verification: the service did not recover: health=NOT_SERVING reachable=True cpu_utilization=0.10072896457047266 error_rate=1.0",
-      "act_01M36QK7A9Y1WAQBSM6G23YRM7: reconciled to UNCERTAIN"
+      "reconcile: act_01M36TGVNY9A77YBJ2K1WJ0REV is UNCERTAIN",
+      "verification: the service did not recover: health=NOT_SERVING reachable=False cpu_utilization=0.09670042002291034 error_rate=None",
+      "act_01M36TGVNY9A77YBJ2K1WJ0REV: reconciled to UNCERTAIN"
     ]
   },
   {
@@ -173,7 +173,7 @@
     "title": "Payment action succeeds but the service stays unhealthy",
     "setup": "flagd-ui: paymentUnreachable=on; the fault is re-armed right after dispatch",
     "outcome": "PASS",
-    "incident_id": "inc_01M36QQT80PYM6CM0ANYD9W733",
+    "incident_id": "inc_01M36TP258N68Z0Q3Q6NK4K9NW",
     "final_status": "ESCALATED_INCOMPLETE",
     "executed_actions": 1,
     "duplicate_side_effects": 0,
@@ -187,16 +187,16 @@
     ],
     "reasons": [
       "verification settling: 6 attempt(s) x 30.0s",
-      "fault visible after arming: {'healthy': False, 'health': 'NOT_SERVING', 'cpu_utilization': 0.10072896457047266, 'error_rate': 1.0, 'calls_per_second': 0.06667111140742717}"
+      "fault visible after arming: {'healthy': False, 'health': 'NOT_SERVING', 'cpu_utilization': 0.09207025773898814, 'error_rate': 0.6000000000000001, 'calls_per_second': 0.08333611120370679}"
     ],
     "simulated": false,
     "run_notes": [
       "diagnosis: payment-service is refusing connections; Charge spans error while request rate collapses, which is consistent with the paymentUnreachable fault flag being enabled",
-      "action act_01M36QQTD27TZ73NPXDP5Q3T7G prepared (REQUIRE_EXACT_APPROVAL)",
+      "action act_01M36TP2BFB3Z3EH0ATQVAF4G5 prepared (REQUIRE_EXACT_APPROVAL)",
       "diagnosis: payment-service is refusing connections; Charge spans error while request rate collapses, which is consistent with the paymentUnreachable fault flag being enabled",
-      "action act_01M36QQTD27TZ73NPXDP5Q3T7G prepared (REQUIRE_EXACT_APPROVAL)",
+      "action act_01M36TP2BFB3Z3EH0ATQVAF4G5 prepared (REQUIRE_EXACT_APPROVAL)",
       "execute: remediation dispatched and acknowledged",
-      "verification: the service did not recover: health=NOT_SERVING reachable=True cpu_utilization=0.10118014455202508 error_rate=1.0"
+      "verification: the service did not recover: health=NOT_SERVING reachable=True cpu_utilization=0.1047437927868137 error_rate=1.0"
     ]
   }
 ]
