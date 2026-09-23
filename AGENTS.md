@@ -12,6 +12,7 @@ Read README.md, docs/architecture.md, docs/phase1.md, and docs/evaluation.md bef
 - Keep tokens, credentials, raw provider payloads, local notes, and local runtime configuration out of Git. Log concise decision rationales and structured outcomes, not hidden chain-of-thought.
 - Use mocks for fast tests, and real local integration checks for persistence, telemetry adapters, recovery, and action safety. Clearly identify which evidence is simulated.
 - Add tests that exercise behavior and failure modes. Never weaken a test merely to obtain a passing run.
-- Prepare the requested independent reviewer at the start; perform its review after implementation and before the final report. Never claim review occurred unless it actually ran using the requested model/provider.
-- Report exact branch and commit, commands and results, scenarios, review findings and fixes, limitations, and next decisions using docs/report-template.md.
+- Development tooling is authorized explicitly: the DeepSeek-backed Codex agent is primary, and the authenticated subscription-backed Claude Code harness may be used for bounded implementation help or an optional second review. Record which tool and model actually ran; never claim a review that did not happen. If a tool is unavailable, continue with the others and state the fallback.
+- External review is optional and is never a completion gate. Final review and acceptance happen with the user in their planning conversation, so finish with an honest report and stop. Use READY_FOR_DISCUSSION / PARTIAL / BLOCKED in docs/report-template.md rather than declaring completion.
+- Report exact branch and commit, commands and results, scenarios, findings and fixes, limitations, and next decisions using docs/report-template.md.
 - Do not merge implementation work, publish a release, or change repository visibility without explicit instruction.

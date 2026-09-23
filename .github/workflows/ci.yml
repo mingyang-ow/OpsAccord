@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "phase1/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline:
+    name: Lint, types, and offline tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install dependencies from the lockfile
+        run: uv sync --all-groups --frozen
+      - name: Lint
+        run: uv run ruff check .
+      - name: Formatting
+        run: uv run ruff format --check .
+      - name: Types
+        run: uv run mypy src/opsaccord
+      - name: Offline unit tests
+        run: uv run pytest -m "not integration" -q
+
+  postgres:
+    name: PostgreSQL integration and acceptance
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: opsaccord
+          POSTGRES_PASSWORD: opsaccord
+          POSTGRES_DB: opsaccord_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U opsaccord -d opsaccord_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      # The suite only resets a database whose name ends in _test.
+      OPSACCORD_TEST_DATABASE_URL: postgresql+psycopg://opsaccord:opsaccord@127.0.0.1:5432/opsaccord_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install dependencies from the lockfile
+        run: uv sync --all-groups --frozen
+      - name: Migrations and recovery tests against real PostgreSQL
+        run: uv run pytest -m integration -q
+      - name: Phase 1 acceptance scenarios
+        run: uv run python -m opsaccord.cli run-scenarios --env ci

@@ -8,7 +8,27 @@ version = "0.1.0.dev0"
 description = "Incident response with evidence-backed diagnosis and policy-controlled remediation"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "streamlit>=1.40",
+  "langgraph>=0.2.60",
+  "langgraph-checkpoint-postgres>=2.0.0",
+  "sqlalchemy>=2.0.36",
+  "alembic>=1.14",
+  "psycopg[binary]>=3.2",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  "httpx>=0.27",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+  "ruff>=0.8",
+  "mypy>=1.13",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/opsaccord"]
@@ -16,6 +36,24 @@ packages = ["src/opsaccord"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+packages = ["opsaccord"]
+strict = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
+markers = [
+  "integration: requires a live PostgreSQL server",
+  "live_demo: requires the local Astronomy Shop demo environment",
+]
