@@ -17,7 +17,9 @@ from opsaccord.reasoning.deterministic import DeterministicAdapter
 from opsaccord.reasoning.openai_compatible import OpenAICompatibleAdapter
 from opsaccord.scenarios.fixtures import build_environment_for_scenario
 from opsaccord.scenarios.runner import SCENARIOS
-from opsaccord.tools import demo_environment as demo
+from opsaccord.tools.contracts import Environment
+from opsaccord.tools.demo_environment import DemoEnvironment
+from opsaccord.tools.factory import build_environment
 from opsaccord.tools.gateway import ToolGateway
 from opsaccord.workflow.checkpoints import ensure_checkpoint_schema
 from opsaccord.workflow.controller import WorkflowController
@@ -64,12 +66,12 @@ def create_app(
     *,
     settings: Settings | None = None,
     db: Database | None = None,
-    environment: demo.DemoEnvironment | None = None,
+    environment: Environment | None = None,
     provider: ReasoningProvider | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
     database = db or Database(settings.state_database_url)
-    environment = environment or demo.build_demo_environment()
+    environment = environment or build_environment(settings)
     provider = provider or build_provider(settings)
     gateway = ToolGateway(db=database, environment=environment, settings=settings)
     ensure_checkpoint_schema(settings.checkpoint_url)
@@ -96,7 +98,7 @@ def create_app(
         return {
             "status": "ok",
             "demo_mode": settings.demo_mode,
-            "demo_revision": demo.REVISION,
+            "demo_revision": environment.revision,
             "model_provider": settings.model_provider,
             "model_id": settings.model_id,
             "simulated_demo": environment.is_simulated,
@@ -117,10 +119,15 @@ def create_app(
             spec = SCENARIOS.get(request.scenario_id)
             if spec is None:
                 raise HTTPException(status_code=400, detail="unknown scenario id")
-            app.state.environment.__init__(
-                services=build_environment_for_scenario(spec).services,
-                faults=build_environment_for_scenario(spec).faults,
-            )
+            if not isinstance(app.state.environment, DemoEnvironment):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "built-in scenarios install simulated faults and are unavailable in "
+                        "live mode; inject the fault in the demo stack instead"
+                    ),
+                )
+            app.state.environment.install_from(build_environment_for_scenario(spec))
         try:
             incident_id = controller.create_incident(
                 title=request.title,

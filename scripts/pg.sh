@@ -16,6 +16,7 @@ PG_PORT="${OPSACCORD_PG_PORT:-55432}"
 PG_USER="${OPSACCORD_PG_USER:-opsaccord}"
 PG_DB="${OPSACCORD_PG_DB:-opsaccord}"
 PG_TEST_DB="${OPSACCORD_PG_TEST_DB:-opsaccord_test}"
+PG_SCENARIO_DB="${OPSACCORD_PG_SCENARIO_DB:-opsaccord_scenarios}"
 PG_PKGS="postgresql-18 postgresql-client-18 postgresql-common libpq5 libnuma1 libicu78 liburing2"
 
 export LD_LIBRARY_PATH="$PG_ROOT/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -62,20 +63,30 @@ CONF
   log "initialized cluster at $PG_DATA (port $PG_PORT)"
 }
 
-cmd_start() {
-  [ -x "$PGBIN/pg_ctl" ] || die "run 'provision' first"
-  [ -s "$PG_DATA/PG_VERSION" ] || cmd_init
-  if "$PGBIN/pg_ctl" -D "$PG_DATA" status >/dev/null 2>&1; then log "already running"; return 0; fi
-  mkdir -p "$PG_RUN"
-  "$PGBIN/pg_ctl" -D "$PG_DATA" -l "$PG_HOME/postgres.log" -w -t 30 start
-  "$PGBIN/psql" -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d postgres -v ON_ERROR_STOP=1 -q \
-    -c "SELECT 1" >/dev/null
-  for db in "$PG_DB" "$PG_TEST_DB"; do
+# Three databases, one per environment, so a destructive schema reset in the
+# pytest session can never reach scenario or demo records (see docs/development.md).
+cmd_ensure_dbs() {
+  for db in "$PG_DB" "$PG_SCENARIO_DB" "$PG_TEST_DB"; do
     "$PGBIN/psql" -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d postgres -tAc \
       "SELECT 1 FROM pg_database WHERE datname='$db'" | grep -q 1 \
       || "$PGBIN/createdb" -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" "$db"
   done
-  log "running on 127.0.0.1:$PG_PORT (db: $PG_DB, test db: $PG_TEST_DB)"
+}
+
+cmd_start() {
+  [ -x "$PGBIN/pg_ctl" ] || die "run 'provision' first"
+  [ -s "$PG_DATA/PG_VERSION" ] || cmd_init
+  if "$PGBIN/pg_ctl" -D "$PG_DATA" status >/dev/null 2>&1; then
+    log "already running"
+    cmd_ensure_dbs
+    return 0
+  fi
+  mkdir -p "$PG_RUN"
+  "$PGBIN/pg_ctl" -D "$PG_DATA" -l "$PG_HOME/postgres.log" -w -t 30 start
+  "$PGBIN/psql" -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d postgres -v ON_ERROR_STOP=1 -q \
+    -c "SELECT 1" >/dev/null
+  cmd_ensure_dbs
+  log "running on 127.0.0.1:$PG_PORT (dbs: $PG_DB, $PG_SCENARIO_DB, $PG_TEST_DB)"
 }
 
 cmd_stop() {
@@ -100,6 +111,7 @@ cmd_url() { echo "postgresql+psycopg://$PG_USER@127.0.0.1:$PG_PORT/${1:-$PG_DB}"
 
 case "${1:-}" in
   provision|init|start|stop|status|psql|reset|env) "cmd_$1" "${@:2}" ;;
-  url) cmd_url "${2:-}" ;;
+  ensure-dbs) cmd_ensure_dbs ;;
+  url) case "${2:-dev}" in dev) cmd_url "$PG_DB" ;; test) cmd_url "$PG_TEST_DB" ;; scenario) cmd_url "$PG_SCENARIO_DB" ;; *) cmd_url "$2" ;; esac ;;
   *) die "usage: $0 {provision|init|start|stop|status|psql|reset|env|url} [args]" ;;
 esac

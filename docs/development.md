@@ -31,6 +31,39 @@ uv run python -m opsaccord.cli serve-ui       # http://127.0.0.1:8511
 scripts/run_scenarios.sh                      # all P1 scenarios, JSON evidence in reports/local/
 ```
 
+## Live Astronomy Shop stack
+
+The live paths run against the pinned upstream demo, not a mock. The checkout
+lives outside this repository (for example
+`/mnt/c/Users/admin/opsaccord-demo/opentelemetry-demo` at tag `3.1.0`); point
+`OPSACCORD_DEMO_CHECKOUT` at it if it is somewhere else. All lifecycle commands
+are scoped to this project's containers.
+
+```
+scripts/demo.sh pull        # pull the pinned 3.1.0 images
+scripts/demo.sh start       # core + observability layers, with the local override
+scripts/demo.sh health      # probe every published port and API
+scripts/demo.sh endpoints   # resolve the ephemeral ports into .local/demo-endpoints.env
+scripts/demo.sh status
+scripts/demo.sh logs checkout
+scripts/demo.sh stop
+```
+
+Only `frontend-proxy` (8080) and `prometheus` (9090) are stable host ports; every
+other port is ephemeral, so always load the resolved endpoints before a live
+command:
+
+```
+set -a; . .local/demo-endpoints.env; set +a
+uv run python -m opsaccord.cli run-live-scenarios --json reports/local/live-scenarios.json
+OPSACCORD_LIVE_DEMO=1 uv run pytest -q -m live_demo
+```
+
+`scripts/run_live_scenarios.sh` wraps the whole sequence. Live runs take tens of
+minutes because they wait for real telemetry: see the calibrated windows in
+`docs/astronomy-shop.md`. Live tests are opt-in and skipped unless
+`OPSACCORD_LIVE_DEMO=1`, so the default suite stays offline and fast.
+
 Tests are split by what they need. Unit tests are offline and never touch PostgreSQL; acceptance and integration tests are marked `integration` and require the local cluster (`scripts/pg.sh start`) or a CI service container.
 
 ```

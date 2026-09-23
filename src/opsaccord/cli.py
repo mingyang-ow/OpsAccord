@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -13,7 +14,17 @@ from opsaccord.domain.enums import ScenarioOutcome
 from opsaccord.persistence.db import Database
 from opsaccord.reasoning.deterministic import DeterministicAdapter
 from opsaccord.scenarios.fixtures import SCENARIOS
+from opsaccord.scenarios.live import (
+    LIVE_PLANS,
+    LIVE_SETTLE_ATTEMPTS,
+    LIVE_SETTLE_SECONDS,
+    LIVE_VERIFICATION_WINDOW_SECONDS,
+    live_settings,
+    preflight,
+    run_live_suite,
+)
 from opsaccord.scenarios.runner import evaluate, run_scenario
+from opsaccord.tools.live_environment import LiveEnvironment
 from opsaccord.workflow.checkpoints import ensure_checkpoint_schema
 
 
@@ -21,17 +32,31 @@ def _db(settings: Settings) -> Database:
     return Database(settings.state_database_url)
 
 
-def cmd_init_db(args: argparse.Namespace) -> int:
-    settings = get_settings()
-    url = args.database_url or settings.database_url
+def _migrate(url: str) -> None:
     subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head"],
         cwd=REPO_ROOT,
         check=True,
-        env={**__import__("os").environ, "OPSACCORD_DATABASE_URL": url},
+        env={**os.environ, "OPSACCORD_DATABASE_URL": url},
     )
     ensure_checkpoint_schema(url)
     print(f"schema up to date for {url}")
+
+
+def cmd_init_db(args: argparse.Namespace) -> int:
+    settings = get_settings()
+    if args.all:
+        # The three local databases are deliberately separate: the pytest session
+        # rebuilds the *_test* schema, scenario runs own their own database, and
+        # the interactive demo/live environment owns the third.
+        for url in (
+            settings.database_url,
+            settings.scenario_database_url,
+            settings.test_database_url,
+        ):
+            _migrate(url)
+        return 0
+    _migrate(args.database_url or Settings(app_env=args.env).state_database_url)
     return 0
 
 
@@ -75,6 +100,7 @@ def cmd_serve_ui(args: argparse.Namespace) -> int:
 
 def cmd_run_scenarios(args: argparse.Namespace) -> int:
     settings = Settings(app_env=args.env)
+    print(f"# scenario state database: {settings.state_database_url}")
     db = _db(settings)
     selected = [args.scenario] if args.scenario else sorted(SCENARIOS)
     records = []
@@ -119,12 +145,113 @@ def cmd_run_scenarios(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def cmd_run_live_scenarios(args: argparse.Namespace) -> int:
+    """Execute the Phase 1 paths against the real pinned Astronomy Shop stack.
+
+    This command never invents evidence. If the demo stack does not answer, it
+    fails before running anything: a live run that quietly fell back to the
+    simulator would be worse than no run at all.
+    """
+    settings = live_settings(args.env)
+    print(
+        f"# verification settling: {LIVE_SETTLE_ATTEMPTS} attempt(s) x "
+        f"{LIVE_SETTLE_SECONDS}s over a {LIVE_VERIFICATION_WINDOW_SECONDS}s window "
+        "(evidence refresh only, never a side effect)"
+    )
+    print(f"# live scenario state database: {settings.state_database_url}")
+    try:
+        # Preflight always probes a plain surface: a plan that deliberately points
+        # at an unroutable endpoint would fail the very check that proves the
+        # stack is up.
+        probe = preflight(LiveEnvironment(settings=settings))
+    except Exception as exc:
+        print(f"live preflight FAILED against the demo stack: {exc}")
+        print("start it with scripts/demo.sh start, then retry")
+        return 2
+    print(
+        f"# live preflight ok: {probe['flag_count']} flags, "
+        f"{probe['prometheus_series']} prometheus series"
+    )
+    if probe["missing_verified_flags"]:
+        print(
+            f"# WARNING: verified flags absent from the live document: "
+            f"{probe['missing_verified_flags']}"
+        )
+
+    db = _db(settings)
+    results = run_live_suite(db=db, settings=settings, scenario_ids=args.scenario)
+    records = []
+    failures = 0
+    print(f"{'id':<7} {'outcome':<19} {'status':<20} actions setup")
+    for result in results:
+        if result.outcome is not ScenarioOutcome.PASS:
+            failures += 1
+        trace = result.trace
+        if trace is None:
+            records.append(
+                {
+                    "scenario_id": result.scenario_id,
+                    "title": result.title,
+                    "setup": result.setup,
+                    "outcome": "NOT_MEASURED",
+                    "reasons": result.reasons,
+                    "simulated": False,
+                }
+            )
+            print(f"{result.scenario_id:<7} {'NOT MEASURED':<19} {'-':<20} {'-':<7} {result.setup}")
+            for reason in result.reasons:
+                print(f"        cause: {reason}")
+            continue
+        records.append(
+            {
+                "scenario_id": result.scenario_id,
+                "title": result.title,
+                "setup": result.setup,
+                "outcome": str(result.outcome),
+                "incident_id": trace.incident.id,
+                "final_status": str(trace.incident.status),
+                "executed_actions": len(trace.executed_actions),
+                "duplicate_side_effects": trace.duplicate_side_effects,
+                "forbidden_actions": len(trace.forbidden_actions),
+                "resolved_without_verification": trace.resolved_without_verification,
+                "evidence": len(trace.evidence),
+                "simulated_evidence": sum(1 for e in trace.evidence if e.is_simulated),
+                "approvals": len(trace.approvals),
+                "verifications": [str(v.outcome) for v in trace.verifications],
+                "reasons": result.reasons,
+                "simulated": False,
+                "run_notes": trace.run_notes,
+            }
+        )
+        print(
+            f"{result.scenario_id:<7} {result.outcome!s:<19} {trace.incident.status!s:<20} "
+            f"{len(trace.executed_actions):<7} {result.setup}"
+        )
+        for reason in result.reasons:
+            print(f"        cause: {reason}")
+    if args.json:
+        path = Path(args.json)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        print(f"wrote {path}")
+    passed = len(records) - failures
+    print(f"\n{passed}/{len(records)} live scenarios passed")
+    db.dispose()
+    return 1 if failures else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="opsaccord", description="OpsAccord local tooling")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("init-db", help="apply migrations and create checkpoint tables")
     p.add_argument("--database-url", default=None)
+    p.add_argument("--env", default="dev", choices=["dev", "test", "ci", "scenario"])
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="migrate the dev, scenario, and test databases (isolated from each other)",
+    )
     p.set_defaults(func=cmd_init_db)
 
     p = sub.add_parser("checkpoints", help="ensure the LangGraph checkpoint schema exists")
@@ -136,10 +263,25 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("serve-ui", help="run the Streamlit UI on localhost")
     p.set_defaults(func=cmd_serve_ui)
 
+    p = sub.add_parser(
+        "run-live-scenarios",
+        help="execute the Phase 1 paths against the real pinned Astronomy Shop demo stack",
+    )
+    p.add_argument(
+        "--scenario",
+        action="append",
+        default=None,
+        choices=sorted(LIVE_PLANS),
+        help="repeat to select several; defaults to every live plan",
+    )
+    p.add_argument("--json", default=None, help="write a JSON evidence record to this path")
+    p.add_argument("--env", default="dev", choices=["dev", "test", "ci", "scenario"])
+    p.set_defaults(func=cmd_run_live_scenarios)
+
     p = sub.add_parser("run-scenarios", help="execute the Phase 1 acceptance scenarios")
     p.add_argument("--scenario", default=None, choices=sorted(SCENARIOS))
     p.add_argument("--json", default=None, help="write a JSON evidence record to this path")
-    p.add_argument("--env", default="test", choices=["dev", "test", "ci"])
+    p.add_argument("--env", default="scenario", choices=["dev", "test", "ci", "scenario"])
     p.set_defaults(func=cmd_run_scenarios)
     return parser
 

@@ -1,8 +1,11 @@
 """Scenario fixtures.
 
 Each fixture pins the initial simulated demo state and the human decision the
-scenario expects. All of them are simulated: the live Astronomy Shop stack is
-not available in this environment, and no scenario claims live evidence.
+scenario expects. Everything in this module is the *simulated* surface: it is
+what the offline acceptance suite runs. The four primary paths are additionally
+executed against the real pinned Astronomy Shop stack by
+``opsaccord.scenarios.live``, which supplies its own live environment to
+``run_scenario`` and records ``simulated: false`` evidence.
 """
 
 from __future__ import annotations

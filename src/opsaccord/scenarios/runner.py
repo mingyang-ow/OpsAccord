@@ -25,6 +25,7 @@ from opsaccord.persistence.db import Database
 from opsaccord.reasoning.base import ReasoningProvider
 from opsaccord.reasoning.deterministic import DeterministicAdapter
 from opsaccord.scenarios.fixtures import SCENARIOS, ScenarioSpec, build_environment_for_scenario
+from opsaccord.tools.contracts import Environment
 from opsaccord.tools.gateway import ToolGateway
 from opsaccord.workflow.controller import WorkflowController
 
@@ -138,9 +139,17 @@ def run_scenario(
     provider: ReasoningProvider | None = None,
     approve: bool | None = None,
     approver: str = "scenario-operator",
+    environment: Environment | None = None,
 ) -> ScenarioTrace:
-    """Execute one scenario end to end and return the persisted trace."""
-    environment = build_environment_for_scenario(spec)
+    """Execute one scenario end to end and return the persisted trace.
+
+    ``environment`` lets the caller drive the graph with a real execution surface
+    instead of the in-process simulator. Nothing else changes: the controller,
+    policy engine, gateway, and scoring are the same code in both cases, so a live
+    run is labelled by its evidence (``ToolResult.is_simulated``) and not by a
+    parallel implementation.
+    """
+    environment = environment if environment is not None else build_environment_for_scenario(spec)
     gateway = ToolGateway(db=db, environment=environment, settings=settings)
     controller = WorkflowController(
         db=db, gateway=gateway, provider=provider or DeterministicAdapter(), settings=settings

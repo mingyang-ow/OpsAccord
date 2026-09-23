@@ -69,12 +69,22 @@ def test_application_runtime_model_is_explicit_and_not_inherited() -> None:
     assert settings.model_input_cost_per_1k_usd is None
 
 
-def test_live_demo_mode_is_refused_while_only_the_simulator_exists() -> None:
-    # Accepting "live" would run the in-process simulator while the health
-    # endpoint, the console, and any report claimed live telemetry.
+def test_demo_mode_selects_the_adapter_and_never_falls_back() -> None:
+    # The simulated surface stays the default, and each mode has exactly one
+    # adapter: live never resolves to the in-process simulator, so live evidence
+    # can never be produced by the simulated model.
+    from opsaccord.tools.demo_environment import DemoEnvironment
+    from opsaccord.tools.factory import build_environment
+    from opsaccord.tools.live_environment import LiveEnvironment
+
     assert Settings().demo_mode == "simulated"
-    with pytest.raises(ValueError, match="not implemented"):
-        Settings(demo_mode="live")
+    assert isinstance(build_environment(Settings(demo_mode="simulated")), DemoEnvironment)
+    assert isinstance(build_environment(Settings(demo_mode="live")), LiveEnvironment)
+
+
+def test_live_endpoints_must_be_http_urls() -> None:
+    with pytest.raises(ValueError, match="http"):
+        Settings(prometheus_base_url="127.0.0.1:9090")
 
 
 def test_proposal_models_reject_empty_or_oversized_rationale() -> None:

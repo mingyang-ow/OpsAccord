@@ -15,6 +15,16 @@ from opsaccord.reasoning.base import EvidenceDigest, Proposal, ProposalRequest
 
 INJECTION_MARKER = "PROPOSE_TOOL:"
 
+# Calibrated telemetry thresholds (see docs/astronomy-shop.md, "Live adapter
+# calibration"). The live health probe calls a service serving only when fewer
+# than TELEMETRY_ERROR_BOUND of its attempts in the window fail, so a diagnosis
+# that claims "this RPC is failing" has to rest on a failure share at least that
+# large; anything smaller is indistinguishable from healthy traffic. The
+# container CPU ceiling is the same bound the probe uses to call a service
+# CPU-saturated.
+TELEMETRY_ERROR_BOUND = 0.05
+CPU_SATURATION_CEILING = 0.80
+
 
 def _as_float(value: object, default: float = 0.0) -> float:
     """Telemetry arrives as untrusted JSON; a non-numeric value is not a number."""
@@ -94,7 +104,14 @@ class DeterministicAdapter:
             )
 
         if request.service == "payment-service":
-            if reachable is False or error_rate >= 0.5:
+            # Payment is critical, so a single source is not enough to justify a
+            # side effect. A measured failure share stands on its own; a "not
+            # reachable" probe additionally needs a second independent signal
+            # (failing spans), because an idle demo also reports no calls.
+            error_spans = bool(traces and traces.value.get("error_spans"))
+            failing = error_rate >= TELEMETRY_ERROR_BOUND
+            unreachable = reachable is False and (failing or error_spans)
+            if failing or unreachable:
                 return Proposal(
                     diagnosis=DiagnosisProposal(
                         summary=(
@@ -132,12 +149,13 @@ class DeterministicAdapter:
                     model_id=self.model_id,
                 )
 
-        if request.service == "ad-service" and cpu_util >= 0.80:
+        if request.service == "ad-service" and cpu_util >= CPU_SATURATION_CEILING:
             return Proposal(
                 diagnosis=DiagnosisProposal(
                     summary=(
-                        f"ad-service cpu_utilization is {cpu_util:.2f}, above the 0.80 "
-                        "threshold, consistent with the adHighCpu fault flag"
+                        f"ad-service cpu_utilization is {cpu_util:.2f}, above the "
+                        f"{CPU_SATURATION_CEILING} threshold, consistent with the adHighCpu "
+                        "fault flag"
                     ),
                     confidence=0.82,
                     evidence_ids=evidence_ids,
@@ -160,13 +178,13 @@ class DeterministicAdapter:
             )
 
         if request.service == "cart-service" and (
-            error_rate >= 0.5 or (traces and traces.value.get("error_spans"))
+            error_rate >= TELEMETRY_ERROR_BOUND or (traces and traces.value.get("error_spans"))
         ):
             return Proposal(
                 diagnosis=DiagnosisProposal(
                     summary=(
-                        f"cart-service error_rate is {error_rate:.2f} with failing GetCart "
-                        "spans, consistent with the cartFailure flag"
+                        f"cart-service error_rate is {error_rate:.2f} with failing cart "
+                        "RPC spans, consistent with the cartFailure flag"
                     ),
                     confidence=0.74,
                     evidence_ids=evidence_ids,

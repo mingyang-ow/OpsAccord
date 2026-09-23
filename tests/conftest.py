@@ -4,9 +4,13 @@ Offline unit tests never touch PostgreSQL. Acceptance and integration tests are
 marked ``integration`` and require a real PostgreSQL server: use the
 project-local cluster (``scripts/pg.sh start``) or a CI service container.
 
-Every integration test truncates the schema first, so each test observes only
-the rows it created. Nothing here substitutes in-memory state for PostgreSQL:
-the persistence and recovery evidence is produced against the real engine.
+The session rebuilds the *dedicated test database* and every integration test
+truncates it first, so each test observes only the rows it created. Two guards
+from ``support.isolation`` keep that destructive setup contained: the
+reset refuses any database that is not the ``*_test`` one, and a session-scoped
+advisory lock makes a concurrent second run fail loudly. Nothing here
+substitutes in-memory state for PostgreSQL: the persistence and recovery
+evidence is produced against the real engine.
 """
 
 from __future__ import annotations
@@ -26,6 +30,12 @@ from opsaccord.tools import demo_environment as demo
 from opsaccord.tools.gateway import ToolGateway
 from opsaccord.workflow.checkpoints import ensure_checkpoint_schema
 from opsaccord.workflow.controller import WorkflowController
+from support.isolation import (
+    assert_checkpoints_are_local,
+    assert_dedicated_test_database,
+    dedicated_test_session,
+    reset_public_schema,
+)
 
 DEFAULT_TEST_DATABASE_URL = "postgresql+psycopg://opsaccord@127.0.0.1:55432/opsaccord_test"
 
@@ -39,41 +49,34 @@ def settings() -> Settings:
 
 
 @pytest.fixture(scope="session")
-def migrated(settings: Settings) -> str:
+def migrated(settings: Settings) -> Iterator[str]:
     """Rebuild the dedicated test schema, then migrate it once per session.
 
     Integration evidence has to start from a schema the migrations actually
     produced, so an earlier failed run cannot leave the tables present with an
     empty ``alembic_version``. The reset is refused unless the URL names the
-    dedicated ``*_test`` database.
+    dedicated ``*_test`` database, and the session lock means a second
+    concurrent run cannot truncate the schema underneath this one. LangGraph
+    checkpoints are written to the same database, never into demo state.
     """
-    url = settings.test_database_url
-    if not url.rsplit("/", 1)[-1].split("?")[0].endswith("_test"):
-        raise RuntimeError(
-            f"refusing to reset {url!r}: the test suite only resets a *_test database"
+    url = assert_dedicated_test_database(settings.test_database_url)
+    assert_checkpoints_are_local(settings)
+    with dedicated_test_session(url):
+        reset_public_schema(url)
+        result = subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "OPSACCORD_DATABASE_URL": url},
         )
-    engine = sa.create_engine(url, isolation_level="AUTOCOMMIT")
-    try:
-        with engine.connect() as connection:
-            connection.execute(sa.text("DROP SCHEMA IF EXISTS public CASCADE"))
-            connection.execute(sa.text("CREATE SCHEMA public"))
-    finally:
-        engine.dispose()
-
-    result = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        env={**os.environ, "OPSACCORD_DATABASE_URL": settings.test_database_url},
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            "alembic upgrade head failed for the test database\n"
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-        )
-    ensure_checkpoint_schema(settings.checkpoint_url)
-    return settings.test_database_url
+        if result.returncode != 0:
+            raise RuntimeError(
+                "alembic upgrade head failed for the test database\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+        ensure_checkpoint_schema(settings.checkpoint_url)
+        yield url
 
 
 @pytest.fixture

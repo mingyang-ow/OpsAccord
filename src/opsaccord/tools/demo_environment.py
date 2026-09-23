@@ -18,17 +18,10 @@ from datetime import UTC, datetime
 
 from opsaccord.domain.enums import ActionOutcome, SideEffect
 from opsaccord.domain.models import ToolResult
+from opsaccord.tools.contracts import DispatchTimeout, ReadTimeout
 
 REVISION = "3.1.0"
 REVISION_SOURCE = "https://github.com/open-telemetry/opentelemetry-demo"
-
-
-class ReadTimeout(RuntimeError):
-    """The read path did not answer inside its budget."""
-
-
-class DispatchTimeout(RuntimeError):
-    """The side effect was dispatched but the outcome was not observed."""
 
 
 @dataclass
@@ -82,6 +75,8 @@ class DemoEnvironment:
     """The simulated isolated demo environment."""
 
     is_simulated = True
+    revision = REVISION
+    revision_source = REVISION_SOURCE
 
     def __init__(
         self,
@@ -106,6 +101,17 @@ class DemoEnvironment:
     def _bump(self, key: str) -> int:
         self.call_counts[key] = self.call_counts.get(key, 0) + 1
         return self.call_counts[key]
+
+    def install_from(self, other: DemoEnvironment) -> None:
+        """Adopt another simulated environment state in place.
+
+        The API hands one environment instance to the gateway, so installing a
+        built-in scenario has to mutate that instance rather than replace it.
+        Only the simulated surface supports this: a live stack fault is injected
+        in the stack itself, never by rewriting adapter state.
+        """
+        self.services = other.services
+        self.faults = other.faults
 
     @staticmethod
     def _now() -> datetime:

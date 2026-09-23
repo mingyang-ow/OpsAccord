@@ -30,6 +30,7 @@ TRACE_OPERATIONS = (
     "GetCart",
     "GetAds",
     "PlaceOrder",
+    "EmptyCart",
     "Health",
 )
 

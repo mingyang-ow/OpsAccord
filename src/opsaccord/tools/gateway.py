@@ -46,7 +46,7 @@ from opsaccord.ids import utcnow
 from opsaccord.persistence import repositories as repo
 from opsaccord.persistence.db import Database
 from opsaccord.policy import engine as policy_engine
-from opsaccord.tools import demo_environment as demo
+from opsaccord.tools.contracts import DispatchTimeout, Environment, ReadTimeout
 from opsaccord.tools.registry import ToolRegistry
 
 _EVIDENCE_KIND = {
@@ -91,7 +91,7 @@ class ToolGateway:
         self,
         *,
         db: Database,
-        environment: demo.DemoEnvironment,
+        environment: Environment,
         registry: ToolRegistry | None = None,
         settings: Settings,
     ) -> None:
@@ -99,6 +99,9 @@ class ToolGateway:
         self.environment = environment
         self.registry = registry or ToolRegistry.default()
         self.settings = settings
+        # Provenance is stamped from the adapter that produced the result, so a live
+        # run can never be persisted as simulated evidence, or the reverse.
+        self.is_simulated = bool(environment.is_simulated)
 
     # --- read path --------------------------------------------------------
 
@@ -161,7 +164,7 @@ class ToolGateway:
             try:
                 result = self._invoke_read(spec.name, arguments, spec.timeout_seconds)
                 break
-            except demo.ReadTimeout as exc:
+            except ReadTimeout as exc:
                 last_error = str(exc)
             except Exception as exc:  # adapter faults are evidence, not crashes
                 last_error = f"{type(exc).__name__}: {exc}"
@@ -175,7 +178,7 @@ class ToolGateway:
                 succeeded=False,
                 error=last_error or "read did not complete inside its budget",
                 attempts=attempts,
-                is_simulated=True,
+                is_simulated=self.is_simulated,
                 collected_at=finished,
             )
         else:
@@ -196,7 +199,7 @@ class ToolGateway:
                 error=result.error,
                 started_at=started,
                 finished_at=finished,
-                is_simulated=True,
+                is_simulated=self.is_simulated,
             )
             kind = (
                 _EVIDENCE_KIND.get(spec.name, EvidenceKind.LOG)
@@ -221,7 +224,7 @@ class ToolGateway:
                 observation_window_start=result.observation_window_start,
                 observation_window_end=result.observation_window_end,
                 tool_call_id=tool_call.id,
-                is_simulated=True,
+                is_simulated=self.is_simulated,
                 collected_at=result.collected_at,
             )
         return ReadOutcome(result=result, evidence_id=evidence.id)
@@ -367,7 +370,7 @@ class ToolGateway:
             else:
                 status, outcome = ActionStatus.FAILED, ActionOutcome.CONFIRMED_NOT_APPLIED
                 error = tool_result.error
-        except demo.DispatchTimeout as exc:
+        except DispatchTimeout as exc:
             # Dispatched, outcome unknown. Never retry; reconcile instead.
             status, outcome, error = ActionStatus.UNCERTAIN, ActionOutcome.UNKNOWN, str(exc)
         except Exception as exc:
@@ -390,7 +393,7 @@ class ToolGateway:
                 error=error,
                 started_at=started,
                 finished_at=finished,
-                is_simulated=True,
+                is_simulated=self.is_simulated,
             )
             # Dispatching and recording an already-approved action is safety
             # critical: it may exceed the soft investigation budget, never the cap.
@@ -478,16 +481,15 @@ class ToolGateway:
 
     # --- verification -----------------------------------------------------
 
-    def verify_service(
+    def _collect_verification_evidence(
         self,
         *,
         incident_id: str,
         workflow_id: str,
         target: str,
-        action_id: str | None,
         action_completed_at: datetime | None,
-    ) -> VerificationResult:
-        """Require fresh, service-specific evidence before RESOLVED."""
+    ) -> tuple[list[str], bool, str | None, ReadOutcome | None, bool]:
+        """One round of fresh, service-specific verification reads."""
         evidence_ids: list[str] = []
         collected_after_action = False
         blocked: str | None = None
@@ -524,7 +526,7 @@ class ToolGateway:
                             arguments={
                                 "target": target,
                                 "metric": metric,
-                                "window_seconds": 300,
+                                "window_seconds": self.settings.verification_window_seconds,
                             },
                             target=target,
                             budget_class="verification",
@@ -536,6 +538,64 @@ class ToolGateway:
                     metrics_ok = metrics_ok and outcome.result.succeeded
             else:
                 metrics_ok = False
+
+        return evidence_ids, collected_after_action, blocked, health, metrics_ok
+
+    def verify_service(
+        self,
+        *,
+        incident_id: str,
+        workflow_id: str,
+        target: str,
+        action_id: str | None,
+        action_completed_at: datetime | None,
+    ) -> VerificationResult:
+        """Require fresh, service-specific evidence before RESOLVED.
+
+        Real telemetry needs a convergence window. A PromQL rate() over a fixed
+        lookback still contains the fault for as long as the lookback spans it, so
+        a probe taken the instant after a fix can legitimately still report the
+        service as unhealthy -- and treating that as a failed recovery would be
+        just as wrong as calling it resolved. ``verification_settle_attempts`` and
+        ``verification_settle_seconds`` re-collect fresh evidence a bounded number
+        of times before the verdict is recorded; the default is one attempt and no
+        delay, which is exactly the previous behaviour.
+
+        This refreshes *evidence* only. It never dispatches, claims, or retries a
+        side effect, so a bounded settle cannot become a repeat of the action.
+        """
+        attempts = max(1, self.settings.verification_settle_attempts)
+        settle_seconds = max(0.0, self.settings.verification_settle_seconds)
+        evidence_ids: list[str] = []
+        collected_after_action = False
+        blocked: str | None = None
+        health: ReadOutcome | None = None
+        metrics_ok = True
+
+        for attempt in range(attempts):
+            if attempt and settle_seconds:
+                time.sleep(settle_seconds)
+            (
+                evidence_ids,
+                collected_after_action,
+                blocked,
+                health,
+                metrics_ok,
+            ) = self._collect_verification_evidence(
+                incident_id=incident_id,
+                workflow_id=workflow_id,
+                target=target,
+                action_completed_at=action_completed_at,
+            )
+            if blocked is not None:
+                break
+            if (
+                health is not None
+                and health.result.succeeded
+                and metrics_ok
+                and bool(health.result.value.get("healthy"))
+            ):
+                break
 
         if blocked is not None:
             result = VerificationResult(

@@ -378,4 +378,19 @@ def main() -> None:
         st.error(str(exc))
 
 
-main()
+def _in_streamlit_runtime() -> bool:
+    """True only when Streamlit is actually running this script.
+
+    The guard keeps the module importable for tooling and tests: without it,
+    importing the console would perform real HTTP calls and render outside a
+    Streamlit runtime.
+    """
+    try:
+        from streamlit.runtime import exists as runtime_exists
+    except ImportError:  # pragma: no cover - streamlit is a hard dependency
+        return False
+    return bool(runtime_exists())
+
+
+if _in_streamlit_runtime():
+    main()

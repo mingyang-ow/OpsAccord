@@ -46,6 +46,7 @@ def test_unreachable_payment_proposes_the_verified_flag_under_approval() -> None
             [
                 evidence("read_service_health", "HEALTH", {"reachable": False, "healthy": False}),
                 evidence("read_metrics", "METRIC", {"value": 1.0, "metric": "error_rate"}),
+                evidence("read_traces", "TRACE", {"spans": [], "error_spans": 1}),
             ],
         )
     )
@@ -54,6 +55,64 @@ def test_unreachable_payment_proposes_the_verified_flag_under_approval() -> None
     assert action.target == "payment-service"
     assert action.arguments["flag_id"] == "paymentUnreachable"
     assert proposal.diagnosis.escalate is False
+
+
+def test_lone_unreachable_probe_is_not_enough_for_a_critical_service() -> None:
+    """An idle window also reports no calls, so payment needs a second signal.
+
+    This is the live-calibration lesson: the demo's load generator is bursty, and
+    "no Charge attempts in the window" happens while the service is perfectly
+    healthy. Without corroboration the adapter must escalate instead of naming a
+    cause -- and must never propose a side effect on that basis.
+    """
+    proposal = DeterministicAdapter().propose(
+        request_for(
+            "payment-service",
+            [evidence("read_service_health", "HEALTH", {"reachable": False, "healthy": False})],
+        )
+    )
+    assert proposal.diagnosis.proposed_action is None
+    assert proposal.diagnosis.escalate is True
+
+
+def test_measured_payment_failure_share_alone_is_actionable() -> None:
+    """A real failing-RPC share is the live signature of paymentUnreachable.
+
+    The pinned stack shows roughly a third of live Charge attempts failing under
+    the flag, so the diagnosis has to act on a measured share at the probe's own
+    error bound rather than on an arbitrary higher threshold.
+    """
+    proposal = DeterministicAdapter().propose(
+        request_for(
+            "payment-service",
+            [
+                evidence(
+                    "read_service_health",
+                    "HEALTH",
+                    {"reachable": True, "healthy": False, "error_rate": 0.33},
+                ),
+            ],
+        )
+    )
+    action = proposal.diagnosis.proposed_action
+    assert action is not None
+    assert action.arguments["flag_id"] == "paymentUnreachable"
+
+
+def test_healthy_payment_with_low_error_share_is_not_actionable() -> None:
+    proposal = DeterministicAdapter().propose(
+        request_for(
+            "payment-service",
+            [
+                evidence(
+                    "read_service_health",
+                    "HEALTH",
+                    {"reachable": True, "healthy": True, "error_rate": 0.01},
+                ),
+            ],
+        )
+    )
+    assert proposal.diagnosis.proposed_action is None
 
 
 def test_high_ad_cpu_proposes_the_allow_listed_flag() -> None:

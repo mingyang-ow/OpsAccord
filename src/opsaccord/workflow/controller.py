@@ -66,11 +66,14 @@ READ_PLAN: dict[str, tuple[dict[str, Any], ...]] = {
     "ad-service": (
         {"tool_name": "read_service_health", "arguments": {"target": "ad-service"}},
         {
+            # Container CPU metrics are exported on a fast cadence, so a short
+            # window answers "is it burning now". A five-minute average would
+            # dilute a burn that started a minute ago and read as healthy.
             "tool_name": "read_metrics",
             "arguments": {
                 "target": "ad-service",
                 "metric": "cpu_utilization",
-                "window_seconds": 300,
+                "window_seconds": 60,
             },
         },
         {
@@ -86,8 +89,15 @@ READ_PLAN: dict[str, tuple[dict[str, Any], ...]] = {
             "arguments": {"target": "cart-service", "metric": "error_rate", "window_seconds": 300},
         },
         {
+            # cartFailure in the pinned revision breaks EmptyCart, not GetCart:
+            # the cart service routes EmptyCart to the bad store. Asking for
+            # GetCart would collect a healthy span and miss the fault.
             "tool_name": "read_traces",
-            "arguments": {"target": "cart-service", "operation": "GetCart", "window_seconds": 300},
+            "arguments": {
+                "target": "cart-service",
+                "operation": "EmptyCart",
+                "window_seconds": 300,
+            },
         },
         {"tool_name": "read_runbook", "arguments": {"target": "cart-service"}},
     ),
