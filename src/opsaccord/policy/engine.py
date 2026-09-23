@@ -196,6 +196,23 @@ def evaluate(request: PolicyRequest) -> PolicyDecision:
         )
 
     if posture == "allow_listed":
+        # The allow-listed autonomous path is scoped to the service under
+        # investigation. A target the incident is not about is never remediated
+        # without a human: nothing in the incident makes that side effect safe,
+        # and the target list alone would let untrusted runbook text steer an
+        # approval-free write onto a different allow-listed service.
+        if proposal.target != request.incident_service:
+            return PolicyDecision(
+                allowed=True,
+                requires_approval=True,
+                reasons=(
+                    f"{proposal.target} is not the service under investigation "
+                    f"({request.incident_service}); a cross-service remediation "
+                    "requires an exact human approval",
+                ),
+                matched_rule="CROSS_SERVICE_REMEDIATION_REQUIRES_APPROVAL",
+                actor=ActorType.HUMAN,
+            )
         if proposal.target not in request.settings.allow_listed_remediation_targets:
             return PolicyDecision(
                 allowed=False,

@@ -321,7 +321,12 @@ class DemoEnvironment:
             return ActionOutcome.CONFIRMED_APPLIED
         if idempotency_key in self.attempted:
             return ActionOutcome.CONFIRMED_NOT_APPLIED
-        return ActionOutcome.CONFIRMED_NOT_APPLIED
+        # No record of this key at all. The adapter's applied/attempted maps are
+        # in-memory, so after a restart it genuinely cannot tell "the write never
+        # happened" from "the write happened in a process that is gone". Claiming
+        # CONFIRMED_NOT_APPLIED here would turn an unknown outcome into a
+        # confident failure; the live adapter answers UNKNOWN for the same reason.
+        return ActionOutcome.UNKNOWN
 
 
 def faulted_payment_unreachable() -> DemoEnvironment:

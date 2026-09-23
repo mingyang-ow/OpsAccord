@@ -29,6 +29,7 @@ from opsaccord.domain.enums import (
     transition_allowed,
 )
 from opsaccord.domain.models import (
+    EXTENSION_STEP_ALLOWANCE,
     Action,
     Approval,
     Constraint,
@@ -353,6 +354,21 @@ def get_workflow(session: Session, incident_id: str) -> Workflow | None:
     return _workflow(row) if row else None
 
 
+def lock_incident(session: Session, incident_id: str) -> IncidentRow:
+    """Take the row lock that serialises human controls against dispatch.
+
+    ``set_takeover`` and ``add_constraint`` (and therefore a human's freeze,
+    takeover, or deny rule) commit under this lock, and the gateway holds it while
+    it revalidates policy and claims an action. Without a shared lock a control
+    committed between the revalidation read and the claim would be invisible
+    under READ COMMITTED, and the side effect would go out anyway.
+    """
+    row = session.get(IncidentRow, incident_id, with_for_update=True)
+    if row is None:
+        raise RepositoryError(f"unknown incident {incident_id}")
+    return row
+
+
 def _lock_workflow_row(session: Session, workflow_id: str) -> WorkflowRow:
     row = session.scalars(
         sa.select(WorkflowRow).where(WorkflowRow.id == workflow_id).with_for_update()
@@ -499,10 +515,11 @@ def consume_step(
         raise BudgetExhausted(
             f"hard step cap reached ({workflow_row.hard_step_cap}); refusing further work"
         )
-    if workflow_row.steps_used >= workflow_row.soft_step_budget and not allow_over_soft:
-        raise BudgetExhausted(
-            f"soft step budget reached ({workflow_row.soft_step_budget}); extension required"
-        )
+    effective_soft = workflow_row.soft_step_budget + (
+        workflow_row.extensions_granted * EXTENSION_STEP_ALLOWANCE
+    )
+    if workflow_row.steps_used >= effective_soft and not allow_over_soft:
+        raise BudgetExhausted(f"soft step budget reached ({effective_soft}); extension required")
     workflow_row.steps_used += 1
     workflow_row.updated_at = utcnow()
     if kind == "model":
@@ -565,6 +582,7 @@ def grant_extension(
 
 
 def set_takeover(session: Session, *, incident_id: str, actor: str) -> Workflow:
+    lock_incident(session, incident_id)
     workflow_row = _lock_workflow_row(
         session,
         session.scalar(sa.select(WorkflowRow.id).where(WorkflowRow.incident_id == incident_id))
@@ -803,6 +821,7 @@ def create_action(
     rationale: str,
     decision_id: str | None,
     requires_approval: bool,
+    is_simulated: bool = True,
 ) -> Action:
     from opsaccord.config import digest as _digest
 
@@ -823,7 +842,7 @@ def create_action(
         decision_id=decision_id,
         attempt=0,
         idempotency_key=action_id,
-        is_simulated=True,
+        is_simulated=is_simulated,
         created_at=now,
         updated_at=now,
     )
@@ -1259,6 +1278,8 @@ def add_constraint(
     target: str | None = None,
     note: str | None = None,
 ) -> Constraint:
+    if incident_id is not None:
+        lock_incident(session, incident_id)
     row = ConstraintRow(
         id=prefixed("con"),
         incident_id=incident_id,

@@ -153,6 +153,27 @@ def test_live_cart_path_hands_off_without_executing_anything(db, live_settings: 
     assert trace.forbidden_actions == []
 
 
+def test_live_provenance_is_read_out_of_the_evidence(db, live_settings: Settings) -> None:
+    """A live result is never allowed to assert provenance it did not observe.
+
+    The driver derives ``simulated`` from the evidence the run actually collected
+    instead of hardcoding it, so a live run cannot claim to be live on no
+    evidence, and this pins that derivation.
+    """
+    spec = SCENARIOS["P1-05"]
+    plan = live_scenarios.LIVE_PLANS["P1-05"]
+    result = live_scenarios.run_live_scenario(
+        spec, plan, db=db, settings=live_settings, provider=DeterministicAdapter()
+    )
+
+    trace = result.trace
+    assert trace is not None, result.reasons
+    assert trace.evidence, "a live scenario must collect at least one record"
+    assert result.simulated is any(item.is_simulated for item in trace.evidence)
+    assert result.simulated is False
+    assert "provenance" not in " ".join(result.reasons)
+
+
 def test_live_metrics_timeout_escalates_without_guessing(db, live_settings: Settings) -> None:
     """P1-04 live: the telemetry endpoints genuinely do not answer."""
     spec = SCENARIOS["P1-04"]

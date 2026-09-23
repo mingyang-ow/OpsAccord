@@ -52,6 +52,32 @@ def test_unregistered_service_is_denied() -> None:
     assert decision.matched_rule == "TARGET_NOT_REGISTERED"
 
 
+def test_autonomous_remediation_may_not_target_a_different_service() -> None:
+    """The allow-listed autonomous path belongs to the incident's own service.
+
+    Without this, untrusted runbook text could aim an approval-free side effect
+    at a different allow-listed service than the one under investigation.
+    """
+    proposal = remediation("ad-service", "adHighCpu")
+    request = policy_request(
+        proposal=proposal, service="ad-service", incident_service="cart-service"
+    )
+    decision = engine.evaluate(request)
+    assert decision.allowed is True
+    assert decision.requires_approval is True
+    assert decision.matched_rule == "CROSS_SERVICE_REMEDIATION_REQUIRES_APPROVAL"
+
+
+def test_the_incidents_own_allow_listed_target_stays_autonomous() -> None:
+    """The same proposal is pre-authorised when the incident really is that service."""
+    proposal = remediation("ad-service", "adHighCpu")
+    request = policy_request(proposal=proposal, service="ad-service", incident_service="ad-service")
+    decision = engine.evaluate(request)
+    assert decision.allowed is True
+    assert decision.requires_approval is False
+    assert decision.matched_rule == "ALLOW_LISTED_REMEDIATION"
+
+
 def test_human_takeover_suspends_automatic_execution() -> None:
     proposal = remediation("ad-service", "adHighCpu")
     request = policy_request(

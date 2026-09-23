@@ -121,6 +121,15 @@ class ToolGateway:
             raise UnknownTool(f"{tool_name!r} is not a registered typed tool")
         if spec.side_effect is not SideEffect.READ:
             raise UnknownTool(f"{tool_name!r} is not a read-only tool")
+        # The typed registry is the single gate for arguments, reads included.
+        # Binding the executed target to the validated argument keeps the value
+        # policy approves and the value the adapter reads the same value.
+        arguments = spec.validate_arguments(arguments)
+        if arguments["target"] != target:
+            raise ValueError(
+                f"read target {target!r} does not match the validated argument target "
+                f"{arguments['target']!r}"
+            )
 
         with self.db.session() as session:
             repo.consume_step(
@@ -131,9 +140,10 @@ class ToolGateway:
                 allow_over_soft=budget_class == "verification",
             )
             workflow = repo.get_workflow(session, incident_id)
+            incident = repo.get_incident(session, incident_id)
             service = repo.get_service(session, target)
             constraints = tuple(repo.list_active_constraints(session, incident_id))
-            assert workflow is not None
+            assert workflow is not None and incident is not None
             decision = policy_engine.evaluate(
                 policy_engine.PolicyRequest(
                     proposal=ActionProposal(
@@ -142,7 +152,7 @@ class ToolGateway:
                     tool=spec,
                     service=service,
                     workflow=workflow,
-                    incident_service=workflow.incident_id,
+                    incident_service=incident.service,
                     constraints=constraints,
                     rejected_intents=frozenset(),
                     budget=policy_engine.budget_state(workflow),
@@ -265,7 +275,8 @@ class ToolGateway:
         arguments = spec.validate_arguments(proposal.arguments)
         with self.db.session() as session:
             workflow = repo.get_workflow(session, incident_id)
-            if workflow is None:
+            incident = repo.get_incident(session, incident_id)
+            if workflow is None or incident is None:
                 raise repo.RepositoryError(f"no workflow for incident {incident_id}")
             decision = policy_engine.evaluate(
                 policy_engine.PolicyRequest(
@@ -273,7 +284,7 @@ class ToolGateway:
                     tool=spec,
                     service=repo.get_service(session, proposal.target),
                     workflow=workflow,
-                    incident_service=workflow.incident_id,
+                    incident_service=incident.service,
                     constraints=tuple(repo.list_active_constraints(session, incident_id)),
                     rejected_intents=frozenset(
                         repo.rejected_intents(session, workflow_id=workflow.id)
@@ -331,6 +342,7 @@ class ToolGateway:
                 rationale=proposal.rationale,
                 decision_id=decision_id,
                 requires_approval=requires_approval,
+                is_simulated=self.is_simulated,
             )
         return action
 
@@ -340,6 +352,11 @@ class ToolGateway:
             action = repo.get_action(session, action_id)
             if action is None:
                 raise repo.RepositoryError(f"unknown action {action_id}")
+            # Serialise against human controls: from here until the claim commits,
+            # a concurrent takeover or constraint either lands before this
+            # revalidation (and blocks the dispatch) or waits for it. There is no
+            # window in between for a control to be ignored.
+            repo.lock_incident(session, action.incident_id)
             blocked = self._revalidate(session, action)
             if blocked is not None:
                 return ActionExecution(action, False, blocked)
@@ -395,15 +412,6 @@ class ToolGateway:
                 finished_at=finished,
                 is_simulated=self.is_simulated,
             )
-            # Dispatching and recording an already-approved action is safety
-            # critical: it may exceed the soft investigation budget, never the cap.
-            repo.consume_step(
-                session,
-                incident_id=claimed_action.incident_id,
-                kind="tool",
-                actor="tool-gateway",
-                allow_over_soft=True,
-            )
             updated = repo.finish_action(
                 session,
                 action_id=claimed_action.id,
@@ -412,11 +420,31 @@ class ToolGateway:
                 error=error,
                 external_outcome=outcome,
             )
+            # Dispatching and recording an already-approved action is safety
+            # critical: it may exceed the soft investigation budget, never the cap.
+            # The side effect has already happened by now, so a budget refusal must
+            # not roll back the tool-call ledger row or the action's final status.
+            # Losing those would leave an applied change with no record and an
+            # action stuck in DISPATCHING; an uncounted step is the lesser evil and
+            # it is reported instead of hidden.
+            budget_note: str | None = None
+            try:
+                repo.consume_step(
+                    session,
+                    incident_id=claimed_action.incident_id,
+                    kind="tool",
+                    actor="tool-gateway",
+                    allow_over_soft=True,
+                )
+            except repo.BudgetExhausted as exc:
+                budget_note = str(exc)
         detail = {
             ActionStatus.SUCCEEDED: "remediation dispatched and acknowledged",
             ActionStatus.FAILED: f"remediation reported failure: {error}",
             ActionStatus.UNCERTAIN: "dispatch did not return; outcome must be reconciled",
         }[status]
+        if budget_note:
+            detail = f"{detail}; budget: {budget_note}"
         return ActionExecution(updated, True, detail)
 
     def _revalidate(self, session: Any, action: Action) -> str | None:
@@ -448,6 +476,43 @@ class ToolGateway:
             return "this exact action intent was already rejected by a human"
         if action.status is ActionStatus.AWAITING_APPROVAL:
             return "action is still waiting for approval"
+        # The cheap checks above are a subset of policy. Re-run the whole
+        # deterministic engine against the rows as they are now: service posture,
+        # the target and argument allow-lists, the service/target binding, the
+        # rejected-intent set and the hard budget wall all have to be true at the
+        # instant of dispatch, not only when the action was requested.
+        incident = repo.get_incident(session, action.incident_id)
+        spec = self.registry.get(action.tool_name)
+        if spec is None:
+            return f"{action.tool_name!r} is no longer a registered typed tool"
+        decision = policy_engine.evaluate(
+            policy_engine.PolicyRequest(
+                proposal=ActionProposal(
+                    tool_name=action.tool_name,
+                    target=action.target,
+                    arguments=action.arguments,
+                    rationale=action.rationale,
+                ),
+                tool=spec,
+                service=repo.get_service(session, action.target),
+                workflow=workflow,
+                incident_service=incident.service if incident else action.target,
+                constraints=tuple(repo.list_active_constraints(session, action.incident_id)),
+                rejected_intents=frozenset(repo.rejected_intents(session, workflow_id=workflow.id)),
+                budget=policy_engine.budget_state(workflow),
+                settings=self.settings,
+            )
+        )
+        if not decision.allowed:
+            return "policy revalidation blocked the dispatch: " + "; ".join(decision.reasons)
+        # An approval-backed action carries the approval row that claim_action
+        # consumes; an autonomous one carries none. If policy requires approval
+        # now and none is bound to this action, the dispatch is not authorised.
+        if decision.requires_approval and action.approval_id is None:
+            return (
+                "policy revalidation now requires a human approval for this action; "
+                "dispatch is blocked"
+            )
         return None
 
     def reconcile_action(self, *, action_id: str) -> Action:
@@ -505,15 +570,27 @@ class ToolGateway:
                 target=target,
                 budget_class="verification",
             )
+        except repo.BudgetExhausted as exc:
+            # The hard cap can land between the action and its verification. The
+            # service state is then unmeasured, which is not a recovery: leave the
+            # health probe unset so the verdict is inconclusive and the workflow
+            # hands off, rather than failing the run with an exception.
+            blocked = f"the verification reads are no longer affordable ({exc})"
         except PolicyBlocked as exc:
             # A human control (a freeze or a manual-handling constraint) can land
             # between the action and its verification. That is a decision, not a
             # crash: report an unverified outcome and let the controller escalate.
-            blocked = str(exc)
+            blocked = f"a human control blocked the verification reads ({exc})"
 
         if health is not None:
             evidence_ids.append(health.evidence_id)
-            if action_completed_at is None or health.result.collected_at >= action_completed_at:
+            # "Fresh" only means something relative to a completed action. With no
+            # completed action there is nothing for this evidence to be fresh with
+            # respect to, so it cannot be a verified recovery of anything.
+            if (
+                action_completed_at is not None
+                and health.result.collected_at >= action_completed_at
+            ):
                 collected_after_action = True
 
             if health.result.succeeded:
@@ -531,8 +608,11 @@ class ToolGateway:
                             target=target,
                             budget_class="verification",
                         )
+                    except repo.BudgetExhausted as exc:
+                        blocked = f"the verification reads are no longer affordable ({exc})"
+                        break
                     except PolicyBlocked as exc:
-                        blocked = str(exc)
+                        blocked = f"a human control blocked the verification reads ({exc})"
                         break
                     evidence_ids.append(outcome.evidence_id)
                     metrics_ok = metrics_ok and outcome.result.succeeded
@@ -602,10 +682,7 @@ class ToolGateway:
                 outcome=VerificationOutcome.VERIFICATION_INCONCLUSIVE,
                 service=target,
                 evidence_ids=tuple(evidence_ids),
-                detail=(
-                    "verification is inconclusive: a human control blocked the "
-                    f"verification reads ({blocked})"
-                ),
+                detail=f"verification is inconclusive: {blocked}",
                 checked_at=utcnow(),
             )
         elif health is None or not health.result.succeeded or not metrics_ok:

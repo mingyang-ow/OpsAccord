@@ -272,6 +272,15 @@ def test_uncertain_dispatch_is_reconciled_instead_of_retried(
 def test_crash_after_claim_before_dispatch_is_not_blindly_retried(
     db: Database, settings: Settings, rig
 ) -> None:
+    """A claim with no recorded outcome stays unknown; it never becomes a guess.
+
+    The worker died holding the claim and nothing recorded what happened to the
+    external call. The adapter's applied/attempted maps are in-memory, so after a
+    restart it cannot tell "never asked" from "asked in a process that is gone".
+    Reporting CONFIRMED_NOT_APPLIED here would convert an unknown outcome into a
+    confident failure, which is the opposite of what this case is for: the run
+    must not retry the side effect, and it must not resolve either.
+    """
     case = rig("P1-01")
     case.controller.run(case.incident_id)
     approval = pending(db, case.incident_id)
@@ -290,10 +299,100 @@ def test_crash_after_claim_before_dispatch_is_not_blindly_retried(
         stored = repo.get_action(session, action.id)
         incident = repo.get_incident(session, case.incident_id)
     assert stored is not None
-    assert stored.status is ActionStatus.FAILED
-    assert stored.external_outcome is ActionOutcome.CONFIRMED_NOT_APPLIED
+    assert stored.status is ActionStatus.UNCERTAIN
+    assert stored.external_outcome is ActionOutcome.UNKNOWN
     assert incident is not None and incident.status is not IncidentStatus.RESOLVED
     assert stored.attempt == 1
+
+
+def test_unknown_reconcile_outcome_hands_off_instead_of_resolving(
+    db: Database, settings: Settings, rig
+) -> None:
+    """The other half of the same rule: an unresolved side effect blocks RESOLVED.
+
+    Even when the service has genuinely recovered, a dispatch whose outcome is
+    still unknown must not be reported as a resolved incident -- an action in
+    DISPATCHING is exactly as open as one in UNCERTAIN.
+    """
+    case = rig("P1-01")
+    case.controller.run(case.incident_id)
+    approval = pending(db, case.incident_id)
+    approve(db, approval)
+    action = action_of(db, case.incident_id)
+
+    # The worker both dispatched *and* applied the change, then died before the
+    # ledger row was written: the flag is off, but the action row says DISPATCHING.
+    case.environment.apply_remediation(
+        idempotency_key=action.idempotency_key,
+        target=action.target,
+        remediation_id="disable_feature_flag",
+        flag_id="paymentUnreachable",
+        timeout_seconds=1.0,
+    )
+    with db.session() as session:
+        claim = repo.claim_action(session, action_id=action.id, actor="worker-that-died")
+    assert claim.claimed is True
+    assert case.environment.applied, "the external change really happened"
+
+    case.controller.advance(case.incident_id)
+
+    with db.read_session() as session:
+        stored = repo.get_action(session, action.id)
+        incident = repo.get_incident(session, case.incident_id)
+    assert stored is not None
+    assert incident is not None
+    assert stored.status is not ActionStatus.SUCCEEDED
+    assert incident.status is not IncidentStatus.RESOLVED
+
+
+def test_an_open_side_effect_blocks_resolution_even_after_real_recovery(
+    db: Database, settings: Settings, rig
+) -> None:
+    """A DISPATCHING action is unresolved, so recovery alone cannot resolve.
+
+    The first action really succeeded and really recovered the service, but a
+    second intent is still mid-flight with no recorded outcome. The routing gate
+    must refuse RESOLVED for as long as that side effect is open.
+    """
+    case = rig("P1-01")
+    case.controller.run(case.incident_id)
+    approve(db, pending(db, case.incident_id))
+    settled = case.gateway.execute_action(action_id=action_of(db, case.incident_id).id).action
+    assert settled.status is ActionStatus.SUCCEEDED
+    assert settled.completed_at is not None
+
+    with db.session() as session:
+        second = repo.create_action(
+            session,
+            incident_id=case.incident_id,
+            workflow_id=settled.workflow_id,
+            tool_name="apply_remediation",
+            target="payment-service",
+            arguments={
+                "target": "payment-service",
+                "remediation_id": "disable_feature_flag",
+                "flag_id": "paymentFailure",
+            },
+            rationale="a second intent that never recorded its outcome",
+            decision_id=None,
+            # Created APPROVED so the claim below really happens; this action is
+            # not the point of the test, only the open DISPATCHING row it leaves.
+            requires_approval=False,
+        )
+        claimed = repo.claim_action(session, action_id=second.id, actor="worker-that-died")
+    assert claimed.claimed is True, claimed.reason
+
+    with db.read_session() as session:
+        stored = repo.get_action(session, second.id)
+    assert stored is not None and stored.status is ActionStatus.DISPATCHING
+
+    route = case.controller._route_after_verify(
+        {
+            "incident_id": case.incident_id,
+            "verification": str(VerificationOutcome.VERIFICATION_SUCCESS),
+        }
+    )
+    assert route == "escalate"
 
 
 def test_restart_while_waiting_for_approval_resumes_from_postgres(

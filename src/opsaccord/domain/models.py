@@ -355,6 +355,13 @@ class PolicyDecision(Frozen):
     actor: ActorType | None = None
 
 
+# Additional soft-budget headroom one justified extension buys. The soft budget
+# is a checkpoint rather than a wall, so an extension has to permit more work --
+# otherwise the extension machinery, and the policy verdict that asks for one,
+# are inert.
+EXTENSION_STEP_ALLOWANCE = 5
+
+
 class BudgetState(Frozen):
     soft_step_budget: int
     hard_step_cap: int
@@ -363,8 +370,13 @@ class BudgetState(Frozen):
     max_extensions: int
 
     @property
+    def effective_soft_budget(self) -> int:
+        """The soft checkpoint, including every extension granted so far."""
+        return self.soft_step_budget + self.extensions_granted * EXTENSION_STEP_ALLOWANCE
+
+    @property
     def soft_exhausted(self) -> bool:
-        return self.steps_used >= self.soft_step_budget
+        return self.steps_used >= self.effective_soft_budget
 
     @property
     def hard_exhausted(self) -> bool:

@@ -477,13 +477,26 @@ def run_live_scenario(
             f"fault visible after arming: {fault_visible}" if fault_visible else "no fault armed",
         ]
     )
+
+    # Provenance is read back out of the evidence that was actually collected, not
+    # asserted by the driver. If a live run ever collected simulator evidence, the
+    # result says so instead of claiming to be live.
+    simulated_evidence = [item for item in trace.evidence if item.is_simulated]
+    if simulated_evidence:
+        reasons.append(
+            f"provenance: {len(simulated_evidence)} of {len(trace.evidence)} evidence record(s) "
+            "came from a simulator during a live run; this is a defect, not a live result"
+        )
+    if not trace.evidence:
+        reasons.append("provenance: the live run collected no evidence at all")
+
     return LiveResult(
         scenario_id=spec.id,
         title=spec.title,
         setup=plan.setup,
         outcome=outcome,
         reasons=reasons,
-        simulated=False,
+        simulated=bool(simulated_evidence),
         trace=trace,
         fault_visible=fault_visible,
     )

@@ -1,0 +1,225 @@
+# Phase 1 optional second review (Claude Code)
+
+This file records an **optional second review** requested under the updated
+handoff. It is a review of the implementation, not an approval, and it is kept
+separate from the implementation agent's own self-checks (`docs/phase1.md`
+completion gates, the offline suite, the live suite). No review result is used as
+an acceptance gate; final review and acceptance happen with the user in the
+planning conversation.
+
+## Reviewer and scope
+
+| Item | Value |
+| --- | --- |
+| Tool | Claude Code CLI, `2.1.267` (`claude -p`, headless, non-interactive) |
+| Model reported by the harness | `claude-opus-5[1m]` (canonical `claude-opus-5`), 35 turns, 21,532 thinking tokens |
+| Auth mode | subscription (`authMethod: claude.ai`, `apiProvider: firstParty`, `subscriptionType: pro`) - **no API key, no separately billed usage** |
+| Usage reported by the harness | 40 input / 31,814 output tokens, 2.2M cache reads, ~8.3 min; the harness's list-price equivalent is $3.73, which is not a charge on a subscription |
+| Reviewed revision | `b4b75aa` (diff base `3168bcf`), branch `phase1/baseline` |
+| Reviewed state | committed tree only; the working tree was clean at review time |
+| Access granted | read-only: `Read`, `Grep`, `Glob`, and a `Bash` allow-list of `git diff/show/log/status` |
+| Deliverable | findings only, with `file:line` and a reproduction, in a fixed format |
+
+The prompt asked the reviewer to check eight invariants and to check four named
+risk points: no model-controlled execution, approval binding and revalidation,
+atomic claim, crash recovery, fresh verification, budgets and retries, untrusted
+text, live-vs-simulated provenance, the request/claim/dispatch/record ordering,
+the verification settling loop, whether a live scenario can pass without
+exercising the demo, and whether human controls live in the backend.
+
+## Outcome
+
+Eleven findings, all of which the implementation agent reproduced in the code
+before accepting them. **All eleven were confirmed as real and fixed**, each with
+a regression test that fails on the pre-fix code (verified by reverting the source
+fixes and re-running: 14 tests fail without them). Nothing was accepted on the
+reviewer's word alone, and no finding was dismissed without checking it.
+
+Severity is the reviewer's; the disposition and evidence are the implementation
+agent's.
+
+### 1. `DISPATCHING` did not block `RESOLVED` - high - FIXED
+
+`src/opsaccord/workflow/controller.py:787` (`_route_after_verify`). The gate
+filtered in-flight actions to `ActionStatus.UNCERTAIN`, so an action left in
+`DISPATCHING` - the outcome of a real side effect was never recorded - did not
+prevent resolution, contradicting the method's own docstring. The reviewer's
+reproduction: kill a worker between `apply_remediation` and the recording block,
+restart, `advance()`; the claim fails, fresh evidence is healthy, and the route
+returns `resolved`.
+
+Confirmed: `repo.list_in_flight_actions` already returns `DISPATCHING` and
+`UNCERTAIN`, so only the filter dropped it. Fixed by treating every unsettled
+status as blocking. Evidence: `test_an_open_side_effect_blocks_resolution_even_after_real_recovery`;
+with the filter reverted to the old predicate the same test observes `resolved`.
+
+### 2. An autonomous remediation was not bound to the incident's service - high - FIXED
+
+`src/opsaccord/tools/gateway.py:276` passed `incident_service=workflow.incident_id`
+(an `inc_...` id) into `PolicyRequest`, and `policy/engine.py` never read the
+field. Untrusted runbook text could therefore steer an approval-free,
+allow-listed remediation onto a *different* allow-listed service than the
+incident under investigation; P1-09 only covered the non-allow-listed direction.
+
+Confirmed: the field is declared but unused, and the read path
+(`gateway.py:145`) had the same defect. Fixed by passing the incident's real
+service and by refusing to pre-authorise a cross-service side effect - it now
+requires an exact human approval (`CROSS_SERVICE_REMEDIATION_REQUIRES_APPROVAL`).
+Evidence: `test_autonomous_remediation_may_not_target_a_different_service`,
+`test_the_incidents_own_allow_listed_target_stays_autonomous`.
+
+### 3. Verification freshness degenerated when no action completed - medium - FIXED
+
+`src/opsaccord/tools/gateway.py:516` set `collected_after_action = True` whenever
+`action_completed_at is None`, so "fresh evidence after the action" became "any
+evidence". Combined with `_execute` ignoring `execution.executed is False`, a
+dispatch that was refused, never claimable, or left in `DISPATCHING` could still
+produce `VERIFICATION_SUCCESS` and `RESOLVED` with nothing applied in that run.
+
+Confirmed and fixed: freshness now requires a completed action to be fresh with
+respect to. This also closes finding 3's route to `RESOLVED` without touching the
+restart-with-a-settled-action path that the Phase 1 recovery gate needs. Evidence:
+`test_verification_without_a_completed_action_is_never_a_recovery` (negative and
+positive control).
+
+### 4. A budget error after dispatch discarded the ledger row - medium - FIXED
+
+`src/opsaccord/tools/gateway.py:400`. `record_tool_call`, `consume_step` and
+`finish_action` ran in one transaction, and `consume_step` raises
+`BudgetExhausted` - which rolled back the tool-call row and skipped
+`finish_action`, leaving an applied change with no record and the action stuck in
+`DISPATCHING`, with the exception escaping the `_execute` node.
+
+Confirmed and fixed: the action's final status and the tool-call ledger are
+persisted first, and the budget consumption is now tolerant, reporting the
+uncounted step in the execution detail instead of losing the record. Evidence:
+`test_a_budget_error_after_dispatch_never_erases_the_ledger` (fault-injected).
+
+### 5. Revalidation was a hand-rolled subset of policy, with a race - medium - FIXED
+
+`src/opsaccord/tools/gateway.py:422`. `_revalidate` checked takeover, terminal
+status, four constraint kinds, rejected intent and pending approval, but not
+service posture, the target/argument allow-lists, the service/target binding, or
+the hard budget wall; it also read the workflow without a row lock, so under READ
+COMMITTED a takeover or constraint committed between that read and the claim was
+invisible.
+
+Confirmed and fixed in both halves: the full deterministic engine now runs
+immediately before the claim, and the revalidate+claim pair holds the incident
+row lock, which `set_takeover`, `add_constraint` and `set_takeover`'s workflow
+lock now share. Evidence: `test_a_posture_change_between_approval_and_dispatch_stops_the_side_effect`,
+`test_an_exhausted_hard_cap_stops_the_side_effect_at_dispatch`, and
+`test_a_human_control_that_commits_during_dispatch_is_not_ignored` - the last one
+reproduces the race with two threads and, without the lock, observes the side
+effect going out (`executed=True`) despite the human takeover.
+
+### 6. Budget exhaustion during verification was fatal - medium - FIXED
+
+`src/opsaccord/tools/gateway.py:508` caught only `PolicyBlocked`, so a
+`BudgetExhausted` from `consume_step` escaped `verify_service` and the `_verify`
+node: no verification row, workflow left in `VERIFYING` after a side effect, and
+an aborted run instead of a handoff.
+
+Confirmed and fixed: both read paths now treat an unaffordable verification as
+inconclusive, which routes to handoff. Evidence:
+`test_verification_that_cannot_afford_a_step_is_inconclusive_not_fatal`.
+
+### 7. The soft-budget extension was inert - medium - FIXED
+
+`src/opsaccord/persistence/repositories.py:552`. `grant_extension` incremented
+`extensions_granted` but nothing consulted it, so a granted extension permitted
+no work: the soft budget behaved as a hard wall, `BudgetState.can_extend` was
+dead, the `BUDGET_SOFT_EXHAUSTED` verdict could never be satisfied, and the audit
+event plus the run note recorded something with no effect.
+
+Confirmed and fixed: an extension now buys a bounded allowance
+(`EXTENSION_STEP_ALLOWANCE = 5`), used by both `consume_step` and
+`BudgetState.soft_exhausted` so policy and the wall agree. Evidence:
+`test_a_granted_extension_actually_buys_more_soft_budget`.
+
+### 8. Live actions were persisted as simulated - medium - FIXED
+
+`src/opsaccord/persistence/repositories.py:826` hardcoded `is_simulated=True` in
+`create_action` and nothing corrected it, so an action taken against the live
+stack was stored as fake while its tool-call row said otherwise.
+
+Confirmed and fixed: provenance is now a parameter of `create_action`, stamped
+from the adapter by the gateway. Evidence:
+`test_actions_taken_through_a_live_adapter_are_not_persisted_as_simulated`.
+
+### 9. The simulated adapter claimed certainty it could not have - medium - FIXED
+
+`src/opsaccord/tools/demo_environment.py:324` returned `CONFIRMED_NOT_APPLIED`
+for an idempotency key it had no record of, conflating "no record" with "the
+change did not happen" (the live adapter correctly answers `UNKNOWN`). The
+simulated adapter is what the acceptance suite scores, so the one crash case
+where the outcome is genuinely unknown was reconciled to a confident `FAILED`
+instead of remaining `UNCERTAIN` and ending in a handoff.
+
+Confirmed and fixed. The pre-existing test
+`test_crash_after_claim_before_dispatch_is_not_blindly_retried` asserted the
+false certainty, which is how the behaviour survived; it now asserts `UNCERTAIN`,
+`UNKNOWN`, no re-dispatch and no resolution, and
+`test_reconciliation_says_unknown_when_the_adapter_has_no_record` pins the
+adapter directly.
+
+### 10. The live driver asserted its own provenance - medium - FIXED
+
+`src/opsaccord/scenarios/live.py:487` set `LiveResult.simulated=False` as a
+constant, so a live run with zero successful live reads could still be reported
+as live (P1-04's plan deliberately points at an unroutable host).
+
+Confirmed and fixed: provenance is now derived from the evidence the run actually
+collected, with an explicit reason recorded when simulator evidence appears or
+no evidence was collected at all. Evidence:
+`test_live_provenance_is_read_out_of_the_evidence`.
+
+### 11. The read path bypassed the typed argument gate - low - FIXED
+
+`src/opsaccord/tools/gateway.py:119`. `read()` never called
+`spec.validate_arguments`, and `_invoke_read` dereferenced `arguments["target"]`
+independently of the `target` that policy evaluated, so the approved target and
+the executed target were two different values.
+
+Confirmed: no current caller diverges, but the registry is stated to be the single
+gate for arguments. Fixed by validating through the registry and requiring the
+two targets to agree, which now fails loudly instead of diverging. Evidence:
+`test_a_read_target_must_match_its_validated_arguments`,
+`test_a_read_argument_outside_the_typed_catalog_is_refused`.
+
+## What the reviewer verified as correct
+
+Recorded because a review that only lists defects hides the rest. The reviewer
+also confirmed, by reading: no shell, HTTP or container primitive exists on the
+`Environment` protocol; `apply_remediation` arguments are pinned globally and per
+target, with `cart-service`/`checkout-service` mapped to an empty tuple that
+rejects every value; a `shell_exec` proposal dies before policy and becomes a
+handoff; numeric telemetry is coerced defensively; `run`/`resume`/`advance` all
+funnel through one entry point that returns early on a terminal workflow and
+derives its entry node from persisted status rather than from the caller;
+`consume_step` locks the workflow row and enforces the soft gate and hard wall in
+one place; the rejection of a human approval is bound to intent identity; the
+settling loop calls `self.read` exclusively and never touches `claim_action`,
+`apply_remediation` or `finish_action`, so it cannot repeat a side effect; human
+controls and takeover are enforced in the API/policy layer with the Streamlit
+console holding no authority; and `LiveEnvironment` has no simulator fallback.
+
+## Limitations of this review
+
+- **Nothing was executed by the reviewer.** `Bash` was restricted to read-only
+  git, and one command (`git -C <path> diff --stat`) was denied by the
+  permission mode, so the reviewer could not confirm diff statistics or history
+  and worked from the files at `b4b75aa`. It ran no tests, no migrations and no
+  live stack.
+- Concurrency findings were analytical. The reviewer could not itself exercise
+  the competing-worker claim race or the control-versus-claim window. The
+  implementation agent then reproduced the latter deterministically (finding 5).
+- Findings 4, 6 and 7 depend on budget arithmetic the reviewer computed by hand
+  from `config.py` defaults rather than from an instrumented run.
+- The reviewer did not read the tests (except the adversarial module), the
+  migrations in full, `persistence/tables.py` in full, `reasoning/base.py`,
+  `tools/factory.py` or `scripts/`, and it did not audit this report or the
+  scenario JSON against its own findings.
+- The review covers `b4b75aa`. The fixes in this document were written after it
+  and are covered by the offline suite, the scenario suite and the live suite -
+  not by the reviewer.

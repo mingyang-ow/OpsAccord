@@ -41,6 +41,10 @@ from opsaccord.reasoning.base import EvidenceDigest, ProposalRequest, ReasoningP
 from opsaccord.tools.gateway import PolicyBlocked, ToolGateway
 from opsaccord.workflow.checkpoints import checkpoint_saver, ensure_checkpoint_schema
 
+# An action whose external outcome is not settled. The workflow may not report
+# RESOLVED while one of these exists: the change might still be in flight.
+_UNRESOLVED_SIDE_EFFECT_STATUSES = frozenset({ActionStatus.DISPATCHING, ActionStatus.UNCERTAIN})
+
 READ_PLAN: dict[str, tuple[dict[str, Any], ...]] = {
     "payment-service": (
         {"tool_name": "read_service_health", "arguments": {"target": "payment-service"}},
@@ -775,25 +779,26 @@ class WorkflowController:
 
         A service can look healthy while the outcome of the action that was
         supposed to fix it is still unknown. Treating that as resolved would
-        hide a possible duplicate-dispatch risk, so an uncertain action escalates
-        instead. A failed or inconclusive verification also escalates: Phase 1
-        does not automate a second side effect after a failed verification.
+        hide a possible duplicate-dispatch risk, so any action whose outcome is
+        still open escalates instead. A failed or inconclusive verification also
+        escalates: Phase 1 does not automate a second side effect after a failed
+        verification.
         """
         outcome = state.get("verification")
         with self.db.session() as session:
             workflow = repo.get_workflow(session, state["incident_id"])
             if workflow is None:
                 return "escalate"
-            uncertain = [
-                action
-                for action in repo.list_in_flight_actions(session, workflow_id=workflow.id)
-                if action.status is ActionStatus.UNCERTAIN
-            ] + [
+            # DISPATCHING is exactly as unresolved as UNCERTAIN: the side effect
+            # may already have happened and its outcome was never recorded. Only
+            # UNCERTAIN used to be checked here, which let a crash between the
+            # external call and the ledger write resolve as if nothing were open.
+            unresolved = [
                 action
                 for action in repo.list_actions(session, state["incident_id"])
-                if action.status is ActionStatus.UNCERTAIN
+                if action.status in _UNRESOLVED_SIDE_EFFECT_STATUSES
             ]
-        if uncertain:
+        if unresolved:
             return "escalate"
         if outcome == str(VerificationOutcome.VERIFICATION_SUCCESS):
             return "resolved"
