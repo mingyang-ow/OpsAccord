@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 
 from opsaccord.domain.enums import ActionOutcome, SideEffect
 from opsaccord.domain.models import ToolResult
-from opsaccord.tools.contracts import DispatchTimeout, ReadTimeout
+from opsaccord.tools.contracts import DispatchRefused, DispatchTimeout, ReadTimeout
 
 REVISION = "3.1.0"
 REVISION_SOURCE = "https://github.com/open-telemetry/opentelemetry-demo"
@@ -54,6 +54,11 @@ class FaultInjection:
     health_timeout_attempts: int = 0
     remediation_ineffective: bool = False
     action_dispatch_timeout: bool = False
+    # The change landed, then the adapter failed while constructing its
+    # acknowledgement. Distinct from a dispatch timeout on purpose: the caller
+    # observes an unclassifiable error, which is exactly the case that must not be
+    # recorded as a definite non-execution.
+    action_response_error: bool = False
     status_query_available: bool = True
     runbook_text: dict[str, str] = field(default_factory=dict)
 
@@ -236,7 +241,31 @@ class DemoEnvironment:
         repeated call with the same key does not apply a second change. That
         guarantee only holds while the adapter is reachable; it is not a
         substitute for reconciling an ambiguous outcome.
+
+        Outcome contract: an unmapped target is refused before anything happens
+        (:class:`DispatchRefused`); an unsupported remediation is a
+        ``ToolResult(succeeded=False)`` refusal; a lost acknowledgement after the
+        change landed is :class:`DispatchTimeout`; and a failure while building the
+        acknowledgement is an ordinary error, which the gateway records as an
+        unknown outcome rather than as a non-execution.
         """
+        if target not in self.services:
+            # Refused locally, before any state change: nothing was attempted, so
+            # this is a proved non-execution rather than an ambiguous outcome.
+            raise DispatchRefused(f"demo adapter has no mapping for target {target!r}")
+        if remediation_id not in {"disable_feature_flag", "restart_workload"}:
+            return ToolResult(
+                tool_name="apply_remediation",
+                target=target,
+                succeeded=False,
+                error=f"unsupported remediation {remediation_id!r}",
+                is_simulated=True,
+                collected_at=self._now(),
+            )
+        # ``attempted`` means a state change was about to be made, so a key that
+        # appears here without appearing in ``applied`` is a change this adapter
+        # knows it did not make. Refusals above are recorded nowhere, because no
+        # attempt happened.
         self.attempted[idempotency_key] = {
             "target": target,
             "remediation_id": remediation_id,
@@ -254,17 +283,8 @@ class DemoEnvironment:
 
         if remediation_id == "disable_feature_flag":
             self._disable_flag(target=target, flag_id=flag_id)
-        elif remediation_id == "restart_workload":
-            self._restart(target=target)
         else:
-            return ToolResult(
-                tool_name="apply_remediation",
-                target=target,
-                succeeded=False,
-                error=f"unsupported remediation {remediation_id!r}",
-                is_simulated=True,
-                collected_at=self._now(),
-            )
+            self._restart(target=target)
 
         record: dict[str, object] = {
             "remediation_id": remediation_id,
@@ -277,6 +297,15 @@ class DemoEnvironment:
             # The change landed, but the caller never saw the acknowledgement.
             raise DispatchTimeout(
                 f"dispatch of {remediation_id} on {target} exceeded {timeout_seconds}s"
+            )
+        if self.faults.action_response_error:
+            # The change landed, and then the adapter failed while building its
+            # acknowledgement - the malformed-response case. It raises an ordinary
+            # error on purpose: the gateway must treat an error it cannot classify
+            # as an unknown outcome, not as proof that nothing happened.
+            raise ValueError(
+                f"malformed acknowledgement for {remediation_id} on {target}: "
+                "the response body could not be parsed"
             )
         return ToolResult(
             tool_name="apply_remediation",
@@ -366,6 +395,7 @@ __all__ = [
     "REVISION",
     "REVISION_SOURCE",
     "DemoEnvironment",
+    "DispatchRefused",
     "DispatchTimeout",
     "FaultInjection",
     "ReadTimeout",

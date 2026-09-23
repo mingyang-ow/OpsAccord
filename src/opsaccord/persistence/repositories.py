@@ -43,6 +43,7 @@ from opsaccord.domain.models import (
     Workflow,
 )
 from opsaccord.ids import prefixed, utcnow
+from opsaccord.persistence.locks import lock_control_gate
 from opsaccord.persistence.tables import (
     ActionRow,
     ApprovalRow,
@@ -357,11 +358,17 @@ def get_workflow(session: Session, incident_id: str) -> Workflow | None:
 def lock_incident(session: Session, incident_id: str) -> IncidentRow:
     """Take the row lock that serialises human controls against dispatch.
 
-    ``set_takeover`` and ``add_constraint`` (and therefore a human's freeze,
-    takeover, or deny rule) commit under this lock, and the gateway holds it while
-    it revalidates policy and claims an action. Without a shared lock a control
-    committed between the revalidation read and the claim would be invisible
-    under READ COMMITTED, and the side effect would go out anyway.
+    ``set_takeover`` and an incident-scoped ``add_constraint`` (and therefore a
+    human's freeze, takeover, or deny rule) commit under this lock, and the
+    gateway holds it while it revalidates policy and claims an action. Without a
+    shared lock a control committed between the revalidation read and the claim
+    would be invisible under READ COMMITTED, and the side effect would go out
+    anyway.
+
+    This is the *per-incident* half of the ordering guarantee. The global half is
+    :func:`~opsaccord.persistence.locks.lock_control_gate`, which covers controls
+    with no incident to lock. Callers that take both must take the gate first:
+    the documented order is control gate -> incident row -> workflow row.
     """
     row = session.get(IncidentRow, incident_id, with_for_update=True)
     if row is None:
@@ -582,6 +589,9 @@ def grant_extension(
 
 
 def set_takeover(session: Session, *, incident_id: str, actor: str) -> Workflow:
+    # Every human control write takes the gate first, so that dispatch
+    # authorization cannot read the control set while a control is mid-commit.
+    lock_control_gate(session)
     lock_incident(session, incident_id)
     workflow_row = _lock_workflow_row(
         session,
@@ -918,6 +928,7 @@ def claim_action(
     action_id: str,
     actor: str,
     now: datetime | None = None,
+    commit_context: dict[str, Any] | None = None,
 ) -> ClaimResult:
     """Atomically claim an approved action and consume its approval.
 
@@ -925,6 +936,12 @@ def claim_action(
     worker can win the conditional UPDATE, and consuming the approval in the
     same transaction means a consumed approval can never authorise a second
     dispatch.
+
+    Winning this claim *is* the execution commitment point: once the caller's
+    transaction commits, the action is committed to execution and no control that
+    commits later can cancel it (see ``docs/architecture.md``). ``commit_context``
+    is written into the ``action.claimed`` audit event so the record of that
+    commitment states which controls the authorization actually evaluated.
     """
     moment = now or utcnow()
     claimed = session.execute(
@@ -980,6 +997,7 @@ def claim_action(
         ),
         subject_type="action",
         subject_id=action_id,
+        payload=dict(commit_context or {}),
     )
     return ClaimResult(True, get_action(session, action_id))
 
@@ -1278,6 +1296,20 @@ def add_constraint(
     target: str | None = None,
     note: str | None = None,
 ) -> Constraint:
+    """Record a human control.
+
+    The scope decides which lock makes it ordered against an in-flight dispatch,
+    and both are taken here so a caller cannot forget one:
+
+    * an incident-scoped constraint is serialised by the incident row lock, which
+      the dispatcher also holds across revalidate-and-claim;
+    * a *global* constraint (``incident_id IS NULL``) is read by every incident's
+      policy evaluation but has no incident row to lock, so it is serialised by
+      the global control gate instead. Locking the existing constraint rows would
+      not do it: an ``INSERT`` is not blocked by any lock on rows that already
+      exist, and with no constraints recorded there is nothing to lock at all.
+    """
+    lock_control_gate(session)
     if incident_id is not None:
         lock_incident(session, incident_id)
     row = ConstraintRow(

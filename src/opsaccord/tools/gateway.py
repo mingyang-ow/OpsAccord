@@ -9,11 +9,21 @@ Design rules enforced here:
 * The action row is claimed with a conditional UPDATE inside a transaction, and
   the approval is consumed in that same transaction, so a consumed approval can
   never authorise a second dispatch.
-* Policy is revalidated immediately before the side effect, from persisted rows.
+* Policy is revalidated immediately before the side effect, from persisted rows,
+  inside the same transaction that claims the action, under the control gate.
+
+The dispatch transaction in ``execute_action`` is the **execution commitment
+point**. It takes the control gate first, the incident row lock second, then reads
+the control set, revalidates the whole policy, claims the action and consumes its
+approval. Once that transaction commits, the action is committed to execution: a
+human control that commits later cannot cancel the request (which may already be
+in flight), and a control that commits earlier cannot be missed, because every
+control write takes the same gate. No lock is held across the external call.
 
 Exactly-once is *not* guaranteed by a unique row. The demo adapter is idempotent
 on the action id; when the adapter cannot report an outcome, the action is left
-UNCERTAIN and escalated rather than retried.
+UNCERTAIN and escalated rather than retried. An error the gateway cannot classify
+is one of those cases: see ``classify_dispatch_failure``.
 """
 
 from __future__ import annotations
@@ -36,6 +46,7 @@ from opsaccord.domain.enums import (
 from opsaccord.domain.models import (
     Action,
     ActionProposal,
+    Constraint,
     ToolResult,
     VerificationResult,
 )
@@ -46,7 +57,11 @@ from opsaccord.ids import utcnow
 from opsaccord.persistence import repositories as repo
 from opsaccord.persistence.db import Database
 from opsaccord.policy import engine as policy_engine
-from opsaccord.tools.contracts import DispatchTimeout, Environment, ReadTimeout
+from opsaccord.tools.contracts import (
+    Environment,
+    ReadTimeout,
+    classify_dispatch_failure,
+)
 from opsaccord.tools.registry import ToolRegistry
 
 _EVIDENCE_KIND = {
@@ -347,8 +362,19 @@ class ToolGateway:
         return action
 
     def execute_action(self, *, action_id: str, actor: str = "tool-gateway") -> ActionExecution:
-        """Claim, revalidate, dispatch once, and record the outcome."""
+        """Claim, revalidate, dispatch once, and record the outcome.
+
+        The transaction below is the execution commitment point described in the
+        module docstring. The order of the two locks is fixed: control gate, then
+        incident row. The gate is what makes a *global* control (one with no
+        incident row to lock) ordered against this authorization; the incident row
+        is what orders an incident-scoped control or a takeover against it.
+        """
+        controls: tuple[Constraint, ...] = ()
         with self.db.session() as session:
+            # The gate is taken before anything else in this transaction, and
+            # before the incident row.
+            repo.lock_control_gate(session)
             action = repo.get_action(session, action_id)
             if action is None:
                 raise repo.RepositoryError(f"unknown action {action_id}")
@@ -357,17 +383,36 @@ class ToolGateway:
             # revalidation (and blocks the dispatch) or waits for it. There is no
             # window in between for a control to be ignored.
             repo.lock_incident(session, action.incident_id)
-            blocked = self._revalidate(session, action)
+            # Read the control set once, under both locks, and evaluate exactly
+            # what was read. The same snapshot is recorded on the claim, so the
+            # audit says which controls the commitment was made against.
+            controls = tuple(repo.list_active_constraints(session, action.incident_id))
+            blocked = self._revalidate(session, action, constraints=controls)
             if blocked is not None:
                 return ActionExecution(action, False, blocked)
-            claim = repo.claim_action(session, action_id=action_id, actor=actor)
+            claim = repo.claim_action(
+                session,
+                action_id=action_id,
+                actor=actor,
+                commit_context={
+                    "evaluated_constraints": [
+                        {
+                            "id": constraint.id,
+                            "kind": str(constraint.kind),
+                            "scope": "global" if constraint.incident_id is None else "incident",
+                        }
+                        for constraint in controls
+                    ]
+                },
+            )
             if not claim.claimed:
                 return ActionExecution(
                     claim.action or action, False, claim.reason or "not claimable"
                 )
             claimed_action = claim.action
             assert claimed_action is not None
-        # Transaction committed: we are the only worker holding this action.
+        # Transaction committed: we are the only worker holding this action, and
+        # no control that commits from here on can cancel it.
 
         spec = self.registry.require(claimed_action.tool_name)
         started = utcnow()
@@ -385,14 +430,18 @@ class ToolGateway:
             if tool_result.succeeded:
                 status, outcome = ActionStatus.SUCCEEDED, ActionOutcome.CONFIRMED_APPLIED
             else:
+                # The adapter's contract: succeeded=False means the change provably
+                # did not happen. Both shipped adapters refuse before they write.
                 status, outcome = ActionStatus.FAILED, ActionOutcome.CONFIRMED_NOT_APPLIED
                 error = tool_result.error
-        except DispatchTimeout as exc:
-            # Dispatched, outcome unknown. Never retry; reconcile instead.
-            status, outcome, error = ActionStatus.UNCERTAIN, ActionOutcome.UNKNOWN, str(exc)
         except Exception as exc:
-            status, outcome = ActionStatus.FAILED, ActionOutcome.CONFIRMED_NOT_APPLIED
-            error = f"{type(exc).__name__}: {exc}"
+            # Every raised error is classified in one place, so this handler cannot
+            # drift from the outcome contract: a proven pre-dispatch refusal is a
+            # definite non-execution, and anything the gateway cannot classify -
+            # including an unexpected error after the adapter already applied the
+            # change - stays UNCERTAIN. Never retry an uncertain action; reconcile.
+            failure = classify_dispatch_failure(exc)
+            status, outcome, error = failure.status, failure.outcome, failure.error
 
         finished = utcnow()
         with self.db.session() as session:
@@ -441,14 +490,24 @@ class ToolGateway:
         detail = {
             ActionStatus.SUCCEEDED: "remediation dispatched and acknowledged",
             ActionStatus.FAILED: f"remediation reported failure: {error}",
-            ActionStatus.UNCERTAIN: "dispatch did not return; outcome must be reconciled",
+            ActionStatus.UNCERTAIN: (
+                "dispatch outcome is unknown; reconcile it before resolving or retrying"
+            ),
         }[status]
         if budget_note:
             detail = f"{detail}; budget: {budget_note}"
         return ActionExecution(updated, True, detail)
 
-    def _revalidate(self, session: Any, action: Action) -> str | None:
-        """Immediately-before-execution policy revalidation from persisted rows."""
+    def _revalidate(
+        self, session: Any, action: Action, *, constraints: tuple[Constraint, ...]
+    ) -> str | None:
+        """Immediately-before-execution policy revalidation from persisted rows.
+
+        ``constraints`` is the control set read by the caller under the control
+        gate and the incident row lock, so the cheap checks below and the policy
+        engine both evaluate one consistent snapshot rather than two reads that a
+        concurrent control could land between.
+        """
         workflow = repo.get_workflow(session, action.incident_id)
         if workflow is None:
             return "workflow disappeared"
@@ -460,7 +519,7 @@ class ToolGateway:
             IncidentStatus.ESCALATED_INCOMPLETE,
         }:
             return f"workflow is already terminal ({workflow.status})"
-        for constraint in repo.list_active_constraints(session, action.incident_id):
+        for constraint in constraints:
             if constraint.kind is ConstraintKind.FREEZE_ACTIONS:
                 return "freeze-actions constraint is active"
             if constraint.kind is ConstraintKind.REQUIRE_MANUAL:
@@ -497,7 +556,7 @@ class ToolGateway:
                 service=repo.get_service(session, action.target),
                 workflow=workflow,
                 incident_service=incident.service if incident else action.target,
-                constraints=tuple(repo.list_active_constraints(session, action.incident_id)),
+                constraints=constraints,
                 rejected_intents=frozenset(repo.rejected_intents(session, workflow_id=workflow.id)),
                 budget=policy_engine.budget_state(workflow),
                 settings=self.settings,

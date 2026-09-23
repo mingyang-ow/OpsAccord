@@ -223,3 +223,42 @@ console holding no authority; and `LiveEnvironment` has no simulator fallback.
 - The review covers `b4b75aa`. The fixes in this document were written after it
   and are covered by the offline suite, the scenario suite and the live suite -
   not by the reviewer.
+
+## Follow-up review of the safety pass: not run
+
+The planning conversation asked for an optional focused review of the safety pass
+that followed `5cbcce2` (the control gate and the uncertain-outcome contract). **It
+did not run.** The subscription-backed Claude Code harness is installed on this
+machine - `claude --version` reports `2.1.267 (Claude Code)`, and the user settings
+select the subscription model with no API key configured - but four bounded
+non-interactive attempts across two sessions (`claude -p ... --output-format text`
+with timeouts of 90s, 120s, and 45s with `--debug` in the implementation session;
+120s re-attempted in the delivery session, which exited `124` after the timeout
+with a captured output of exactly 0 bytes) each hung and produced no stdout and no
+stderr.
+That is consistent with the same sandbox restriction that blocks PostgreSQL: every
+socket operation raises `PermissionError [Errno 1]`, so the harness cannot reach
+its API. Escalating outside the sandbox is rejected by the misconfigured automatic
+approval review, which is the same failure recorded in the implementation report.
+
+Consequences, stated plainly:
+
+- The fixes in `5102dbe` and the safety pass on top of `5cbcce2` have **no
+  independent review**. Their evidence is the implementation agent's own checks
+  (`docs/reports/phase1-implementation.md`, "Safety pass after `5cbcce2`").
+- The changed areas a review should look at first, if one is run later: the lock
+  scope and ordering in `src/opsaccord/persistence/locks.py` and
+  `repositories.add_constraint`/`set_takeover`, the authorization window in
+  `ToolGateway.execute_action`, the classification in
+  `tools/contracts.classify_dispatch_failure`, the live adapter's
+  `action_status` inference, and whether
+  `tests/integration/test_dispatch_safety.py` actually establishes the guarantees
+  it claims. Two of its tests - the probe that must find the control gate held
+  across revalidate-and-claim, and the freeze writer that must block while the gate
+  is held - are *written to fail on the pre-fix code*. That is the implementation
+  agent's design argument, not an observation: PostgreSQL cannot run in this
+  sandbox, so neither the two pre-fix failures nor the post-fix passes were
+  executed. They should be re-run against a database before the claim is treated
+  as established.
+- No independent approval was obtained, and none is implied by anything in this
+  document.

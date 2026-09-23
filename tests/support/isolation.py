@@ -26,13 +26,18 @@ from contextlib import contextmanager
 import sqlalchemy as sa
 
 from opsaccord.config import Settings, to_libpq_dsn
+from opsaccord.persistence.locks import TEST_SCHEMA_RESET_LOCK
 
 TEST_DATABASE_SUFFIX = "_test"
 
 # Database-scoped advisory lock key: (classid, objid). Advisory locks are a
 # cluster-wide resource, so the two-argument form is used to scope the lock to
-# the database the session actually resets.
-ADVISORY_LOCK_KEY = (11296, 1)
+# the database the session actually resets. The key comes from the application's
+# registry rather than being declared here: it must not collide with
+# ``CONTROL_GATE_LOCK``, because this session-scoped lock is held for the whole
+# run while the schema is rebuilt, and a dispatch inside the suite would then
+# block on a lock this process already owns.
+ADVISORY_LOCK_KEY = TEST_SCHEMA_RESET_LOCK
 
 
 def database_name(url: str) -> str:

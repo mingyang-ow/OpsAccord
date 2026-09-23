@@ -243,6 +243,15 @@ def create_app(
     def takeover(
         incident_id: str, actor: Annotated[Actor, Depends(require_human)]
     ) -> dict[str, Any]:
+        """Take control of one incident on behalf of a human operator.
+
+        The takeover is enforced by backend policy and is ordered against
+        dispatch: it either commits before an authorization reads the control
+        state, in which case the authorization is blocked, or an action has
+        already been committed to execution and the takeover cannot cancel the
+        request. A committed dispatch is never recalled; the action ledger and the
+        `action.claimed` audit event record which controls the authorization saw.
+        """
         _snapshot_or_404(incident_id)
         with database.session() as session:
             workflow = repo.set_takeover(session, incident_id=incident_id, actor=actor.name)
@@ -254,6 +263,16 @@ def create_app(
         request: ConstraintRequest,
         actor: Annotated[Actor, Depends(require_human)],
     ) -> dict[str, Any]:
+        """Record a human control that the backend policy engine enforces.
+
+        A control takes effect at the instant it commits. It blocks every action
+        authorization that commits after it - including one already claimed but
+        not yet committed - and it cannot cancel an action that was already
+        committed to execution, because that external request may be in flight and
+        this demo surface has no way to recall it. `freeze_actions` therefore
+        stops the *next* dispatch, not one that has already been authorised; the
+        action ledger shows which controls each authorization evaluated.
+        """
         _snapshot_or_404(incident_id)
         with database.session() as session:
             try:

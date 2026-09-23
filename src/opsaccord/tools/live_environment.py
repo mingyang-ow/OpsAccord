@@ -35,7 +35,12 @@ import httpx
 from opsaccord.config import Settings
 from opsaccord.domain.enums import ActionOutcome
 from opsaccord.domain.models import ToolResult
-from opsaccord.tools.contracts import DispatchTimeout, ReadTimeout, UnknownDemoTarget
+from opsaccord.tools.contracts import (
+    DispatchRefused,
+    DispatchTimeout,
+    ReadTimeout,
+    UnknownDemoTarget,
+)
 from opsaccord.tools.demo_environment import DEFAULT_RUNBOOKS, REVISION, REVISION_SOURCE
 
 # Metric and span series names come from the OTLP -> Prometheus pipeline and the
@@ -620,13 +625,23 @@ class LiveEnvironment:
 
         flagd-ui replaces the stored document wholesale, so every other flag is
         carried through unchanged and only the single requested key is modified.
+
+        The two validations below and the document read all happen *before* the
+        single write, so a failure there is a proved non-execution and is reported
+        as :class:`DispatchRefused`. Everything after the request is issued is
+        either an acknowledgement or an unknown outcome; nothing in between is
+        claimed.
         """
         if flag_id not in FLAG_SAFE_VARIANT:
-            raise UnknownDemoTarget(f"{flag_id!r} is not a verified flag of the pinned revision")
+            raise DispatchRefused(
+                f"{flag_id!r} is not a verified flag of the pinned revision; no write was sent"
+            )
         document = self.read_flag_document(timeout_seconds=timeout_seconds)
         flags = document["flags"]
         if flag_id not in flags:
-            raise LiveEnvironmentUnavailable(f"flag {flag_id!r} is absent from the live document")
+            raise DispatchRefused(
+                f"flag {flag_id!r} is absent from the live document; no write was sent"
+            )
         previous = flags[flag_id].get("defaultVariant")
         flags[flag_id] = {**flags[flag_id], "defaultVariant": variant}
         self._json(
@@ -649,7 +664,11 @@ class LiveEnvironment:
         flag_id: str,
         timeout_seconds: float,
     ) -> ToolResult:
-        live = self._target(target)
+        try:
+            live = self._target(target)
+        except UnknownDemoTarget as exc:
+            # No verified mapping means no request is built, let alone sent.
+            raise DispatchRefused(str(exc)) from exc
         if remediation_id != "disable_feature_flag":
             return ToolResult(
                 tool_name="apply_remediation",
@@ -694,11 +713,19 @@ class LiveEnvironment:
     def action_status(self, idempotency_key: str) -> ActionOutcome:
         """Ask the external system whether the desired state is in place.
 
-        This adapter answers a state question, not an authorship question: it
-        reports whether the flag carries the value this action asked for. That is
-        the honest limit of a flag-document API, and it is enough to resolve an
-        ambiguous dispatch, because the alternative -- assuming the write either
-        landed or did not -- is exactly the guess the controller must not make.
+        This adapter answers a *state* question, not an authorship question. The
+        flag-document API says what the flag is set to; it does not say who set it
+        or whether an earlier write of ours ever landed. The two directions are
+        therefore not symmetric, and the asymmetry is the point:
+
+        * the requested value being **present** is ``CONFIRMED_APPLIED`` - the
+          state this action intended is in force, which is what the workflow needs;
+        * the requested value being **absent** is ``UNKNOWN``, not
+          ``CONFIRMED_NOT_APPLIED``. Something else may have changed the flag after
+          a write of ours landed, so "not the value we asked for" is not evidence
+          that our request was never applied. Claiming non-execution here would be
+          the same unsupported inference the gateway used to make for unclassified
+          errors, and it would let an ambiguous action resolve as a definite fail.
         """
         if not self.reconcile_via_external_state:
             return ActionOutcome.UNKNOWN
@@ -712,7 +739,7 @@ class LiveEnvironment:
         current = document.get("flags", {}).get(applied["flag_id"], {}).get("defaultVariant")
         if current == applied["variant"]:
             return ActionOutcome.CONFIRMED_APPLIED
-        return ActionOutcome.CONFIRMED_NOT_APPLIED
+        return ActionOutcome.UNKNOWN
 
 
 def _span_failed(span: dict[str, Any]) -> bool:
@@ -733,6 +760,7 @@ __all__ = [
     "CALLS_METRIC_CANDIDATES",
     "FLAG_SAFE_VARIANT",
     "LIVE_TARGETS",
+    "DispatchRefused",
     "LiveEnvironment",
     "LiveEnvironmentUnavailable",
     "LiveTarget",

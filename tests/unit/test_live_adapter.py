@@ -320,7 +320,14 @@ def test_dispatch_timeout_is_raised_so_the_gateway_reconciles() -> None:
         )
 
 
-def test_action_status_answers_from_external_state() -> None:
+def test_action_status_confirms_the_requested_state_and_refuses_to_infer_the_rest() -> None:
+    """The two directions are not symmetric, and the asymmetry is the point.
+
+    The requested value being present proves the state this action wanted is in
+    force. The requested value being *absent* proves nothing about whether our
+    write ever happened - another actor may have changed the flag afterwards - so
+    it is UNKNOWN, not CONFIRMED_NOT_APPLIED.
+    """
     stack = FakeStack()
     environment = build(stack)
     environment.read_flag_document(timeout_seconds=2.0)
@@ -335,7 +342,8 @@ def test_action_status_answers_from_external_state() -> None:
     assert environment.action_status("act-5") is ActionOutcome.CONFIRMED_APPLIED
 
     stack.flags["flags"]["paymentUnreachable"]["defaultVariant"] = "on"
-    assert environment.action_status("act-5") is ActionOutcome.CONFIRMED_NOT_APPLIED
+    assert environment.action_status("act-5") is ActionOutcome.UNKNOWN
+    assert environment.action_status("act-5") is not ActionOutcome.CONFIRMED_NOT_APPLIED
 
 
 def test_action_status_is_unknown_when_the_probe_is_disabled_or_unknown() -> None:

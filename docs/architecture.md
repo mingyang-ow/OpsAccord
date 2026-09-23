@@ -42,6 +42,47 @@ Operational audit events are append-only. Mutable workflow projections do not re
 - Approval APIs require a human-authenticated role or an explicitly documented local-development mechanism; the agent cannot approve itself. Keep development controls bound to localhost.
 - Completion requires fresh, service-specific recovery evidence. Failed verification must not become RESOLVED.
 
+### Execution commitment and control ordering
+
+Added by the safety pass that followed Phase 1 implementation. It states the
+guarantee the dispatcher already relied on, closes the gap a *global* human
+control exposed, and bounds what the system is allowed to claim afterwards.
+
+- **Commitment point.** An action becomes committed to execution when the
+  authorization transaction commits. That transaction acquires the control gate,
+  reads the workflow, the active constraint set, the rejected-intent set and the
+  remaining budget, re-runs the policy engine, claims the action
+  (`APPROVED -> DISPATCHING`) and consumes the bound approval. Only after it
+  commits does the gateway call the adapter.
+- **Ordering guarantee.** No human control can commit inside that window. For every
+  control `C` and action `A`, either `C` commits before `A` reads the control set
+  and blocks the authorization, or `A` commits to execution first and `C` cannot
+  cancel it. There is no third outcome: a control write that is only half-committed
+  while a dispatcher reads is not observable.
+- **Shared mechanism.** Every side-effect authorization and every human control
+  write (`add_constraint` for both scopes, `set_takeover`) takes one global
+  transaction-scoped advisory lock, the control gate, as the first lock of its
+  transaction. An incident-scoped control is additionally serialised by the
+  incident row lock; a global constraint has no incident row, which is exactly why
+  the gate exists. Approval decisions do not need it: the claim's conditional
+  update is authoritative for them.
+- **Lock order.** Control gate, then incident row, then workflow row. No path takes
+  them in another order, so the design has no lock cycle; a PostgreSQL deadlock
+  error aborts the authorization and fails safe.
+- **No lock spans an external call.** The gate covers a short in-database
+  transaction, so a slow or hung adapter cannot block human controls.
+- **Explicit limitation.** A control that commits after the commitment point does
+  not cancel the dispatch; the request may already be in flight, and the demo
+  surfaces have no cancellation primitive. This is documented in the API, and the
+  `action.claimed` audit event records the control snapshot the authorization
+  actually evaluated.
+- **Definitive failure versus unknown outcome.** A refusal the adapter can prove
+  (no request was sent) is recorded `FAILED` / `CONFIRMED_NOT_APPLIED`. A timeout,
+  or any error the gateway cannot classify - including one raised *after* the
+  adapter applied the change - is recorded `UNCERTAIN` / `UNKNOWN`, escalates, and
+  is reconciled rather than retried. Observing that the desired state is absent is
+  not evidence that an earlier action never occurred, so it reconciles to `UNKNOWN`.
+
 ## Model rollout
 
 Phase 1 starts with one runtime reasoning provider plus a deterministic test adapter, strict structured outputs, bounded calls, and recorded usage. Provider/model choice is explicit configuration, distinct from the coding-agent model. Preserve the interface for later Laya pre-routing, DeepSeek reasoning, and Luna escalation. None of these models may waive deterministic policy.

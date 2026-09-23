@@ -15,7 +15,8 @@
 | Coding agent | Codex CLI agent on the user's configured DeepSeek provider; the environment reports `deepseek-flash` / `deepseek-v4-pro` as its supported models |
 | Application runtime model | `deterministic` / `deterministic-v1` - no paid application-model calls were made |
 | Optional second review | Claude Code 2.1.267, model `claude-opus-5`, subscription-backed - see `docs/reports/phase1-review.md` |
-| **Overall status** | **READY_FOR_DISCUSSION** |
+| **Overall status at `5102dbe`** | **READY_FOR_DISCUSSION** |
+| Safety-pass status (branch tip) | **PARTIAL** - both follow-up defects are implemented with regression tests and every offline check passes, but the PostgreSQL concurrency, recovery, scenario and live checks could not run in this session and no optional review ran. See "Safety pass after `5cbcce2`". |
 
 `READY_FOR_DISCUSSION` means every executable technical gate in `docs/phase1.md`
 passed on this commit, including the four primary paths against the real isolated
@@ -205,18 +206,194 @@ Unresolved findings and known limitations, stated rather than hidden:
 - No paid application-model call was made, so nothing here evidences model
   behaviour.
 
+## Safety pass after `5cbcce2` - control ordering and uncertain outcomes
+
+**Status: PARTIAL.** The two defects the planning conversation asked to close are
+implemented on this branch with regression tests, and every offline check passes.
+The database-backed concurrency and recovery tests, the scenario suites and the
+seven live paths could not run here, because this sandbox forbids **all** socket
+operations: no PostgreSQL, no network, and no escalated command (the harness's
+automatic approval review is misconfigured). Optional review did not run either.
+Nothing below is called verified unless it says how it was verified.
+
+### What was fixed
+
+**A2 - a global constraint was not ordered against dispatch.**
+
+The incident row lock serialises takeover and incident-scoped constraints against
+a dispatcher's revalidate-and-claim window, but `repositories.add_constraint` only
+took it when `incident_id is not None`. A constraint with `incident_id IS NULL` is
+read by *every* incident's policy evaluation
+(`list_active_constraints` matches `incident_id IS NULL OR incident_id = :id`) and
+yet has no incident row to lock, so under READ COMMITTED an insert committing
+after the dispatcher's control read and before its claim was invisible and the
+side effect went out. Locking the existing constraint rows could not fix this:
+an `INSERT` is not blocked by a lock on rows that already exist, and with no
+constraints recorded there is nothing to lock at all.
+
+The fix introduces one global transaction-scoped advisory lock - the *control
+gate*, `pg_advisory_xact_lock(11296, 1)` in `src/opsaccord/persistence/locks.py` -
+and takes it as the first lock of every side-effect authorization and every human
+control write (`add_constraint` for both scopes, `set_takeover`). The documented
+lock order is **control gate -> incident row -> workflow row**, so the design has
+no lock cycle by construction; the gate is held only for the short in-database
+authorization transaction, never across the external call. Transaction scope is
+load-bearing twice: the server releases the lock on commit, rollback, or backend
+death, so a crashed worker cannot freeze controls, and it cannot leak into the
+next borrowed pooled connection.
+
+**A1 - an unclassified execution error asserted non-execution.**
+
+`execute_action`'s general handler recorded `FAILED` / `CONFIRMED_NOT_APPLIED` for
+any `Exception`. An adapter can apply a change and then fail while reading,
+parsing, constructing or recording its acknowledgement, so that asserted a
+non-execution the code had no evidence for; the adjacent `DispatchTimeout` branch
+already recorded `UNCERTAIN` / `UNKNOWN`.
+
+The fix moves the whole mapping into one place, `classify_dispatch_failure` in
+`src/opsaccord/tools/contracts.py`: a proved pre-dispatch refusal
+(`DispatchRefused`, new) is a definite non-execution, a `DispatchTimeout` is
+unknown, and **anything else is unknown**. Adapters gained the matching
+obligation, stated in the protocol: report `succeeded=False` only when the change
+provably did not happen. Reconciliation was corrected on the same principle: the
+live adapter used to infer `CONFIRMED_NOT_APPLIED` from the desired flag value
+being absent, which is a statement about state, not about who wrote it - another
+actor may have changed the flag afterwards - so absence now reconciles to
+`UNKNOWN`. `plan_action` already reuses an action id for the same intent unless the
+action is `FAILED` / `CANCELLED` / `REJECTED`, so an `UNCERTAIN` action can never
+be replaced by a fresh id, and `DISPATCHING`/`UNCERTAIN` both escalate.
+
+### The guarantee as implemented
+
+- An action is committed to execution when the authorization transaction commits.
+- A control that commits before that reads as active and blocks the dispatch; a
+  control that commits after it cannot cancel the dispatch. There is no
+  half-committed third case a dispatcher can read.
+- Approval decisions need no gate: the claim's conditional update requires the
+  action row to be `APPROVED` *and* the bound approval to be unconsumed,
+  unexpired, and matched on action id and intent digest, so a rejection that
+  commits first makes the claim fail.
+- Residual limitation, documented in the API and in `docs/architecture.md`: a
+  freeze or takeover cannot recall a request that is already in flight, because
+  the demo surfaces have no cancellation primitive. The `action.claimed` audit
+  event now carries the constraint snapshot the authorization actually evaluated,
+  so an operator can reconstruct which side of the boundary a control landed on.
+- `created_at` and `dispatch_started_at` are transaction-local clocks, not commit
+  timestamps: comparing them is evidence of ordering, not proof. The gate, not the
+  timestamp, establishes the ordering at runtime.
+
+### Verification performed in this session
+
+| Check | Exact command | Result |
+| --- | --- | --- |
+| Lint | `uv run ruff check .` | clean |
+| Format | `uv run ruff format --check .` | 73 files already formatted |
+| Types | `uv run mypy src/opsaccord` | success, 40 source files |
+| Offline suite | `uv run pytest -m "not integration" -q` | **89 passed, 7 skipped, 78 deselected** |
+| New outcome-contract tests | `uv run pytest tests/unit/test_dispatch_outcomes.py tests/unit/test_persistence_locks.py -q` | 12 passed |
+| New adapter-contract tests | `uv run pytest tests/unit/test_demo_adapter_outcomes.py -q` | 6 passed |
+| New integration tests | `uv run pytest tests/integration/test_dispatch_safety.py --collect-only -q` | 14 tests collected (not run: no PostgreSQL) |
+| Pre-fix reproduction | `uv run python reports/local/safety-fix-prefix-repro.py` | both defects reproduced from the `5cbcce2` source; see below |
+
+The seven skipped tests are the opt-in live tests, which need
+`OPSACCORD_LIVE_DEMO=1` and the running demo stack.
+
+Every offline check above was re-run in the delivery session that committed this
+pass, with identical results (lint clean, 73 files formatted, 40 source files
+typed, 89 passed / 7 skipped / 78 deselected, and the reproduction script exiting
+`0` with both verdicts `True`). The two sessions were the same environment, so
+this is a repeat measurement, not independent verification.
+
+### Verification that could not run
+
+The blocker is environmental and precise: `socket.socket(AF_INET)` raises
+`PermissionError [Errno 1]`, `AF_UNIX` `bind()` and `connect()` raise the same,
+and any escalated command is rejected by the harness's automatic approval review
+(*"The supported API model names are deepseek-flash, deepseek-v4-pro, but you
+passed codex-auto-review"*). A PostgreSQL-backed test therefore errors during
+fixture setup in 0.21s: `sqlalchemy.exc.OperationalError: (psycopg.OperationalError)
+connection is bad: no error details available`.
+
+Outstanding because of it, and not claimed as passing:
+
+- `tests/integration/test_dispatch_safety.py` - all 14 concurrency, ordering and
+  uncertainty tests, including the two that are *written* to fail on the pre-fix
+  code (the probe that must find the gate held across revalidate-and-claim, and
+  the freeze writer that must block while the gate is held). That expectation is
+  the implementation agent's design argument about code it wrote; neither the
+  pre-fix failures nor the post-fix passes were executed, because the suite needs
+  PostgreSQL. It is outstanding, not established.
+- The pre-fix *concurrency* reproduction: the rule-level reproduction below does
+  not need a database, but the race itself needs two concurrent transactions.
+- `tests/acceptance` and the remaining `tests/integration` suites (64 tests), the
+  nine simulated scenarios, and the seven live paths. The change touches dispatch
+  and recovery, so the live suite is the check that matters most.
+- `reports/local/live-scenarios-final.json` and the live pytest run remain at
+  their `5cbcce2` values; they do not describe this revision.
+
+### Pre-fix reproduction, and its exact scope
+
+`reports/local/safety-fix-prefix-repro.py` (untracked, output in
+`reports/local/safety-fix-prefix-repro.txt`) loads the `5cbcce2` sources with
+`git show` and demonstrates both decisions:
+
+- **A2:** the pre-fix `add_constraint(incident_id=None)` issued **no lock
+  statement at all** against a recording session; the fixed function issues
+  `SELECT pg_advisory_xact_lock(:classid, :objid)`.
+- **A1:** the demo adapter applies the change and then fails while building its
+  acknowledgement (`ValueError: malformed acknowledgement ...`), leaving
+  `applied` populated and the service recovered. The two `5cbcce2` handler lines
+  are extracted verbatim from `gateway.py:394-395` and executed against that real
+  exception: they record `FAILED` / `CONFIRMED_NOT_APPLIED`. The fixed classifier
+  records `UNCERTAIN` / `UNKNOWN` for the same exception.
+
+This reproduces the *decision* each defect turned on, not a full pre-fix
+execution of the dispatch path, which needs a database. The concurrency itself -
+a freeze committing inside an authorization window, or a probe finding the gate
+held - is not reproduced here and is exactly what the unrun integration tests
+establish.
+
+### Optional review for this pass
+
+**Optional external review did not run.** The subscription-backed Claude Code
+harness is installed (`claude --version` reports `2.1.267 (Claude Code)`, settings
+show the subscription model, no API key), but three bounded non-interactive
+attempts hung with no stdout and no stderr - 90s, 120s, and 45s with `--debug` -
+which is consistent with the sandbox blocking every socket. Escalating past the
+sandbox is rejected by the same approval-review failure. Per the handoff, the
+self-checks above were completed instead, and no independent approval is claimed.
+The delivery session re-attempted once more with the exit status and output size
+captured directly: the run was killed by its 120s timeout with exit code `124` and
+an output file of exactly 0 bytes. Two sessions, four bounded attempts, no output;
+no fifth attempt is planned, and the fallback the handoff authorises - continue
+with the implementation agent's own deterministic checks - is what was used.
+The first review (`docs/reports/phase1-review.md`, revision `b4b75aa`) reviewed
+neither these fixes nor the ones in `5102dbe`.
+
 ## Remaining work and discussion
 
 **Blockers (environment, not code):**
 
-- **Push and draft PR are blocked.** `git push -u origin phase1/baseline` fails
-  inside the sandbox on an SSH config permission, and the escalated retry is
-  rejected by the harness: *"The supported API model names are deepseek-flash,
-  deepseek-v4-pro, but you passed codex-auto-review."* The automatic approval
-  review is misconfigured, so no escalated action can be approved - the same
-  failure blocks `rm` and any command that needs approval. The branch exists only
-  locally; there is no PR URL. Pushing it is a one-line manual step for you:
+- **Push and draft PR are blocked.** Re-attempted in the safety pass and still
+  blocked for two independent reasons: `git push -u origin phase1/baseline` fails
+  with *"Bad owner or permissions on /etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf"*
+  before it reaches the network, and even with working SSH this sandbox forbids
+  every socket. The escalated retry is rejected by the harness: *"The supported API
+  model names are deepseek-flash, deepseek-v4-pro, but you passed
+  codex-auto-review."* The automatic approval review is misconfigured, so no
+  escalated action can be approved - the same failure blocks `rm` and any command
+  that needs approval. The branch and its commits exist only locally; there is no
+  PR URL. Publishing is a two-step manual action for you: fix or bypass the ssh
+  config permission, then
   `git -C /home/brentiburo/projects/OpsAccord push -u origin phase1/baseline`.
+- **No PostgreSQL and no network in this session**, which is what leaves the
+  concurrency, recovery, scenario and live checks outstanding (see the safety-pass
+  section above). `socket.socket(AF_INET)` raises `PermissionError [Errno 1]`, and
+  `AF_UNIX` `bind()`/`connect()` raise the same, so no local cluster can be
+  reached by any client.
+- **The optional Claude harness cannot be reached.** It is installed and
+  subscription-configured, but three bounded non-interactive attempts hung with no
+  output at all. Recorded rather than worked around; no review is claimed.
 - `/snap/bin/codex` does not run here: `snap-confine is packaged without necessary
   permissions ... required permitted capability cap_dac_override not found`. The
   working path is the project's `uv` environment (`uv run ...`). Nothing was
@@ -229,10 +406,33 @@ Unresolved findings and known limitations, stated rather than hidden:
 
 - Whether the seven live paths should become a required gate in CI, given they
   need Docker Desktop and take ~20 minutes end to end.
-- Whether the residual global-constraint race should be closed (a global lock row
-  or a `FOR SHARE` read on the constraint set) or documented and accepted.
+- ~~Whether the residual global-constraint race should be closed (a global lock row
+  or a `FOR SHARE` read on the constraint set) or documented and accepted.~~
+  **Closed in the safety pass** with a transaction-scoped advisory control gate;
+  the alternatives that were considered and rejected are recorded in the
+  safety-pass section above and in the decision record the local notes carry.
 - Whether reconciliation's conservatism is the behaviour you want: an unknown
-  external outcome now always hands off rather than ever concluding "not applied".
+  external outcome now always hands off rather than ever concluding "not
+  applied". The safety pass extended this to the *live* adapter, which used to
+  infer "not applied" from the desired flag value being absent; that inference is
+  now `UNKNOWN`, so a live uncertain action can only resolve by finding the
+  desired state present.
+- Whether the control gate should stay a single exclusive advisory lock. It
+  serialises *authorization* across incidents (a few short statements each) for a
+  guarantee a per-incident lock cannot give. A shared-mode gate for dispatch plus
+  an exclusive gate for control writes is the recorded alternative if contention
+  ever shows up.
+- Whether to bound the gate wait with `SET LOCAL lock_timeout` on the
+  authorization transaction. Not added now: the gate is held only for a short
+  in-database transaction, and a timeout would introduce a new failure path this
+  environment cannot exercise.
+- Whether the live adapter should ever be able to report `CONFIRMED_NOT_APPLIED`
+  again. It cannot today, because a flag-document API answers a state question
+  rather than an authorship question; a surface that proves authorship would
+  change that.
+- **Next delivery improvement after these safety changes are assessed:** add the
+  explicitly triggered live CI workflow. It was deliberately *not* added in this
+  pass, per the handoff.
 - Whether to keep the `checkout` memory override as a documented deviation or
   replace it with a different approach (for example excluding the payment path
   from the live demo).
