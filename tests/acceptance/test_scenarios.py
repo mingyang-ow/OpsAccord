@@ -2,8 +2,10 @@
 
 Each scenario drives the full controller/gateway/policy stack and is scored on
 persisted rows, not on the wording of any rationale. The demo execution surface
-is simulated (Docker is unavailable in this environment); the persistence,
-policy, approval, and recovery paths underneath it are real.
+here is the deterministic simulated adapter, which needs no containers; the live
+adapter over the real Astronomy Shop stack is exercised separately by the
+`live_demo` suite. The persistence, policy, approval, and recovery paths
+underneath both are real.
 """
 
 from __future__ import annotations

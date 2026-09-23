@@ -8,7 +8,7 @@
 | Branch | `phase1/baseline` |
 | Base commit | `3168bcf` (branch point: design baseline and Phase 1 foundation) |
 | Implementation commit | `5102dbe` (the commit immediately preceding this report) |
-| Branch commits | `1296b23`, `821414a`, `b4b75aa`, `5102dbe` - 81 files, +17,029 / -42 against the base |
+| Branch commits | `1296b23`, `821414a`, `b4b75aa`, `5102dbe`, then `5cbcce2` and `b508a0f` - the per-revision totals are reproducible with `git diff --shortstat 3168bcf <rev>`; for the branch tip as it stood at `b508a0f` that reports 87 files changed, 18404 insertions(+), 42 deletions(-) |
 | Dirty state | Clean apart from this report and the two evidence files it commits; only gitignored local state (`.local/`, `reports/local/`, `.venv/`) otherwise remains |
 | Host | WSL 2, kernel `6.18.33.2-microsoft-standard-WSL2`, Ubuntu 26.04 LTS, 16 CPU, 15.5 GB RAM |
 | Toolchain | `uv` 0.12.5, Python 3.12.14 (`.python-version`), project-local PostgreSQL 18.6 on `127.0.0.1:55432`, Docker 29.7.2 (client and server), Docker Compose v5.4.0 |
@@ -16,7 +16,8 @@
 | Application runtime model | `deterministic` / `deterministic-v1` - no paid application-model calls were made |
 | Optional second review | Claude Code 2.1.267, model `claude-opus-5`, subscription-backed - see `docs/reports/phase1-review.md` |
 | **Overall status at `5102dbe`** | **READY_FOR_DISCUSSION** |
-| Safety-pass status (branch tip) | **PARTIAL** - both follow-up defects are implemented with regression tests and every offline check passes, but the PostgreSQL concurrency, recovery, scenario and live checks could not run in this session and no optional review ran. See "Safety pass after `5cbcce2`". |
+| Safety-pass status (branch tip) | **PARTIAL** - both follow-up defects are implemented with regression tests and every offline check passes, but the PostgreSQL concurrency, recovery, scenario and live checks could not run and no optional review ran. See "Safety pass after `5cbcce2`". |
+| Validation-pass status | **PARTIAL** - the environment was diagnosed precisely (host services up, sandbox networking denied) and a runnable pre-fix sensitivity harness was added, but no database-backed check has still executed. See "Validation attempt after `b508a0f`". |
 
 `READY_FOR_DISCUSSION` means every executable technical gate in `docs/phase1.md`
 passed on this commit, including the four primary paths against the real isolated
@@ -323,6 +324,9 @@ Outstanding because of it, and not claimed as passing:
   the implementation agent's design argument about code it wrote; neither the
   pre-fix failures nor the post-fix passes were executed, because the suite needs
   PostgreSQL. It is outstanding, not established.
+  `scripts/prefix-sensitivity.sh` covers the same two defects with a portable
+  harness that *can* run against `5cbcce2`, but it has not run either, and it does
+  not replace these 14 tests: it is a smaller, revision-portable demonstration.
 - The pre-fix *concurrency* reproduction: the rule-level reproduction below does
   not need a database, but the race itself needs two concurrent transactions.
 - `tests/acceptance` and the remaining `tests/integration` suites (64 tests), the
@@ -352,6 +356,59 @@ execution of the dispatch path, which needs a database. The concurrency itself -
 a freeze committing inside an authorization window, or a probe finding the gate
 held - is not reproduced here and is exactly what the unrun integration tests
 establish.
+
+### Validation attempt after `b508a0f`
+
+The follow-up pass was asked to restore the environment that previously ran the live
+suite, then run the database-backed and scenario checks. It could not, and the reason
+is not a stopped service.
+
+**Diagnosis: host services are up; the sandbox denies every socket.** The
+project-local cluster is running - `.local/pg/data/postmaster.pid` records PID 22096 on
+port 55432 with socket directory `.local/pg/run`, and `.local/pg/run/.s.PGSQL.55432`
+was rewritten at 20:48, long after the last commit. From inside an agent command,
+however, both `socket.socket(AF_INET).connect(("127.0.0.1", 55432))` and
+`socket.socket(AF_UNIX).connect(...)` raise `PermissionError [Errno 1] Operation not
+permitted`, and the sandbox process itself is launched as
+`codex-linux-sandbox ... "network":"restricted" --apply-seccomp-then-exec`. That is a
+seccomp denial inside the agent's own process tree, not a stopped cluster, not a bad
+DSN, and not a Docker problem. The same applies to the demo stack: it cannot be probed
+from here at all.
+
+**Escalation: attempted once, rejected by the harness.** Running the integration suite
+through the normal supported approval mechanism returned the harness's own failure,
+*"The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed
+codex-auto-review."* Per the handoff, that route was not retried, and nothing was
+bypassed or disabled.
+
+**Prepared instead: a runnable pre-fix sensitivity harness.** `scripts/prefix-sensitivity.sh`
+materialises `5cbcce2` and the fixed revision read-only with `git archive`, copies
+`scripts/prefix_sensitivity/test_prefix_defect_sensitivity.py` into each, and runs it
+against the dedicated `*_test` database. The harness is deliberately portable: it uses
+the advisory key as a literal, monkeypatches `repositories.claim_action` rather than
+calling it with the new `commit_context` argument, and defines its own apply-then-raise
+adapter, so on `5cbcce2` it *imports and executes* instead of failing on a module the fix
+added. Expected: the control test passes in both revisions, and the two defect tests fail
+on `5cbcce2` and pass on the fixed revision. Verified offline here: both materialisations
+import the right source (`5cbcce2`'s `contracts.py`, which has no `DispatchRefused`) and
+the harness collects three tests in each; the run itself stops at fixture setup with
+`psycopg.OperationalError: connection is bad`, which the script now reports distinctly
+as "cannot run" (exit 2) rather than as a result.
+
+Commands for a normal WSL terminal, with expected results:
+
+| Step | Command | Expected |
+| --- | --- | --- |
+| Start the cluster | `scripts/pg.sh status` (or `scripts/pg.sh start`) | `server is running`, port 55432 |
+| Pre-fix sensitivity | `scripts/prefix-sensitivity.sh` | exit 0: `5cbcce2` fails the two defect tests, fixed passes all three |
+| Database-backed safety suite | `UV_CACHE_DIR=/tmp/uvcache uv run pytest -m integration -q` | all integration tests pass, including the 14 in `test_dispatch_safety.py` |
+| Full offline suite | `UV_CACHE_DIR=/tmp/uvcache uv run pytest -m "not integration" -q` | 89 passed, 7 skipped, 78 deselected |
+| Simulated scenarios | `UV_CACHE_DIR=/tmp/uvcache uv run python -m opsaccord.cli run-scenarios` | 9/9 PASS, `simulated: true` |
+| Live paths | `set -a; . .local/demo-endpoints.env; set +a; UV_CACHE_DIR=/tmp/uvcache uv run python -m opsaccord.cli run-live-scenarios --json reports/local/live-scenarios-b508a0f.json` | 7/7 PASS, 0 simulated-evidence records |
+
+Until the first three of those run, A1 and A2 stay "implemented; validation pending",
+the concurrency guarantee stays argued rather than demonstrated, and no scenario or live
+result describes this revision.
 
 ### Optional review for this pass
 

@@ -31,6 +31,11 @@ uv run python -m opsaccord.cli serve-ui       # http://127.0.0.1:8511
 scripts/run_scenarios.sh                      # all P1 scenarios, JSON evidence in reports/local/
 ```
 
+`scripts/prefix-sensitivity.sh` is separate from the suite: it runs a revision-portable harness
+against both the pre-fix revision (`5cbcce2`) and the current tip, to show that the two safety
+defects closed in `b508a0f` fail there and pass here. Its expected results, exit codes, and the
+portability concessions it makes are documented in `scripts/prefix_sensitivity/README.md`.
+
 ## Live Astronomy Shop stack
 
 The live paths run against the pinned upstream demo, not a mock. The checkout

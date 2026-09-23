@@ -262,3 +262,19 @@ Consequences, stated plainly:
   as established.
 - No independent approval was obtained, and none is implied by anything in this
   document.
+
+### Update, validation pass
+
+Claude was not retried, per the handoff ("do not retry Claude in this pass"). The
+optional external review therefore remains **unavailable** rather than failed, and
+still does not exist for `5102dbe` or `b508a0f`.
+
+For the two pre-fix-sensitive tests named above, a route that does not depend on the
+fixed revision's own test file now exists:
+`scripts/prefix-sensitivity.sh`, with the harness in
+`scripts/prefix_sensitivity/`. It is written to import and run against `5cbcce2`
+(no dependency on the module the fix added), so its failures there are behavioural
+rather than import errors. It was verified offline only as far as collection; its
+execution, like every database-backed check in this pass, is outstanding and is
+listed with exact commands in `docs/reports/phase1-implementation.md`,
+"Validation attempt after `b508a0f`".

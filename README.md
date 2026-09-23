@@ -3,7 +3,19 @@
 An incident-response agent with evidence-backed diagnosis, policy-controlled remediation, and human approval.
 
 **Status: Phase 1 implemented and validated locally; awaiting review with the user.**
-The controller, deterministic policy engine, typed tool gateway, PostgreSQL persistence, FastAPI service, Streamlit console, scenarios, and adversarial checks are implemented and exercised end to end. The demo execution surface is *simulated*: Docker is unavailable in this environment, so no live Astronomy Shop stack was run. See [the Phase 1 implementation report](docs/reports/phase1-implementation.md) for exact commands, counts, and what is simulated rather than live.
+The controller, deterministic policy engine, typed tool gateway, PostgreSQL persistence, FastAPI
+service, Streamlit console, scenarios, and adversarial checks are implemented and exercised end to
+end. Both execution surfaces exist: a deterministic simulated adapter, and a live adapter over the
+real Astronomy Shop stack (Prometheus, Jaeger, and the flagd control plane), selected with
+`OPSACCORD_DEMO_MODE`. Docker Desktop runs the pinned `3.1.0` stack locally, and the seven live
+paths have been executed against it with zero simulated-provenance records. See
+[the Phase 1 implementation report](docs/reports/phase1-implementation.md) for exact commands,
+counts, and which evidence is simulated rather than live.
+
+The current safety pass (`b508a0f`, control ordering and uncertain dispatch outcomes)
+is implemented and offline-verified; its PostgreSQL-backed and live validation, and its
+optional independent review, are outstanding. Run `scripts/prefix-sensitivity.sh` to
+reproduce the two defects on the pre-fix revision and confirm they are closed.
 
 ## Phase 1
 
