@@ -78,6 +78,31 @@ uv run pytest                        # everything
 uv run ruff check . && uv run ruff format --check . && uv run mypy src/opsaccord
 ```
 
+`scripts/validate.sh` runs the whole sequence in one pass, with per-stage logs under
+`reports/local/validation-<timestamp>/` and a fail-fast subshell: offline suite, the same suite with
+the live settings exported, lint, formatting and types, then — unless `--offline-only` is passed —
+the PostgreSQL integration suite, the pre-fix sensitivity harness and the nine simulated scenarios.
+`--live` adds the seven live paths, and that is the only stage that loads
+`.local/demo-endpoints.env`, inside a nested subshell so no earlier stage can inherit live mode. It
+also refuses to start the live stage while another live scenario driver is running.
+
+### Configuration isolation in tests
+
+`Settings` reads `OPSACCORD_*` variables and the `.env` file beside the working directory, which is
+the runtime override mechanism. A shell that still exports `.local/demo-endpoints.env` (`scripts/demo.sh
+endpoints` writes `OPSACCORD_DEMO_MODE=live` into it) therefore changes what a *test* observes: a
+default-value assertion fails while everything is working.
+
+A test that asserts a default must request the `isolated_config` fixture. It clears the inherited
+`OPSACCORD_*` variables and moves the working directory to an empty temporary one, for that test
+only. It is never autouse, so override tests and the integration fixtures still see the real
+environment and `OPSACCORD_TEST_DATABASE_URL` keeps working. `tests/unit/test_config_isolation.py`
+pins both halves — the override mechanism still works (the process environment beats `.env`, a
+temporary `.env` is read, and live mode never falls back to the simulator), and the default
+assertions hold while live mode is exported. `scripts/validate.sh` also removes those variables for
+the offline, integration and simulated stages; the list lives in `LIVE_SESSION_VARS` in the script
+and in `tests/conftest.py`, and a test keeps it in step with what `scripts/demo.sh` writes.
+
 ## Independent review
 
 External review is not a completion gate and no reviewer has to be registered before work starts. The DeepSeek-backed Codex agent is the primary development tool; the authenticated, subscription-backed Claude Code harness is authorized for bounded implementation help or an optional second review, and this authorization is about the development workflow only, never the application's runtime models. Record the tool and model that actually ran, and never present a fallback as if the requested reviewer had run.
