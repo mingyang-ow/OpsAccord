@@ -1541,9 +1541,9 @@ it asks the pinned Prometheus for the edge schema with both selector shapes, so 
 the server parse the selector" before the live path answers "does P1-01 resolve".
 
 ```bash
-cd /home/brentiburo/projects/OpsAccord
 (
   set -euo pipefail
+  cd /home/brentiburo/projects/OpsAccord
   deactivate 2>/dev/null || true
   source .venv/bin/activate
   export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
@@ -1557,7 +1557,7 @@ cd /home/brentiburo/projects/OpsAccord
   . .local/demo-endpoints.env
   set +a
   printf 'prometheus: %s\n' "$OPSACCORD_PROMETHEUS_BASE_URL"
-  python - "$OPSACCORD_PROMETHEUS_BASE_URL" <<'PY' 2>&1 | tee "$LOGDIR/series-selector.log"
+  python - "$OPSACCORD_PROMETHEUS_BASE_URL" <<'PY' 2>&1 | tee "$LOGDIR/series-selector.log" || true
 import json, sys, urllib.error, urllib.parse, urllib.request
 base = sys.argv[1]
 for selector in ("span_name='oteldemo.PaymentService/Charge'", "{span_name='oteldemo.PaymentService/Charge'}"):
