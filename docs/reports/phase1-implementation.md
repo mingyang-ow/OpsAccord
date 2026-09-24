@@ -8,18 +8,18 @@
 | Branch | `phase1/baseline` |
 | Base commit | `3168bcf` (branch point: design baseline and Phase 1 foundation) |
 | Implementation commit | `5102dbe` (the commit immediately preceding this report) |
-| Branch commits | `1296b23`, `821414a`, `b4b75aa`, `5102dbe`, `5cbcce2`, `b508a0f`, `cb60242`, the deadlock-correction commits `ed0d132` (committed user guidance), `7b66f11` (the fix), `7becf98` (review fixes), `e8a8e76` (records, which is what the user ran), and the configuration-isolation commits `fe16796` (tests) and `843b34d` (validation runner), then this report's own commit as the tip - per-revision totals are reproducible with `git diff --shortstat 3168bcf <rev>`; for the branch tip as it stood at `b508a0f` that reports 87 files changed, 18404 insertions(+), 42 deletions(-) |
+| Branch commits | `1296b23`, `821414a`, `b4b75aa`, `5102dbe`, `5cbcce2`, `b508a0f`, `cb60242`, the deadlock-correction commits `ed0d132` (committed user guidance), `7b66f11` (the fix), `7becf98` (review fixes), `e8a8e76` (records, which is what the user ran), and the configuration-isolation commits `fe16796` (tests), `843b34d` (validation runner), `a60cecb` (records), `5294575` (corrected a test-selection count) and `7f8c71e` (review fixes), then this report's own commit as the tip - per-revision totals are reproducible with `git diff --shortstat 3168bcf <rev>`; for the branch tip as it stood at `b508a0f` that reports 87 files changed, 18404 insertions(+), 42 deletions(-) |
 | Dirty state | Clean apart from this report and the two evidence files it commits; only gitignored local state (`.local/`, `reports/local/`, `.venv/`) otherwise remains |
 | Host | WSL 2, kernel `6.18.33.2-microsoft-standard-WSL2`, Ubuntu 26.04 LTS, 16 CPU, 15.5 GB RAM |
 | Toolchain | `uv` 0.12.5, Python 3.12.14 (`.python-version`), project-local PostgreSQL 18.6 on `127.0.0.1:55432`, Docker 29.7.2 (client and server), Docker Compose v5.4.0 |
 | Coding agent | Codex CLI agent on the user's configured DeepSeek provider; the environment reports `deepseek-flash` / `deepseek-v4-pro` as its supported models |
 | Application runtime model | `deterministic` / `deterministic-v1` - no paid application-model calls were made |
-| Optional second review | **Not run, and not available in the deadlock-correction pass.** Claude Code 2.1.267 is installed and subscription-backed, but the invocation was denied before it ran by the harness's broken automatic approval review, and a GPT-6 Luna reviewer was rejected by the provider (only `deepseek-flash` and `deepseek-v4-pro` are accepted). A fresh-context agent review on `gpt-5.5-codex` did run - see `docs/reports/phase1-review.md` and "Independent agent review" below |
+| Optional second review | **Not run, and not available on any revision.** Claude Code 2.1.267 is installed and subscription-backed, but the invocation was denied before it ran by the harness's broken automatic approval review, and a GPT-6 Luna reviewer was rejected by the provider (only `deepseek-flash` and `deepseek-v4-pro` are accepted; `gpt-6-sol` was rejected identically when re-tested in the configuration-isolation pass). Fresh-context agent reviews did run in two passes - see `docs/reports/phase1-review.md` and the two "Independent agent review" sections |
 | **Overall status at `5102dbe`** | **READY_FOR_DISCUSSION** |
 | Safety-pass status (branch tip) | **PARTIAL** - both follow-up defects are implemented with regression tests and every offline check passes, but the PostgreSQL concurrency, recovery, scenario and live checks could not run and no optional review ran. See "Safety pass after `5cbcce2`". |
 | Validation-pass status | **PARTIAL** - the environment was diagnosed precisely (host services up, sandbox networking denied) and a runnable pre-fix sensitivity harness was added, but no database-backed check has still executed. See "Validation attempt after `b508a0f`". |
 | **Deadlock-correction status (branch tip with this report)** | **PARTIAL** - the deadlock the user's integration run found is fixed, an independent review found and this pass fixed two further defects in the new tests, and every offline check passes; the corrected test, the pre-fix harness, the nine scenarios and the seven live paths remain unrun because this sandbox denies socket creation. See "Deadlock correction after the integration suite". |
-| **Configuration-isolation status** | **PARTIAL** - the offline failure is fixed and the offline suite is now independent of the operator's shell; the user's integration results were measured on `e8a8e76`, and the pre-fix harness, the nine scenarios and the seven live paths have not run on these test-only changes. See "Configuration-test isolation". |
+| **Configuration-isolation status** | **PARTIAL** - the offline failure is fixed and the offline suite is independent of the operator's shell in either spelling of an override (99 passed, 7 skipped, 78 deselected); a fresh-context review falsified two guarantees in the first version of the fix and both are closed at `7f8c71e`. The user's integration results were measured on `e8a8e76`, and the pre-fix harness, the nine scenarios and the seven live paths have not run on these test-only changes. See "Configuration-test isolation". |
 
 `READY_FOR_DISCUSSION` means every executable technical gate in `docs/phase1.md`
 passed on this commit, including the four primary paths against the real isolated
@@ -749,6 +749,48 @@ the seven live paths are all **unrun in this session**. The user's integration r
 `e8a8e76`; the changes in this pass touch tests, one documentation file and one new script, and no
 `src/` file, which is why the integration suite and the scenarios are not expected to move — but
 that is an expectation, not a measurement, and `scripts/validate.sh` is what settles it.
+
+### Independent agent review of the configuration-isolation pass
+
+The handoff for this pass requires no external review, and the provider makes one impossible anyway:
+a bounded attempt with `gpt-6-luna` was refused word-for-word as before, and a second bounded attempt
+with `gpt-6-sol` was refused identically. That makes the cause the provider's allow-list
+(`deepseek-flash`, `deepseek-v4-pro`) rather than one bad model name, so the agent tool advertises five
+models and none of them can be selected. What did run is a **fresh-context reviewer sub-agent on the
+harness default model**, read-only, given the range `fe16796^..5294575` and told to falsify the pass
+rather than to read it. That is a second agent instance with an independent brief, not an external
+review, and it is not presented as one.
+
+**Verdict: the pass's core claims hold.** The three changed tests do fail against a leaked shell
+without the fixture; the six new tests are non-vacuous; the corrected counts in this report reproduce
+exactly; `scripts/validate.sh --offline-only` is genuinely fail-fast with working `pipefail` and
+`tee`; and `git diff --name-only fe16796^..5294575 -- src/` is empty, so no runtime configuration or
+safety assertion moved. **No production defect was found.**
+
+It falsified two guarantees and found two narrower gaps. All four are fixed in `7f8c71e`, and new tests
+pin the first two:
+
+| Finding | Kind | Status |
+| --- | --- | --- |
+| `isolated_config` scrubbed names case-sensitively (`key.startswith("OPSACCORD_")`) while `Settings` matches environment names **case-insensitively** (pydantic-settings `case_sensitive=False`). Demonstrated: `env opsaccord_demo_mode=live uv run pytest ...::test_defaults_hold_in_an_isolated_configuration_context` -> `AssertionError: assert 'live' == 'simulated'`, and `env opsaccord_demo_mode=live scripts/validate.sh --offline-only` -> **exit 1, 3 failed**. `scripts/validate.sh` had the same hole, because `env -u` cannot match case-insensitively. | **defect** | fixed - the comparison upper-cases the name, the runner removes both spellings, and the mixed-case residual is documented rather than hidden. Pinned by a subprocess regression for both spellings and a direct test of the scrub |
+| The fixture cleared `os.environ` but not the `lru_cache` on `get_settings()`, so a value read from the leaked shell outlived the scrub: `get_settings().demo_mode` stayed `live` after `OPSACCORD_DEMO_MODE` was removed, while `Settings()` said `simulated`. Latent today (only `persistence/db.py` calls `get_settings`, and no offline test does), but any future defaults test exercising application code would have observed the leaked value through a fixture that claimed the environment could not reach it. | **defect (latent)** | fixed - `get_settings.cache_clear()` runs when the fixture starts and when it ends; asserted directly |
+| The competing-driver check ran in the stage-10 preflight, while the protected command is stage 13, after the demo-stack and endpoint stages - a window of minutes in which a driver (or a second `validate.sh --live`) could start undetected. | gap | fixed - the check is repeated immediately before the driver, and the pattern is anchored (`opsaccord\.cli`) instead of using an unanchored `.` wildcard |
+| The drift-guard regex matched only `^OPSACCORD_[A-Z0-9_]+=`, so `export OPSACCORD_NEW=1`, an indented assignment, or a lower-case spelling would have escaped the guard that exists to catch exactly that drift. | gap | fixed - the pattern allows leading whitespace, an optional `export` prefix and either case, and uppercases before comparing |
+
+The falsification is recorded rather than asserted: `reports/local/config-isolation-guard-falsification.log`
+shows the two new tests failing (`2 failed, 1 passed` - the `[upper]` case still passes on the broken
+version, which is the point) and the file passing 8/8 with the fix restored. After the fixes, the
+offline suite reports **99 passed, 7 skipped, 78 deselected** in a clean environment, with the
+upper-case override, and with the lower-case one; ruff, format and mypy stay clean; and
+`scripts/validate.sh --offline-only` exits 0 with a lower-case live export in the parent shell, where
+it exited 1 before.
+
+One observation was deliberately **not** "fixed". An *inconsistent* pair of inherited budget overrides
+(`OPSACCORD_SOFT_STEP_BUDGET=99` with the default hard cap of 16) makes `Settings()` raise
+`ValidationError: hard_step_cap must be >= soft_step_budget` in 34 tests, because the runner
+deliberately keeps budget settings. That is the application failing closed on an invalid
+configuration, not a test observing the shell; isolating it away would hide a real configuration
+error. A consistent pair leaves the suite at 99 passed.
 
 ## Remaining work and discussion
 

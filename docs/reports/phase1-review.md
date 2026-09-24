@@ -298,6 +298,42 @@ failure with a `join()` error. Both were fixed in `7becf98`, and the guard's fai
 the inverted composition is demonstrated in
 `reports/local/lock-order-guard-falsification.log`.
 
+### Update, configuration-isolation pass
+
+No Claude attempt was made: the handoff for this pass says not to retry unavailable external
+reviewers, and no independent review is required for a focused correction. **The optional external
+review still does not exist**, for any revision on this branch.
+
+The provider restriction is now measured twice rather than once. Two bounded attempts, in this pass,
+to start a reviewer sub-agent with an explicit model override were refused with the same error:
+`gpt-6-luna`, and then `gpt-6-sol`. Both messages say the same thing - *"The supported API model names
+are deepseek-flash, deepseek-v4-pro, but you passed &lt;name&gt;"* - which makes the cause the provider's
+model allow-list, not a single mistyped name. It is the same misconfiguration that rejects
+`codex-auto-review` and therefore every escalated command, so one defect in the harness accounts for
+the blocked escalations and the unselectable reviewer alike (see the known-issues note, `B5`).
+
+What did run is recorded in `docs/reports/phase1-implementation.md`, "Independent agent review of the
+configuration-isolation pass": a fresh-context reviewer sub-agent on the harness default model,
+read-only, given `fe16796^..5294575` and told to falsify the pass. It confirmed the pass's core claims
+- the changed tests really do fail against a leaked shell, the six new tests are non-vacuous, the
+corrected counts reproduce, and `src/` is untouched - and found no production defect.
+
+It did falsify two guarantees in the first version of the isolation fix, and both are real:
+
+- the scrub compared names case-sensitively while `Settings` matches them case-insensitively, so
+  `opsaccord_demo_mode=live` bypassed it (reproduced: the isolated defaults test failed, and
+  `scripts/validate.sh --offline-only` exited 1 with three failures);
+- the fixture cleared `os.environ` but not the `lru_cache` on `get_settings()`, so a value read from
+  the leaked shell outlived the scrub.
+
+It also found two narrower gaps: the competing-driver guard ran minutes before the command it
+protects, and the drift-guard regex would have missed `export OPSACCORD_NEW=1` or an indented
+assignment. All four are fixed at `7f8c71e` with new tests pinning the first two;
+`reports/local/config-isolation-guard-falsification.log` shows those tests failing when the fix is
+removed and passing when it is restored. This is the second time in this branch's history that a
+fresh-context review found defects in the pass's own tests rather than in the production code, which
+is the reason to keep running it even when it is not a completion gate.
+
 That is a second pair of eyes on this pass's work, and it is still **not** the
 independent external review this repository's earlier instructions wanted. The
 distinction is kept because it is the difference between evidence and reassurance.
