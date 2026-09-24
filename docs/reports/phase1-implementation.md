@@ -958,6 +958,154 @@ sandbox denies its socket. See `docs/reports/phase1-review.md` for the honest re
   legacy array is preserved deliberately; migrating it would make the reader's job easier and would also
   assert that the old run's status can be reconstructed, which it cannot.
 
+## Dependency attribution for Payment (`2286565` base) - the caller's own view of the edge
+
+**Status: PARTIAL.** The measured Payment failure is fixed at its root cause, and the diagnostic and
+verification contract behind it is now explicit and pinned by **31 new tests**. The offline suite, the
+linter, the formatter and `mypy` pass on this revision. **No database-backed test, no scenario run and no
+live path has executed against it**: the escalation that the integration suite needs is rejected before
+the command runs by the approval provider's own error (`The supported API model names are deepseek-flash,
+deepseek-v4-pro, but you passed codex-auto-review`), the same misconfiguration recorded in the previous
+pass. The new integration tests are therefore *written but unexecuted*, and Payment has not been
+re-measured live. Both are stated as gaps below, not as results.
+
+### The measured failure
+
+`scripts/validate.sh --live --scenario P1-01` (user's terminal, 2026-09-24T08:25Z, 161.0s) recorded
+`SAFE_ESCALATION` / `READY_FOR_HUMAN`, 0 actions, 0 approvals, 5 evidence items, incident
+`inc_01M398H2ZC36N648ZHPN7Y1DZ6` (`reports/local/live-scenarios-20260924T082533.json`). Cleanup
+succeeded: `paymentUnreachable` restored to `off` and read back. The harness saw the fault on the
+**caller**: payment's own probe was `SERVING` / `healthy: true` / `error_rate 0.0` /
+`calls_per_second 0.133`, while checkout's probe was `NOT_SERVING` / `healthy: false` /
+`error_rate 0.333`, with `"attribution": "caller"` after 120.4s. The persisted diagnosis was
+`payment-service is serving normally`.
+
+The same scenario with the same fault passed earlier (`reports/local/live-scenarios-final.json`,
+`inc_01M36T7BYVC1STQHW5TJB8VAEY`, 14 evidence items, 1 action, RESOLVED). It passed because the
+*payment-side aggregate* Charge error share happened to clear the 0.05 bound in that run; the
+`paymentUnreachable` mechanism itself is unchanged.
+
+### Root cause
+
+Three defects, not one:
+
+1. **Nothing collected the caller's view.** The Payment `READ_PLAN` read only target-scoped signals
+   (`read_service_health`, `read_metrics`, `read_traces` on payment) plus changes and the runbook. When
+   checkout fails to reach payment, payment receives nothing and emits nothing: every one of those probes
+   stays quiet. The only observation that can see this fault class is the caller's own client span, and
+   no tool collected it.
+2. **The adapter terminated on the healthy probe.** `DeterministicAdapter` checked
+   `if healthy: -> "payment-service is serving normally"` *before* it looked at any dependency signal, so
+   the one probe that is structurally blind to an unreachable callee was the one that ended the
+   investigation. A healthy server probe is not evidence that the path to it works.
+3. **The historical signal is not a per-caller attribution.** The probe's selectors match
+   `span_name` only (`_op_call_counts` / `_call_counts`), so the Charge series mixes the server side and
+   the client side of the same RPC. In the failing run that aggregate measured `error_rate 0.0` while
+   checkout's own PlaceOrder series measured `0.333`, which is why a threshold change was not the fix:
+   the signal that fired historically is an aggregate whose composition varies run to run.
+
+### The diagnostic contract
+
+* **Allow-listed edges.** `DEPENDENCY_EDGES` in `src/opsaccord/tools/contracts.py` holds the verified
+  edges as `(caller, callee, operation)`: `("checkout-service", "payment-service", "Charge")`. Nothing
+  else is addressable.
+* **A typed, bounded read.** `read_dependency` takes `target` (the *caller*), `dependency` (the callee)
+  and a bounded window. The registry pins `target` to the callers in the edge list and, per target,
+  `dependency` to that caller's verified callees, so `checkout-service -> ad-service` and
+  `payment-service -> payment-service` are refused before dispatch. Reads stay policy-permitted within
+  budget; only `apply_remediation` is a write.
+* **Attribution is recorded, not assumed.** The read records `caller`, `destination`, `operation` and
+  `span_kind: "client"` on the evidence. In live mode the adapter resolves the *label schema* from the
+  server (`/api/v1/series` for the operation, then `/api/v1/label/<name>/values`) instead of assuming
+  names or values: `service_name`/`service` for the emitting service, `span_kind`/`span_kind_client`
+  with a value containing the token `client` for the RPC side.
+* **Five answers, in this order** (`classify_dependency_edge`): not attributable -> *indeterminate*
+  (with the reason); declared window unusable -> *indeterminate*; no calls in the window ->
+  *indeterminate*; missing or non-numeric failure share -> *indeterminate*; otherwise the share is
+  compared against the single calibrated bound `TELEMETRY_ERROR_BOUND = 0.05` -> *failing* or *healthy*.
+  The order is the contract: **an unreachable edge can never be reported as a healthy edge**, and a
+  quiet window is neither a fault nor a recovery.
+* **An instrumentation gap is reported as a gap.** If the exposed schema cannot supply those label
+  names, the live read succeeds with `attributable: false` and the reason, and the adapter escalates
+  with that reason rather than concluding normal operation.
+* **No hidden fault knowledge.** The scenario id, the injected flag and the harness's own observations
+  never reach reasoning. The adapter reads evidence by source like every other item.
+
+### The reasoning rule that changed
+
+For `payment-service` the order is now: a **self-contradictory probe** (healthy and a failing share at
+once) escalates; a **failed or unreachable payment probe** proposes the verified flag as before; an
+**attributable failing caller-side edge** proposes the same remediation while stating the two-level
+finding - *"the checkout-service to payment-service dependency path cannot be reached; the payment server
+itself is serving normally"*; a **healthy probe with an unproven path** (no read collected, or
+unattributable, or a quiet window) escalates and names the gap; only a **healthy probe with a healthy,
+attributed edge** reports normal operation. A healthy edge on its own never justifies a remediation, and
+there is no `P1-01`-specific rule anywhere: the remediation is the mapping the runbook and the registry
+already carry, and it still requires an exact human approval because payment is critical.
+
+### Recovery verification on the same path
+
+`_collect_verification_evidence` now returns one `_VerificationRound` and adds the caller-side read for
+any target with callers. The verdicts follow: the edge **still failing** after the action ->
+`VERIFICATION_FAILURE` (never a success, so never RESOLVED, and no second side effect is attempted);
+**unproven** (indeterminate, or the read failed, or it was no longer affordable, or a human control
+blocked it) -> `VERIFICATION_INCONCLUSIVE`; **healthy** evidence collected at or after the action
+completed -> the existing success path. Freshness is per read: an edge read collected before the action
+makes the whole round stale, exactly like the health probe.
+
+### Changes
+
+| File | Change |
+| --- | --- |
+| `src/opsaccord/tools/contracts.py` | Edge list and helpers, `TELEMETRY_ERROR_BOUND` (single definition), `DependencyVerdict`, `classify_dependency_edge`, `Environment.read_dependency` |
+| `src/opsaccord/tools/registry.py` | `read_dependency` tool spec with the caller/callee allow-list |
+| `src/opsaccord/tools/demo_environment.py` | Simulated edge read: calls are non-zero in both conditions, the share comes from the callee state, an unverified edge is refused |
+| `src/opsaccord/tools/live_environment.py` | `PrometheusClient.series_labels`/`label_values`, schema resolution, client-side selectors, `read_dependency` |
+| `src/opsaccord/tools/gateway.py` | Evidence kind, dispatch, `_VerificationRound`, the edge read in verification, edge-aware verdicts, stop settling when the read is unaffordable |
+| `src/opsaccord/workflow/controller.py` | The caller-side step in the Payment plan; steps bind their own target |
+| `src/opsaccord/reasoning/deterministic.py` | Edge-aware interpretation and the four-way payment rule; `TELEMETRY_ERROR_BOUND` re-exported from the contract |
+| `src/opsaccord/scenarios/live.py` | Imports the bound from the contract; `LIVE_HARD_STEP_CAP` 32 -> **36** |
+
+The live budget is the one constant that changed, deliberately: the intended path now costs 6
+investigation reads + 1 model decision + 1 dispatch + 6 settle rounds x 4 reads = **32**, so a cap of 32
+would leave a real recovery with zero headroom and turn a budget landing into a spurious
+`VERIFICATION_INCONCLUSIVE`. 36 keeps the cap a wall with four steps of slack, and
+`test_settling_fits_inside_the_live_hard_cap` now asserts the headroom rather than only the sum.
+
+### Tests in this session
+
+Executed: `ruff check .`, `ruff format --check .`, `mypy src/opsaccord` (41 files) and
+`pytest -q -m "not integration"` -> **152 passed, 7 skipped, 82 deselected**. New: 10 rule cases in
+`tests/unit/test_deterministic_adapter.py` (a healthy payment with a failing caller edge is a path
+diagnosis; a failing edge is never reported as the payment service failing; a healthy edge on both sides
+is not remediated; a quiet window; a missing read; an unattributable read; malformed evidence; a
+collection error; a self-contradictory probe) and 17 in `tests/unit/test_dependency_attribution.py`
+(the classifier's answers including the bound itself, the edge list, the simulated edge surface, and the
+registry's refusal of any other pair).
+
+Written, **not executed here** (they need PostgreSQL): `test_p1_01_attributes_the_fault_to_the_callers_own_view_of_the_edge`
+in `tests/acceptance/test_scenarios.py` (the caller-side evidence exists with its attribution, and the
+successful verification used edge evidence collected after the action); and three checks in
+`tests/acceptance/test_adversarial_controls.py` - a recovered target probe is not a recovered path (one
+action, `VERIFICATION_FAILURE`, never RESOLVED, no second action), a stale edge read cannot verify
+recovery, and an unaffordable edge read is inconclusive rather than fatal. The fixtures derive from the
+observed payloads with no sensitive values.
+
+### What this pass could not do
+
+* **Payment has not been re-measured live.** The next `--scenario P1-01` run is the real test of the
+  premise, and it is the one command left outstanding.
+* **The client-side Charge error share has not been measured on the pinned stack.** The Failure
+  signature table records the *service* probes; the edge's own series is inferred from the documented
+  span topology (Charge is emitted by both sides; the client side carries `STATUS_CODE_ERROR`, and
+  `astronomy-shop.md` now records the adapter's selector). If that series is absent or carries a
+  different status label, the honest outcome is `attributable: false` with the exposed label names in the
+  reason, a bounded handoff, and a measurement to act on - not a fabricated number and not a weakened
+  assertion.
+* **The new integration tests have not run.** They are written against the fixtures and the persistence
+  contract, and they collect cleanly, but "written" is not "verified"; they belong to the same command as
+  the live run.
+
 ## Remaining work and discussion
 
 **Blockers (environment, not code):**

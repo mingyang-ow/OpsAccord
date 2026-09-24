@@ -177,6 +177,48 @@ traffic is checkout-driven at roughly 4/min and stops for minutes at a time whil
 GetCart runs at ~1/s. A quiet window is therefore not a symptom, and no live
 predicate may treat "no calls" as "faulted" or as "recovered".
 
+### Dependency attribution
+
+`paymentUnreachable` is not a payment-side fault. Checkout reads the flag
+(`src/checkout/main.go` at the pinned revision) and fails the call locally, so the
+Charge never arrives: payment serves whatever else reaches it, emits no error span
+for this call, and its own probes stay healthy. The 2026-09-24 live run is the
+measurement of exactly that shape (recorded in
+`docs/reports/phase1-implementation.md`): payment-server `error_rate` 0.0 with
+`calls_per_second` 0.133, checkout `error_rate` rising to 0.333, and no payment-side
+error span, so a diagnosis built only from the target's own telemetry concluded
+"payment-service is serving normally".
+
+The observation that can attribute this class of fault is the **caller's client
+span for the same operation**, which the table above already records as existing:
+`oteldemo.PaymentService/Charge` is emitted by both `payment` (server) and
+`checkout` (client), and the client side carries `STATUS_CODE_ERROR`. The
+allow-listed edge is therefore:
+
+| Caller | Callee | Operation | Client-side signal |
+| --- | --- | --- | --- |
+| `checkout-service` | `payment-service` | `Charge` | error share of `checkout`'s client spans |
+
+The adapter does not assume the label schema. It reads it from the server
+(`/api/v1/series` for `span_name='oteldemo.PaymentService/Charge'`, then
+`/api/v1/label/<name>/values`) and resolves which label names the emitting
+service (`service_name` or `service`) and which side of the RPC a span is
+(`span_kind` or `span_kind_client`, with a value containing the token `client`).
+It then compares the caller's own error share against the caller's own call rate.
+If the exposed schema cannot supply those two label names, the read reports
+`attributable: false` with the reason: an instrumentation gap is reported as a
+gap, never as a healthy edge and never as a zero.
+
+Two limits are recorded rather than papered over:
+
+* the **client-side error share for this edge has not yet been measured on the
+  pinned stack** (the run above measured the checkout service probe, not the
+  client-side span series), so the live percentage for the edge is an open item
+  for the next Payment run;
+* a window with no Charge calls proves nothing in either direction, and the
+  span-metric cadence means any window shorter than 120s reads as "no data"
+  (see "Two telemetry pipelines, two cadences").
+
 ### Calibrated run parameters
 
 | Parameter | Simulated default | Live value | Why |
@@ -186,12 +228,15 @@ predicate may treat "no calls" as "faulted" or as "recovered".
 | Ad `cpu_utilization` read window | 300s | 60s | container metrics are fresh; a five-minute average dilutes a burn that started a minute ago |
 | Verification window | 300s | 120s | lets a recovering signal leave the lookback promptly |
 | Verification settling | 1 attempt / 0s | 6 rounds x 30s | covers one 120s lookback plus one export interval |
-| Step budgets | soft 8 / hard 16 | soft 12 / hard 32 | investigation 5 + dispatch 1 + 6 settle rounds x 3 reads |
+| Step budgets | soft 8 / hard 16 | soft 12 / hard 36 | investigation 6 + model 1 + dispatch 1 + 6 settle rounds x 4 reads = 32, with headroom |
 
 Both budgets stay enforced; the live values are larger because bounded settling
 for a real telemetry cadence costs more reads than the simulator needs. They are
 set in one place, `opsaccord.scenarios.live.live_settings`, so the CLI, the live
-integration tests, and the report describe the same run.
+integration tests, and the report describe the same run. The fourth read of a
+settle round is the caller-side dependency read; without it a recovery verdict
+would rest on the callee's probe alone, which is the blind spot described under
+"Dependency attribution".
 
 ### Local override for the checkout container
 
