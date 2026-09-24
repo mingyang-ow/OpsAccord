@@ -26,8 +26,8 @@ from pathlib import Path
 
 import pytest
 
-from conftest import LIVE_SESSION_VARS
-from opsaccord.config import REPO_ROOT, Settings
+from conftest import LIVE_SESSION_VARS, scrub_configuration_environment
+from opsaccord.config import REPO_ROOT, Settings, get_settings
 from opsaccord.tools.demo_environment import DemoEnvironment
 from opsaccord.tools.factory import build_environment
 from opsaccord.tools.live_environment import LiveEnvironment
@@ -99,22 +99,33 @@ def test_live_mode_never_resolves_to_the_simulator(
     assert isinstance(build_environment(Settings(demo_mode="live")), LiveEnvironment)
 
 
-def test_the_default_tests_pass_while_the_shell_exports_live_mode() -> None:
-    """The user's failure, as a test: the whole file must pass with live inherited.
+OVERRIDE_VALUES = {
+    "demo_mode": "live",
+    "model_provider": "openai_compatible",
+    "allow_paid_model_calls": "true",
+    "graph_checkpoint_url": "postgresql://inherited/checkpoints",
+}
+
+
+@pytest.mark.parametrize("style", ["upper", "lower"])
+def test_the_default_tests_pass_while_the_shell_exports_live_mode(style: str) -> None:
+    """The user's failure, as a test: the whole file must pass with overrides inherited.
 
     This runs a real pytest subprocess because the property under test is about a
     *process environment*: no fixture can prove that the module is independent of
     the shell it is launched from while running inside that same shell.
+
+    Both spellings are exercised because ``Settings`` reads environment names
+    case-insensitively, so ``opsaccord_demo_mode=live`` leaks exactly like
+    ``OPSACCORD_DEMO_MODE=live``.
     """
     inherited = {
         key: value for key, value in os.environ.items() if not key.startswith(("PYTEST_", "COV_"))
     }
     inherited.update(
         {
-            "OPSACCORD_DEMO_MODE": "live",
-            "OPSACCORD_MODEL_PROVIDER": "openai_compatible",
-            "OPSACCORD_ALLOW_PAID_MODEL_CALLS": "true",
-            "OPSACCORD_GRAPH_CHECKPOINT_URL": "postgresql://inherited/checkpoints",
+            (f"OPSACCORD_{name.upper()}" if style == "upper" else f"opsaccord_{name}"): value
+            for name, value in OVERRIDE_VALUES.items()
         }
     )
 
@@ -131,11 +142,45 @@ def test_the_default_tests_pass_while_the_shell_exports_live_mode() -> None:
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
 
 
+def test_the_scrub_removes_case_variants_and_clears_the_cached_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A case variant is a real leak, and the settings cache outlives the variables.
+
+    Two holes were found by review in the first version of the scrub: it compared
+    names case-sensitively while ``Settings`` does not, and it cleared
+    ``os.environ`` but not ``get_settings``'s cache, so a value read from the
+    leaked shell would still be returned afterwards. Both are pinned here.
+    """
+    monkeypatch.setenv("opsaccord_demo_mode", "live")
+    monkeypatch.setenv("Opsaccord_Soft_Step_Budget", "5")
+    assert get_settings().demo_mode == "live"  # cached from the leaked environment
+    assert get_settings().soft_step_budget == 5
+
+    scrub_configuration_environment(monkeypatch)
+
+    assert "opsaccord_demo_mode" not in os.environ
+    assert "Opsaccord_Soft_Step_Budget" not in os.environ
+    assert Settings().demo_mode == "simulated"
+    assert Settings().soft_step_budget == 8
+    # The cached settings must not survive the scrub.
+    assert get_settings().demo_mode == "simulated"
+    assert get_settings().soft_step_budget == 8
+
+
 def test_the_live_session_variable_list_covers_what_demo_sh_exports() -> None:
-    """The documented leak list cannot drift from the script that creates it."""
+    """The documented leak list cannot drift from the script that creates it.
+
+    The pattern allows leading whitespace, an ``export`` prefix and either case,
+    so the guard holds for the spellings ``scripts/demo.sh`` could plausibly grow
+    rather than only for the one it uses today.
+    """
     script = (REPO_ROOT / "scripts" / "demo.sh").read_text(encoding="utf-8")
     exported = {
-        match.group(1) for match in re.finditer(r"^(OPSACCORD_[A-Z0-9_]+)=", script, re.MULTILINE)
+        match.group(1).upper()
+        for match in re.finditer(
+            r"^\s*(?:export\s+)?(OPSACCORD_[A-Za-z0-9_]+)=", script, re.MULTILINE
+        )
     }
 
     assert exported, "scripts/demo.sh is expected to export OPSACCORD_* endpoints"

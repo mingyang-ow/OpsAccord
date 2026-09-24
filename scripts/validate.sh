@@ -72,9 +72,29 @@ LIVE_SESSION_VARS=(
 without_live_session() {
   local args=() name
   for name in "${LIVE_SESSION_VARS[@]}"; do
-    args+=(-u "$name")
+    # `Settings` matches environment names case-insensitively (pydantic-settings
+    # defaults to case_sensitive=False), so `opsaccord_demo_mode=live` selects
+    # live mode exactly like the upper-case spelling. `env -u` cannot match
+    # case-insensitively, so both spellings are removed. A mixed-case spelling of
+    # the same name (`Opsaccord_Demo_Mode`) is the recorded residual; nothing in
+    # this repository writes one, and the test fixture compares case-insensitively
+    # so the *suite* is not exposed by it.
+    args+=(-u "$name" -u "${name,,}")
   done
   env "${args[@]}" "$@"
+}
+
+# A competing driver shares the demo stack's feature flags with this run, so the
+# live stage refuses to start rather than warning and continuing. Called twice:
+# once as a preflight, and once immediately before the driver, because the demo
+# stack and endpoint stages between them take minutes.
+assert_no_competing_driver() {
+  if pgrep -f 'opsaccord\.cli run-live-scenarios' >/dev/null 2>&1; then
+    printf 'refusing to run: another live scenario driver is active:\n' >&2
+    pgrep -af 'opsaccord\.cli run-live-scenarios' >&2
+    exit 3
+  fi
+  printf 'no competing live scenario driver\n' | tee -a "$LOGS/summary.log"
 }
 
 say "00-checkout (revision under test)"
@@ -91,7 +111,8 @@ run 02-offline-suite without_live_session uv run pytest -q -m "not integration"
 # it once. If this stage ever diverges from 02, the suite has picked up a
 # dependency on the operator's shell.
 run 03-offline-suite-with-live-settings-without-the-opt-in \
-  env -u OPSACCORD_LIVE_DEMO OPSACCORD_DEMO_MODE=live uv run pytest -q -m "not integration"
+  env -u OPSACCORD_LIVE_DEMO -u opsaccord_live_demo OPSACCORD_DEMO_MODE=live \
+  uv run pytest -q -m "not integration"
 
 run 04-lint uv run ruff check .
 run 05-format uv run ruff format --check .
@@ -105,17 +126,15 @@ fi
 
 if [ "$MODE" = "live" ]; then
   say "10-live-preflight"
-  # A competing driver would share the demo stack's feature flags with this run,
-  # so this stops rather than continuing with a warning.
-  if pgrep -f 'opsaccord.cli run-live-scenarios' >/dev/null 2>&1; then
-    printf 'refusing to run: another live scenario driver is active:\n' >&2
-    pgrep -af 'opsaccord.cli run-live-scenarios' >&2
-    exit 3
-  fi
-  printf 'no competing live scenario driver\n' | tee -a "$LOGS/summary.log"
+  assert_no_competing_driver
 
   run 11-demo-stack bash -c 'scripts/demo.sh health >/dev/null 2>&1 || scripts/demo.sh start'
   run 12-demo-endpoints scripts/demo.sh endpoints
+
+  # Re-checked here, not only in the preflight: stages 11 and 12 take minutes, and
+  # a driver started during them would otherwise share the demo fault flags.
+  say "12b-live-driver-guard"
+  assert_no_competing_driver
 
   # The endpoint file is loaded here and nowhere else, so no earlier stage can
   # inherit live mode from it.

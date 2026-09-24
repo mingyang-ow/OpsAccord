@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 import sqlalchemy as sa
 
-from opsaccord.config import REPO_ROOT, Settings
+from opsaccord.config import REPO_ROOT, Settings, get_settings
 from opsaccord.persistence.db import Database
 from opsaccord.reasoning.deterministic import DeterministicAdapter
 from opsaccord.tools import demo_environment as demo
@@ -62,8 +62,31 @@ def settings() -> Settings:
     )
 
 
+def scrub_configuration_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove every inherited ``OPSACCORD_*`` variable and drop cached settings.
+
+    Two details make this complete rather than merely local to ``os.environ``:
+
+    * ``Settings`` matches environment names **case-insensitively**
+      (pydantic-settings defaults to ``case_sensitive=False``), so
+      ``opsaccord_demo_mode=live`` is honoured exactly like the upper-case
+      spelling. The comparison upper-cases the name first, so a case variant
+      cannot survive the scrub.
+    * ``get_settings`` is ``lru_cache``d, so a value read from a leaked shell
+      would outlive the scrub and be handed back afterwards. The cache is
+      cleared here (and again when the fixture finishes), which is what makes an
+      isolated test observe defaults even when application code - not just the
+      test - asks for settings.
+
+    ``monkeypatch`` restores the variables afterwards.
+    """
+    for name in [key for key in os.environ if key.upper().startswith("OPSACCORD_")]:
+        monkeypatch.delenv(name, raising=False)
+    get_settings.cache_clear()
+
+
 @pytest.fixture
-def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """Observe *default* configuration, ignoring this developer's environment.
 
     ``Settings`` is supposed to read ``OPSACCORD_*`` variables and the ``.env``
@@ -74,18 +97,19 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     ``OPSACCORD_DEMO_MODE=live`` (or a model, paid-call, budget or checkpoint
     override) makes the default assertions fail while everything is working.
 
-    This fixture removes the inherited ``OPSACCORD_*`` variables and moves the
-    working directory to an empty temporary one, so neither the process
-    environment nor a real ``.env`` file can reach the test. It is **opt-in and
-    never autouse**: tests that want the ambient environment - the override tests,
-    the integration fixtures, anything reading ``OPSACCORD_TEST_DATABASE_URL`` -
-    still see it. Nothing is changed globally and nothing the user configured is
-    modified; ``monkeypatch`` restores the environment and the directory.
+    This fixture removes the inherited ``OPSACCORD_*`` variables, drops the
+    cached settings, and moves the working directory to an empty temporary one,
+    so neither the process environment, the ``get_settings`` cache, nor a real
+    ``.env`` file can reach the test. It is **opt-in and never autouse**: tests
+    that want the ambient environment - the override tests, the integration
+    fixtures, anything reading ``OPSACCORD_TEST_DATABASE_URL`` - still see it.
+    Nothing is changed globally and nothing the user configured is modified;
+    ``monkeypatch`` restores the environment and the directory.
     """
-    for name in [key for key in os.environ if key.startswith("OPSACCORD_")]:
-        monkeypatch.delenv(name, raising=False)
+    scrub_configuration_environment(monkeypatch)
     monkeypatch.chdir(tmp_path)
-    return tmp_path
+    yield tmp_path
+    get_settings.cache_clear()
 
 
 @pytest.fixture(scope="session")
