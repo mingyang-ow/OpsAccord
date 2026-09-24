@@ -13,6 +13,7 @@ integration run depends on:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import httpx
@@ -52,6 +53,20 @@ FLAG_DOCUMENT = {
 #: hard-coded label name pass these tests.
 SPAN_LABELS = frozenset({"__name__", "service_name", "span_kind", "span_name", "status_code"})
 SPAN_KIND_VALUES = ("SPAN_KIND_SERVER", "SPAN_KIND_CLIENT")
+
+
+def _is_valid_series_selector(selector: str) -> bool:
+    """Does Prometheus's ``match[]`` parser accept this series selector?
+
+    ``/api/v1/series`` parses ``match[]`` as a series selector: either a braced
+    label selector or a bare metric name. A bare ``label='value'`` is a parse
+    error there, and the API answers 400 rather than an empty series list --
+    which is exactly how the live edge read failed, so the fake refuses the same
+    shape instead of answering every selector the adapter happens to send.
+    """
+    if len(selector) > 1 and selector.startswith("{") and selector.endswith("}"):
+        return True
+    return bool(re.fullmatch(r"[a-zA-Z_:][a-zA-Z0-9_:]*", selector))
 
 
 class FakeStack:
@@ -123,7 +138,19 @@ class FakeStack:
             self.flags = body["data"]
             return httpx.Response(200, json={})
         if path == "/api/v1/series":
-            self.series_selectors.append(request.url.params.get("match[]", ""))
+            selector = request.url.params.get("match[]", "")
+            self.series_selectors.append(selector)
+            if not _is_valid_series_selector(selector):
+                # The real server's answer to this: bad_data, not an empty result.
+                return httpx.Response(
+                    400,
+                    json={
+                        "status": "error",
+                        "errorType": "bad_data",
+                        "error": 'invalid parameter "match[]": parse error: unexpected '
+                        "character: '='",
+                    },
+                )
             data = [dict.fromkeys(sorted(self.span_labels))] if self.span_labels else []
             return httpx.Response(200, json={"status": "success", "data": data})
         if path.startswith("/api/v1/label/") and path.endswith("/values"):
@@ -430,7 +457,9 @@ def test_the_edge_read_pins_the_callers_own_client_side_spans() -> None:
     assert value["span_kind"] == "client"
     assert value["attributable"] is True
     assert value["error_rate"] == pytest.approx(1.0)
-    assert stack.series_selectors == ["span_name='oteldemo.PaymentService/Charge'"]
+    # A braced series selector: the unbraced form is a PromQL parse error, and
+    # Prometheus answers it with 400 rather than "no series".
+    assert stack.series_selectors == ["{span_name='oteldemo.PaymentService/Charge'}"]
     calls_query, errors_query = value["queries"]
     for query in (calls_query, errors_query):
         assert "span_name='oteldemo.PaymentService/Charge'" in query
@@ -507,6 +536,74 @@ def test_a_quiet_edge_is_not_a_recovered_edge() -> None:
     assert value["error_rate"] is None
     verdict = classify_dependency_edge(value)
     assert not verdict.failing and not verdict.healthy
+
+
+def test_the_schema_lookup_sends_a_selector_prometheus_can_parse() -> None:
+    """The live failure this pass fixes: the schema query was a parse error.
+
+    ``/api/v1/series?match[]=span_name='oteldemo.PaymentService/Charge'`` answered
+    ``400 Bad Request`` against the pinned stack, so the edge schema was never
+    resolved, every dependency read failed, and recovery stayed unproven even
+    though the remediation had landed. The selector is now braced, and the fake
+    rejects the unbraced form exactly as the server does, so the shape cannot
+    regress unnoticed again.
+    """
+    stack = FakeStack()
+    environment = build(stack)
+
+    result = environment.read_dependency(
+        target="checkout-service",
+        dependency="payment-service",
+        window_seconds=120,
+        timeout_seconds=2.0,
+    )
+
+    assert result.succeeded is True
+    assert result.value["attributable"] is True
+    assert stack.series_selectors == ["{span_name='oteldemo.PaymentService/Charge'}"]
+
+
+def test_the_fake_refuses_a_selector_the_real_server_refuses() -> None:
+    """Guards the guard: unbraced label matchers are a bad request, not a miss.
+
+    If the fake answered this with an empty series list, the adapter's selector
+    could drift back to the form that cost a live run to diagnose.
+    """
+    stack = FakeStack()
+    client = httpx.Client(transport=httpx.MockTransport(stack.handler))
+
+    unbraced = "span_name='oteldemo.PaymentService/Charge'"
+    response = client.get("http://prometheus/api/v1/series", params={"match[]": unbraced})
+
+    assert response.status_code == 400
+    assert response.json()["errorType"] == "bad_data"
+    assert "parse error" in response.json()["error"]
+
+
+def test_a_refused_query_reports_the_servers_own_reason() -> None:
+    """A 4xx must carry the body, not just the status code.
+
+    The live evidence said only "Client error '400 Bad Request'", which does not
+    say whether the selector was unparseable, the parameter unsupported or the
+    query refused. The reason is in the body.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            json={"status": "error", "errorType": "bad_data", "error": "invalid parameter x"},
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(LiveEnvironmentUnavailable) as raised:
+        LiveEnvironment(settings=Settings(), http_client=client).prometheus.series_labels(
+            "{span_name='x'}", timeout_seconds=1.0
+        )
+
+    message = str(raised.value)
+    assert "/api/v1/series" in message
+    assert "422" in message
+    assert "invalid parameter x" in message
 
 
 def test_the_edge_read_refuses_an_unverified_pair() -> None:

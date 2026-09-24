@@ -186,6 +186,22 @@ def _op_selector(metric: str, operation: str, window_seconds: int, **labels: str
     return f"sum(rate({metric}{{{', '.join(parts)}}}[{window_seconds}s]))"
 
 
+def _response_body(response: httpx.Response, *, limit: int = 200) -> str:
+    """The server's own explanation for a failed request, bounded to one line.
+
+    Prometheus answers a bad query with ``{"status": "error", "error": "..."}``
+    and the reason is in the body, not in the status code: a 400 could be a parse
+    error, an unsupported parameter or a refused selector. Without the body the
+    only thing a run records is "400 Bad Request", which cost this pass a live
+    run to work around.
+    """
+    try:
+        text = response.text
+    except Exception:  # a body that cannot be decoded is still a failed request
+        return "<undecodable>"
+    return " ".join(text.split())[:limit] or "<empty>"
+
+
 class PrometheusClient:
     """Bounded, typed access to the Prometheus HTTP API."""
 
@@ -202,6 +218,10 @@ class PrometheusClient:
             payload = response.json()
         except httpx.TimeoutException as exc:
             raise ReadTimeout(f"prometheus {path} exceeded {timeout_seconds}s") from exc
+        except httpx.HTTPStatusError as exc:
+            raise LiveEnvironmentUnavailable(
+                f"prometheus {path} failed: {exc}; body={_response_body(exc.response)}"
+            ) from exc
         except httpx.HTTPError as exc:
             raise LiveEnvironmentUnavailable(f"prometheus {path} failed: {exc}") from exc
         finally:
@@ -594,6 +614,19 @@ class LiveEnvironment:
 
     # --- dependency attribution ------------------------------------------
 
+    @staticmethod
+    def _series_selector(**labels: str) -> str:
+        """Build one series selector for the ``/api/v1/series`` schema lookup.
+
+        Prometheus parses ``match[]`` as a *series selector*, so the labels have
+        to be wrapped in braces. A bare ``span_name='...'`` is a PromQL parse
+        error rather than a selector that matches nothing -- the API answers 400,
+        not an empty series list -- which is how the live edge read failed: the
+        schema could never be resolved, so every dependency read failed and
+        recovery stayed unproven while the remediation had already landed.
+        """
+        return "{" + ", ".join(f"{name}='{value}'" for name, value in sorted(labels.items())) + "}"
+
     def _resolve_edge_labels(
         self, *, operation: str, timeout_seconds: float
     ) -> tuple[str, str, str] | str:
@@ -604,7 +637,7 @@ class LiveEnvironment:
         RPC it observed -- and if the exposed schema cannot supply them, the edge
         is not attributable from span metrics and the caller must say so.
         """
-        selector = f"span_name='{operation}'"
+        selector = self._series_selector(span_name=operation)
         labels = self.prometheus.series_labels(selector, timeout_seconds)
         if not labels:
             return (

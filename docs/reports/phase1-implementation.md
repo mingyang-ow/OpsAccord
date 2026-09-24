@@ -8,7 +8,7 @@
 | Branch | `phase1/baseline` |
 | Base commit | `3168bcf` (branch point: design baseline and Phase 1 foundation) |
 | Implementation commit | `5102dbe` (the commit immediately preceding this report) |
-| Branch commits | `1296b23`, `821414a`, `b4b75aa`, `5102dbe`, `5cbcce2`, `b508a0f`, `cb60242`, the deadlock-correction commits `ed0d132` (committed user guidance), `7b66f11` (the fix), `7becf98` (review fixes), `e8a8e76` (records, which is what the user ran), and the configuration-isolation commits `fe16796` (tests), `843b34d` (validation runner), `a60cecb` (records), `5294575` (corrected a test-selection count) and `7f8c71e` (review fixes), then this report's own commit as the tip - per-revision totals are reproducible with `git diff --shortstat 3168bcf <rev>`; for the branch tip as it stood at `b508a0f` that reports 87 files changed, 18404 insertions(+), 42 deletions(-) |
+| Branch commits | `1296b23`, `821414a`, `b4b75aa`, `5102dbe`, `5cbcce2`, `b508a0f`, `cb60242`, the deadlock-correction commits `ed0d132` (committed user guidance), `7b66f11` (the fix), `7becf98` (review fixes), `e8a8e76` (records, which is what the user ran), the configuration-isolation commits `fe16796` (tests), `843b34d` (validation runner), `a60cecb` (records), `5294575` (corrected a test-selection count) and `7f8c71e` (review fixes), the live-run-recovery commits `74ac1f2` and `2286565`, the dependency-attribution commits `8165c3b`, `fe1a0ea` and `d873dae` (the live edge read pinned offline), the verification-reason commit `4ccca4d`, then this report's own commit as the tip - per-revision totals are reproducible with `git diff --shortstat 3168bcf <rev>`; for the branch tip as it stood at `b508a0f` that reports 87 files changed, 18404 insertions(+), 42 deletions(-) |
 | Dirty state | Clean apart from this report and the two evidence files it commits; only gitignored local state (`.local/`, `reports/local/`, `.venv/`) otherwise remains |
 | Host | WSL 2, kernel `6.18.33.2-microsoft-standard-WSL2`, Ubuntu 26.04 LTS, 16 CPU, 15.5 GB RAM |
 | Toolchain | `uv` 0.12.5, Python 3.12.14 (`.python-version`), project-local PostgreSQL 18.6 on `127.0.0.1:55432`, Docker 29.7.2 (client and server), Docker Compose v5.4.0 |
@@ -21,6 +21,7 @@
 | **Deadlock-correction status (branch tip with this report)** | **PARTIAL** - the deadlock the user's integration run found is fixed, an independent review found and this pass fixed two further defects in the new tests, and every offline check passes; the corrected test, the pre-fix harness, the nine scenarios and the seven live paths remain unrun because this sandbox denies socket creation. See "Deadlock correction after the integration suite". |
 | **Configuration-isolation status** | **PARTIAL** - the offline failure is fixed and the offline suite is independent of the operator's shell in either spelling of an override (99 passed, 7 skipped, 78 deselected); a fresh-context review falsified two guarantees in the first version of the fix and both are closed at `7f8c71e`. The user's integration results were measured on `e8a8e76`, and the pre-fix harness, the nine scenarios and the seven live paths have not run on these test-only changes. See "Configuration-test isolation". |
 | **Live-run-recovery status (branch tip with this report)** | **PARTIAL** - a live run is now observable while it happens and safe to interrupt, cleanup runs on every exit path, and the Payment fault premise is differential instead of a wait for an observation the fault prevents; the new behaviour is pinned by 26 new tests and every offline check passes, but no live path, simulated scenario or database-backed check has run against this revision, and the only live evidence is the user's interrupted run. See "Live-run recovery". |
+| **Live-Payment-verification status (branch tip with this report)** | **PARTIAL** - the user's run on `4ccca4d` passed offline, integration (`85 passed`), sensitivity, the nine simulated scenarios and the focused live P1-01 path at the *harness* level, and the live escalation is now explained: the edge read's Prometheus schema query was a parse error, so no caller-side evidence could ever be collected. That query is corrected with a mutation-checked regression test; the correction has not been exercised against the stack, and P1-01 has still never reached `RESOLVED`. See "The live Payment verification (`104258`)". |
 
 `READY_FOR_DISCUSSION` means every executable technical gate in `docs/phase1.md`
 passed on this commit, including the four primary paths against the real isolated
@@ -1146,6 +1147,11 @@ of this revision reached the integration stage but was cut off inside it; it sho
 alone was not enough, because the previously failing test's cap arithmetic was one read short of the
 refusal it means to pin (see below).
 
+*Since this section was written, both halves ran on the next revision: the user's `104258` run passed
+the integration suite (`85 passed`) and took the focused live P1-01 path, which escalated for a
+separate reason. See "The live Payment verification (`104258`)" above for the measured outcome; the
+analysis below is kept as it stood.*
+
 ### The measured failure
 
 The user ran the full validation on `d873dae` with the project's own environment
@@ -1308,6 +1314,129 @@ risk on this pass.
   live cap of 36 against an intended 32-step path the slack absorbs the difference; reordering budget
   accounting was out of scope for a classification fix.
 
+## The live Payment verification (`104258`) - the edge schema query was unparseable
+
+**Status: PARTIAL.** The user's full validation now passes end to end, and the focused P1-01 live
+path ran for the first time on a revision that carried the previous fix. It escalated safely, and
+the persisted evidence says why: the dependency read could not run at all against the live stack
+because its schema query was a PromQL parse error, so no caller-side evidence was ever collected and
+recovery stayed unproven. That read is corrected here, with a regression test that fails without the
+correction. **The correction itself has not been exercised against the pinned stack** - the sandbox
+still cannot open a socket and the approval route is still rejected - so the live half remains open.
+
+### The user's measured run (revision `4ccca4d`)
+
+`reports/local/validation-20260924T104258/`, `.local/user-live-checks-20260924T104258.log`,
+`reports/local/live-scenarios-20260924T104258.json`:
+
+| Stage | Result |
+| --- | --- |
+| 02 / 03 offline | `191 passed, 7 skipped, 85 deselected` in both variants |
+| 04-06 lint, format, types | clean |
+| 07 integration | **`85 passed`** - every acceptance check, including the corrected `steps_used + 4` cap check |
+| 08 sensitivity harness | `5cbcce2` fails the two defect tests, HEAD passes all three |
+| 09 simulated scenarios | 9/9 |
+| 13 live P1-01 | `SAFE_ESCALATION`, `ESCALATED_INCOMPLETE`, 1 approval, 1 action, no successful verification, 432.4 s; cleanup read `paymentUnreachable` back as `off` |
+
+This is the first run in which the whole database-backed suite passed, so the previous pass's cap
+arithmetic correction is now observed rather than reasoned.
+
+### What the persisted evidence establishes
+
+* **Diagnosis and action.** `inc_01M39GGE3DJVR0SD8ASX7WCTCK`. The diagnosis was
+  *"payment-service is refusing connections; Charge spans error while request rate collapses, which
+  is consistent with the paymentUnreachable fault flag being enabled"* - the adapter's
+  `failing or unreachable` rule, fed by the target probe (`health=NOT_SERVING`, `error_rate=1.00`) and
+  the failing Charge spans. One exact approval, one action
+  (`apply_remediation(disable_feature_flag, paymentUnreachable)`), dispatch acknowledged.
+* **The action cleared the flag, and that is all it proves.** Cleanup found the flag already `off`
+  (the controller disabled it) and read it back as `off`. A flag read-back is not evidence that the
+  caller's dependency path recovered - and this run has no evidence that it did or did not.
+* **No attributable caller evidence was ever received.** Every `read_dependency` call failed with
+  `LiveEnvironmentUnavailable: prometheus /api/v1/series failed: Client error '400 Bad Request' for
+  url '.../api/v1/series?match%5B%5D=span_name%3D%27oteldemo.PaymentService%2FCharge%27'`. The
+  diagnosis therefore fell back to the target signature, and the verification had nothing to read.
+* **The stop cause was a collection failure**, not budget, human control, policy, insufficient
+  traffic or a measured failure: the dependency read *failed*, so the round reported
+  *"the dependency-path verification read failed (LiveEnvironmentUnavailable: ...) so recovery was
+  not established"*, and the verdict was `VERIFICATION_INCONCLUSIVE`.
+* **The workflow exhausted its attempts rather than stopping early.** 30 evidence items decompose as
+  the 6 diagnosis reads plus 6 verification attempts x 4 reads (health, two metrics, the failed
+  dependency read); 6 attempts mean 5 settle sleeps of 30 s = 150 s, matching the 151 s workflow
+  stage. A failed read is not a refusal, so the settle loop kept refreshing evidence.
+* **The same edge was checked for recovery as for diagnosis**: the verification round reads
+  `dependency_callers("payment-service")` -> `checkout-service`, the same
+  `checkout-service -> payment-service` path the diagnosis plan reads.
+* **Not observable from the persisted summary:** the values each attempt's health/metrics reads
+  returned, and therefore whether the 120 s windows still contained pre-remediation errors. No query
+  values are persisted for a failed read.
+
+### Root cause
+
+`/api/v1/series` parses `match[]` as a **series selector**. The adapter sent
+`span_name='oteldemo.PaymentService/Charge'` - a label matcher without the braces - which is a PromQL
+parse error, and the API answers it with `400 Bad Request`. Two facts make this unambiguous:
+
+* a selector that matches *nothing* is not a 400. The API returns `200` with an empty list, and the
+  adapter has an explicit path for that (`no series matches span_name=...`). A 400 can only be a
+  request-level failure, so the schema query was malformed rather than unlucky.
+* the same run's other label lookups worked: the preflight's `347 prometheus series`
+  (`/api/v1/label/__name__/values`) and every metric/span query (braced selectors inside
+  `sum(rate(...))`) came back with data. Only the `match[]` value's shape differed.
+
+So `_resolve_edge_labels` could never resolve a schema against the real stack:
+`read_dependency` failed on every call, every edge observation became a `COLLECTION_ERROR`, and the
+verification could not see the caller's side of the path even after the remediation landed. The
+offline suite could not catch it because the fake stack answered *any* selector with `200` - a
+synthetic schema test proving only that the adapter was consistent with itself.
+
+### The correction
+
+| File | Change |
+| --- | --- |
+| `src/opsaccord/tools/live_environment.py` | `_series_selector()` builds a braced series selector, and `_resolve_edge_labels()` uses it |
+| `src/opsaccord/tools/live_environment.py` | `PrometheusClient._get` reports a bounded, single-lined response body for HTTP error statuses, so a 4xx says *why* (the live evidence said only `400 Bad Request`) |
+| `tests/unit/test_live_adapter.py` | the fake stack now **rejects** a selector the real server rejects (`400`, `bad_data`, `parse error`) instead of answering every selector, and the previously pinned unbraced selector expectation is corrected |
+| `tests/acceptance/test_adversarial_controls.py` | the `steps_used + 4` check now asserts the *shape*, not only the message |
+
+No selector was loosened, no bound moved: a schema the server cannot supply still reports
+`attributable: false` with its reason and still hands off. The three unattributable cases, the quiet
+window and the refusal of an unverified pair are unchanged.
+
+### Tests
+
+Executed (`reports/local/validation-20260924T112600/`): `scripts/validate.sh --offline-only` ->
+**exit 0**; offline **194 passed, 7 skipped, 85 deselected** in both variants; `ruff check` clean;
+`ruff format` clean (83 files); `mypy` clean (41 files).
+
+New offline coverage in `tests/unit/test_live_adapter.py` (28 checks in the file now, 3 new):
+the edge read's schema selector is the braced form; the fake refuses the unbraced form the server
+refuses; and a refused query carries the server's own reason rather than only a status code.
+**Mutation-checked:** reverting `_resolve_edge_labels` to the unbraced selector fails 7 checks -
+including the four unattributable-path checks and the quiet-edge check - with the live run's own
+`400 Bad Request` in the message. The mutation was reverted.
+
+The acceptance check for the cap was strengthened as instructed: it now asserts that
+`read_service_health` and both `read_metrics` reads were recorded under the cap and that no
+`read_dependency` call was recorded, so the refused read is the dependency-path read specifically
+rather than whichever read happens to be named in the message. **It is unexecuted here** - it needs
+PostgreSQL, which this sandbox cannot reach.
+
+### What this pass did not establish
+
+* **The live fix is unconfirmed.** Whether the braced selector resolves a usable schema (a service
+  label, a span-kind label with a client value) on the pinned stack is only answerable by the next
+  live run. If it cannot, the read reports `attributable: false` and the run escalates with a named
+  instrumentation gap - a valid measurement, not a failure to paper over.
+* **Post-remediation recovery is unmeasured.** The flag was disabled and read back, but no live
+  read demonstrated that the caller's Charge path recovered.
+* **Timing was left alone.** Six settle attempts of 30 s span 150 s against a 120 s window, so the
+  final attempt can be clean while the first cannot. That is consistent, not contradictory, and no
+  measurement here justifies raising a timeout, a retry count or a budget.
+* **A deterministic adapter failure is retried six times.** ~151 s of the 432 s run re-ran a read
+  that could not succeed. Retrying is defensible (a Prometheus restart is transient), so it is
+  recorded as an observation for discussion rather than changed.
+
 ## Remaining work and discussion
 
 **Blockers (environment, not code):**
@@ -1400,41 +1529,67 @@ risk on this pass.
   or stay deterministic with live tools.
 
 **One command block for the remaining checks.** This is the whole of what is left to run: the Payment
-path, focused, because the handoff says the remaining scenarios must not start until Payment's result
-has been assessed. It runs in a subshell so the operator's interactive shell is not closed by a failing
-stage, activates the project's own environment explicitly, saves a timestamped log outside the stage
-logs, keeps live settings inside the live subprocess, refuses to start beside another driver, and shows
-progress immediately:
+path, focused, because the remaining scenarios must not start until Payment's result has been
+assessed. It runs in a subshell so the operator's interactive shell is not closed by a failing stage,
+activates the project's own environment explicitly, keeps live settings inside the live subprocess,
+refuses to start beside another driver, and shows progress immediately. Its first step is read-only:
+it asks the pinned Prometheus for the edge schema with both selector shapes, so the log answers "can
+the server parse the selector" before the live path answers "does P1-01 resolve".
 
 ```bash
 cd /home/brentiburo/projects/OpsAccord
 (
   set -euo pipefail
   deactivate 2>/dev/null || true
-  # shellcheck disable=SC1091
   source .venv/bin/activate
   export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
   printf 'interpreter: %s\n' "$(python -c 'import sys; print(sys.executable)')"
-  LOG=".local/user-live-checks-$(date -u +%Y%m%dT%H%M%S).log"
-  printf 'log: %s\n' "$LOG"
-  scripts/validate.sh --live --scenario P1-01 2>&1 | tee "$LOG"
+  LOGDIR=".local/user-live-checks-$(date -u +%Y%m%dT%H%M%S)"
+  mkdir -p "$LOGDIR"
+  printf 'log directory: %s\n' "$LOGDIR"
+  scripts/demo.sh health >/dev/null 2>&1 || scripts/demo.sh start
+  scripts/demo.sh endpoints >/dev/null
+  set -a
+  . .local/demo-endpoints.env
+  set +a
+  printf 'prometheus: %s\n' "$OPSACCORD_PROMETHEUS_BASE_URL"
+  python - "$OPSACCORD_PROMETHEUS_BASE_URL" <<'PY' 2>&1 | tee "$LOGDIR/series-selector.log"
+import json, sys, urllib.error, urllib.parse, urllib.request
+base = sys.argv[1]
+for selector in ("span_name='oteldemo.PaymentService/Charge'", "{span_name='oteldemo.PaymentService/Charge'}"):
+    url = base + "/api/v1/series?" + urllib.parse.urlencode({"match[]": selector})
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            series = json.load(response).get("data") or []
+        labels = sorted({name for one in series for name in one})
+        print(f"match[]={selector}\n  http 200, {len(series)} series, labels {labels}")
+    except urllib.error.HTTPError as exc:
+        print(f"match[]={selector}\n  http {exc.code}: {exc.read().decode()[:300]}")
+    except Exception as exc:  # a diagnostic must never abort the validation behind it
+        print(f"match[]={selector}\n  request failed: {exc!r}")
+PY
+  scripts/validate.sh --live --scenario P1-01 2>&1 | tee "$LOGDIR/validate-live.log"
 )
 ```
 
+Expected: the unbraced selector answers `http 400 ... bad_data`, the braced one answers `http 200`
+with the label names the stack exposes. If the braced selector comes back with no `service_name` or no
+client-side span-kind value, the run will report an unattributable edge and escalate - read that as
+the instrumentation gap it names, not as a failure to work around.
+
 `scripts/validate.sh` is what supplies the rest: it starts and verifies the project-local PostgreSQL
 cluster, runs the offline suite, the linter, the formatter and `mypy`, then the PostgreSQL-backed
-integration suite (which holds this pass's four new checks and the previously failing one), the
+integration suite (which holds the acceptance checks, including the now shape-asserting cap check), the
 sensitivity harness and the simulated scenarios, refuses to run if another live driver holds the demo
 flags, and only then runs the one live path with `PYTHONUNBUFFERED=1` so its per-event lines appear
-while it works. Every stage writes
-`reports/local/validation-<timestamp>/<stage>.log`.
+while it works. Every stage writes `reports/local/validation-<timestamp>/<stage>.log`.
 
-Read three things in that directory: `07-integration-suite.log` (the previously failing
-`test_an_unaffordable_edge_read_is_inconclusive_rather_than_fatal` and the four new acceptance checks
-have never run), `13-live-paths.log` plus the `live-scenarios-*.json` it names for a `read_dependency` evidence
-item carrying `caller=checkout-service`, `destination=payment-service`, `operation=Charge`,
-`span_kind=client` and `attributable: true`, and the persisted diagnosis. A run that escalates again is
-a measurement, not a failure of this command: read the reason, which will name the instrumentation gap
+Read three things in that directory: `07-integration-suite.log` (the strengthened cap check has not
+run here), `13-live-paths.log` plus the `live-scenarios-*.json` it names, and the persisted diagnosis.
+On a good run the evidence holds a `read_dependency` item with `caller=checkout-service`,
+`destination=payment-service`, `operation=Charge`, `span_kind=client` and `attributable: true`, and the
+verification succeeds on fresh caller-side evidence. A run that escalates again is a measurement, not
+a failure of this command: read the reason, which will name the instrumentation gap
 (`attributable: false` with the label names the stack actually exposes) if the client-side Charge series
 is not there.
 

@@ -674,6 +674,7 @@ def test_an_unaffordable_edge_read_is_inconclusive_rather_than_fatal(
         )
         workflow_id = workflow.id
 
+    before = [call.tool_name for call in tool_calls(db, case.incident_id)]
     result = case.gateway.verify_service(
         incident_id=case.incident_id,
         workflow_id=workflow_id,
@@ -686,9 +687,14 @@ def test_an_unaffordable_edge_read_is_inconclusive_rather_than_fatal(
     assert "dependency-path verification read is no longer affordable" in result.detail
     # A budget wall, described as a budget wall: the cause is the cap, not a human.
     assert "human" not in result.detail
-    with db.read_session() as session:
-        incident = repo.get_incident(session, case.incident_id)
-    assert incident is not None and incident.status is not IncidentStatus.RESOLVED
+    # The message alone would also be produced by refusing the *first* read, so
+    # assert the shape too: the health probe and both metrics reads ran under the
+    # cap, and the refused read is the dependency-path read specifically. A
+    # refused read records no tool call at all, so its absence is the evidence.
+    where = [call.tool_name for call in tool_calls(db, case.incident_id)]
+    assert where[len(before) :] == ["read_service_health", "read_metrics", "read_metrics"], where
+    assert "read_dependency" not in where
+    assert_no_resolution_and_one_action(db, case.incident_id)
 
 
 def test_a_cap_spent_before_the_round_is_a_budget_cause_from_the_repository(
