@@ -562,6 +562,33 @@ def verifications(db: Database, incident_id: str) -> list[VerificationRow]:
         )
 
 
+def workflow_id_of(db: Database, incident_id: str) -> str:
+    with db.session() as session:
+        workflow = repo.get_workflow(session, incident_id)
+    assert workflow is not None
+    return workflow.id
+
+
+def tool_calls(db: Database, incident_id: str) -> list[ToolCallRow]:
+    with db.read_session() as session:
+        return list(
+            session.scalars(
+                sa.select(ToolCallRow)
+                .where(ToolCallRow.incident_id == incident_id)
+                .order_by(ToolCallRow.started_at)
+            ).all()
+        )
+
+
+def assert_no_resolution_and_one_action(db: Database, incident_id: str) -> None:
+    """The refusal may not resolve the incident, nor spend a second side effect."""
+    with db.read_session() as session:
+        incident = repo.get_incident(session, incident_id)
+        actions = repo.list_actions(session, incident_id)
+    assert incident is not None and incident.status is not IncidentStatus.RESOLVED
+    assert len(actions) == 1
+
+
 def test_a_recovered_target_probe_is_not_a_recovered_dependency_path(db: Database, rig) -> None:
     """One successful action, no error from the adapter, and still no recovery.
 
@@ -620,9 +647,10 @@ def test_an_unaffordable_edge_read_is_inconclusive_rather_than_fatal(
 ) -> None:
     """The budget is a wall on the path reads too, and the verdict says so.
 
-    The dependency read is the fourth read of a verification round, so a cap that
-    lands exactly there must produce an unproven recovery -- never a success, and
-    never an exception that loses the incident.
+    The dependency read is the fourth read of a verification round, behind the
+    health probe and the two metrics reads, so a cap that leaves those three
+    affordable and lands on the fourth must produce an unproven recovery -- never
+    a success, and never an exception that loses the incident.
     """
     case = rig("P1-01")
     case.controller.run(case.incident_id)
@@ -634,12 +662,15 @@ def test_an_unaffordable_edge_read_is_inconclusive_rather_than_fatal(
     with db.session() as session:
         workflow = repo.get_workflow(session, case.incident_id)
         assert workflow is not None
-        # The next three reads (health plus two metrics) are affordable; the
-        # dependency read that follows them is not.
+        # A read is charged before its verdict is taken, and a refusal rolls that
+        # charge back, so the read refused is the one that would *land on* the cap.
+        # Four steps above the current count leaves the health probe and the two
+        # metrics reads affordable and puts the refusal exactly on the dependency
+        # read that follows them -- which is the case this test is about.
         session.execute(
             sa.update(WorkflowRow)
             .where(WorkflowRow.id == workflow.id)
-            .values(hard_step_cap=workflow.steps_used + 3)
+            .values(hard_step_cap=workflow.steps_used + 4)
         )
         workflow_id = workflow.id
 
@@ -653,9 +684,138 @@ def test_an_unaffordable_edge_read_is_inconclusive_rather_than_fatal(
 
     assert result.outcome is VerificationOutcome.VERIFICATION_INCONCLUSIVE
     assert "dependency-path verification read is no longer affordable" in result.detail
+    # A budget wall, described as a budget wall: the cause is the cap, not a human.
+    assert "human" not in result.detail
     with db.read_session() as session:
         incident = repo.get_incident(session, case.incident_id)
     assert incident is not None and incident.status is not IncidentStatus.RESOLVED
+
+
+def test_a_cap_spent_before_the_round_is_a_budget_cause_from_the_repository(
+    db: Database, rig
+) -> None:
+    """The other budget producer: the repository's wall, reached before any read.
+
+    The engine refuses a read at the cap with a policy verdict; ``consume_step``
+    refuses one once the cap is reached. Both are budget refusals and both must
+    reach the verdict as such -- this test drives the second producer end to end,
+    where the first read of the round is refused and no read is taken at all.
+    """
+    case = rig("P1-01")
+    case.controller.run(case.incident_id)
+    approve(db, pending(db, case.incident_id))
+    action = action_of(db, case.incident_id)
+    execution = case.gateway.execute_action(action_id=action.id)
+    assert execution.action.completed_at is not None
+
+    with db.session() as session:
+        workflow = repo.get_workflow(session, case.incident_id)
+        assert workflow is not None
+        session.execute(
+            sa.update(WorkflowRow)
+            .where(WorkflowRow.id == workflow.id)
+            .values(hard_step_cap=workflow.steps_used)
+        )
+    before = len(tool_calls(db, case.incident_id))
+
+    result = case.gateway.verify_service(
+        incident_id=case.incident_id,
+        workflow_id=workflow_id_of(db, case.incident_id),
+        target="payment-service",
+        action_id=action.id,
+        action_completed_at=execution.action.completed_at,
+    )
+
+    assert result.outcome is VerificationOutcome.VERIFICATION_INCONCLUSIVE
+    assert "the verification reads are no longer affordable" in result.detail
+    assert "hard step cap reached" in result.detail
+    assert "human" not in result.detail
+    assert len(tool_calls(db, case.incident_id)) == before, "a refused round takes no read"
+    recorded = verifications(db, case.incident_id)
+    assert [item.outcome for item in recorded] == [
+        VerificationOutcome.VERIFICATION_INCONCLUSIVE.value
+    ]
+    assert_no_resolution_and_one_action(db, case.incident_id)
+
+
+def test_a_human_denial_of_the_path_read_is_inconclusive_with_the_human_cause(
+    db: Database, rig
+) -> None:
+    """A tool-scoped human denial stops the path read, and is reported as one.
+
+    The constraint names ``read_dependency``, so the probes still answer and the
+    refusal lands on the dependency-path read -- the same read the hard cap hit in
+    the measured failure, with the opposite cause. A human decision must never be
+    described as a budget wall.
+    """
+    case = rig("P1-01")
+    case.controller.run(case.incident_id)
+    approve(db, pending(db, case.incident_id))
+    action = action_of(db, case.incident_id)
+    execution = case.gateway.execute_action(action_id=action.id)
+    assert execution.action.completed_at is not None
+
+    with db.session() as session:
+        repo.add_constraint(
+            session,
+            kind=ConstraintKind.DENY_ACTION,
+            actor="on-call",
+            incident_id=case.incident_id,
+            tool_name="read_dependency",
+            note="do not probe the payment path while I check the instrumentation",
+        )
+    before = [call.tool_name for call in tool_calls(db, case.incident_id)]
+
+    result = case.gateway.verify_service(
+        incident_id=case.incident_id,
+        workflow_id=workflow_id_of(db, case.incident_id),
+        target="payment-service",
+        action_id=action.id,
+        action_completed_at=execution.action.completed_at,
+    )
+
+    assert result.outcome is VerificationOutcome.VERIFICATION_INCONCLUSIVE
+    assert "a human control blocked the dependency-path verification read" in result.detail
+    assert "no longer affordable" not in result.detail
+    recorded = verifications(db, case.incident_id)
+    assert [item.outcome for item in recorded] == [
+        VerificationOutcome.VERIFICATION_INCONCLUSIVE.value
+    ]
+    assert "a human control blocked" in recorded[0].detail
+    # The probes answered, so the refusal was the path read rather than them; and a
+    # refused read records no tool call at all, so the round ended there.
+    where = [call.tool_name for call in tool_calls(db, case.incident_id)]
+    assert where[len(before) :] == ["read_service_health", "read_metrics", "read_metrics"], where
+    assert_no_resolution_and_one_action(db, case.incident_id)
+
+
+def test_takeover_stops_verification_with_the_human_cause(db: Database, rig) -> None:
+    """A human takeover suspends the reads themselves, and the verdict says so."""
+    case = rig("P1-01")
+    case.controller.run(case.incident_id)
+    approve(db, pending(db, case.incident_id))
+    action = action_of(db, case.incident_id)
+    execution = case.gateway.execute_action(action_id=action.id)
+    assert execution.action.completed_at is not None
+
+    with db.session() as session:
+        repo.set_takeover(session, incident_id=case.incident_id, actor="on-call")
+    before = len(tool_calls(db, case.incident_id))
+
+    result = case.gateway.verify_service(
+        incident_id=case.incident_id,
+        workflow_id=workflow_id_of(db, case.incident_id),
+        target="payment-service",
+        action_id=action.id,
+        action_completed_at=execution.action.completed_at,
+    )
+
+    assert result.outcome is VerificationOutcome.VERIFICATION_INCONCLUSIVE
+    assert "a human control blocked the verification reads" in result.detail
+    assert "human takeover is active" in result.detail
+    assert "no longer affordable" not in result.detail
+    assert len(tool_calls(db, case.incident_id)) == before, "takeover takes no read"
+    assert_no_resolution_and_one_action(db, case.incident_id)
 
 
 def test_the_requesting_actor_cannot_approve_its_own_action(db: Database, rig) -> None:

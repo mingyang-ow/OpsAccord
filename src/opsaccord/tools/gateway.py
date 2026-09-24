@@ -57,6 +57,7 @@ from opsaccord.ids import utcnow
 from opsaccord.persistence import repositories as repo
 from opsaccord.persistence.db import Database
 from opsaccord.policy import engine as policy_engine
+from opsaccord.policy.engine import RefusalCause
 from opsaccord.tools.contracts import (
     DependencyVerdict,
     Environment,
@@ -113,10 +114,41 @@ class _VerificationRound:
 
     evidence_ids: list[str]
     collected_after_action: bool
-    blocked: str | None
+    blocked: VerificationBlock | None
     health: ReadOutcome | None
     metrics_ok: bool
     dependency: DependencyVerdict | None = None
+
+
+@dataclass(frozen=True)
+class VerificationBlock:
+    """A verification read that could not be taken, with its cause kept apart.
+
+    ``detail`` is the sentence a human reads; ``cause`` is the same fact as
+    structure. They are built together so the readable text cannot drift into
+    claiming the wrong actor: a hard cap is not a human control, and a human
+    control is not a budget wall.
+    """
+
+    cause: RefusalCause
+    detail: str
+
+
+def _verification_block(
+    *,
+    cause: RefusalCause,
+    subject: str,
+    plural: bool,
+    reason: BaseException,
+) -> VerificationBlock:
+    """Describe a refused verification read without misattributing its cause."""
+    if cause is RefusalCause.BUDGET:
+        detail = f"the {subject} {'are' if plural else 'is'} no longer affordable ({reason})"
+    elif cause is RefusalCause.HUMAN_CONTROL:
+        detail = f"a human control blocked the {subject} ({reason})"
+    else:
+        detail = f"policy refused the {subject} ({reason})"
+    return VerificationBlock(cause=cause, detail=detail)
 
 
 class ToolGateway:
@@ -647,7 +679,7 @@ class ToolGateway:
         """
         evidence_ids: list[str] = []
         collected_after_action = False
-        blocked: str | None = None
+        blocked: VerificationBlock | None = None
         health: ReadOutcome | None = None
         metrics_ok = True
         dependency: DependencyVerdict | None = None
@@ -666,12 +698,25 @@ class ToolGateway:
             # service state is then unmeasured, which is not a recovery: leave the
             # health probe unset so the verdict is inconclusive and the workflow
             # hands off, rather than failing the run with an exception.
-            blocked = f"the verification reads are no longer affordable ({exc})"
+            blocked = _verification_block(
+                cause=RefusalCause.BUDGET,
+                subject="verification reads",
+                plural=True,
+                reason=exc,
+            )
         except PolicyBlocked as exc:
             # A human control (a freeze or a manual-handling constraint) can land
             # between the action and its verification. That is a decision, not a
             # crash: report an unverified outcome and let the controller escalate.
-            blocked = f"a human control blocked the verification reads ({exc})"
+            # The cause comes from the verdict's structured rule id, not from this
+            # sentence: a budget wall is refused here too, and must not be
+            # described as a human control.
+            blocked = _verification_block(
+                cause=policy_engine.refusal_cause(exc.decision),
+                subject="verification reads",
+                plural=True,
+                reason=exc,
+            )
 
         if health is not None:
             evidence_ids.append(health.evidence_id)
@@ -700,18 +745,32 @@ class ToolGateway:
                             budget_class="verification",
                         )
                     except repo.BudgetExhausted as exc:
-                        blocked = f"the verification reads are no longer affordable ({exc})"
+                        blocked = _verification_block(
+                            cause=RefusalCause.BUDGET,
+                            subject="verification reads",
+                            plural=True,
+                            reason=exc,
+                        )
                         break
                     except PolicyBlocked as exc:
-                        blocked = f"a human control blocked the verification reads ({exc})"
+                        blocked = _verification_block(
+                            cause=policy_engine.refusal_cause(exc.decision),
+                            subject="verification reads",
+                            plural=True,
+                            reason=exc,
+                        )
                         break
                     evidence_ids.append(outcome.evidence_id)
                     metrics_ok = metrics_ok and outcome.result.succeeded
             else:
                 metrics_ok = False
 
+        # A round that has already been refused has its verdict. Reading on would
+        # spend budget on a round that cannot settle, and a later refusal would
+        # overwrite the cause with its own -- so the stated cause stays the one
+        # that actually stopped the round.
         callers = dependency_callers(target)
-        if callers:
+        if callers and blocked is None:
             caller = callers[0]
             try:
                 edge = self.read(
@@ -729,21 +788,29 @@ class ToolGateway:
             except repo.BudgetExhausted as exc:
                 # The round is already unaffordable, so stop settling instead of
                 # spending the remaining attempts on reads that cannot happen.
-                blocked = f"the dependency-path verification read is no longer affordable ({exc})"
+                blocked = _verification_block(
+                    cause=RefusalCause.BUDGET,
+                    subject="dependency-path verification read",
+                    plural=False,
+                    reason=exc,
+                )
                 dependency = DependencyVerdict(
                     state="indeterminate",
                     detail=(
-                        "the dependency-path verification read is no longer affordable "
-                        f"({exc}), so recovery was not established on the affected path"
+                        f"{blocked.detail}, so recovery was not established on the affected path"
                     ),
                 )
             except PolicyBlocked as exc:
-                blocked = f"a human control blocked the dependency-path verification read ({exc})"
+                blocked = _verification_block(
+                    cause=policy_engine.refusal_cause(exc.decision),
+                    subject="dependency-path verification read",
+                    plural=False,
+                    reason=exc,
+                )
                 dependency = DependencyVerdict(
                     state="indeterminate",
                     detail=(
-                        "a human control blocked the dependency-path verification read "
-                        f"({exc}), so recovery was not established on the affected path"
+                        f"{blocked.detail}, so recovery was not established on the affected path"
                     ),
                 )
             else:
@@ -800,7 +867,7 @@ class ToolGateway:
         settle_seconds = max(0.0, self.settings.verification_settle_seconds)
         evidence_ids: list[str] = []
         collected_after_action = False
-        blocked: str | None = None
+        blocked: VerificationBlock | None = None
         health: ReadOutcome | None = None
         metrics_ok = True
 
@@ -835,7 +902,7 @@ class ToolGateway:
                 outcome=VerificationOutcome.VERIFICATION_INCONCLUSIVE,
                 service=target,
                 evidence_ids=tuple(evidence_ids),
-                detail=f"verification is inconclusive: {blocked}",
+                detail=f"verification is inconclusive: {blocked.detail}",
                 checked_at=utcnow(),
             )
         elif health is None or not health.result.succeeded or not metrics_ok:

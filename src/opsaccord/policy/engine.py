@@ -8,6 +8,7 @@ performs I/O.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 
 from opsaccord.config import Settings
 from opsaccord.domain.enums import (
@@ -26,6 +27,73 @@ from opsaccord.domain.models import (
     ToolSpec,
     Workflow,
 )
+
+
+class RefusalCause(StrEnum):
+    """Why work was refused, as a closed set a caller can branch on.
+
+    ``matched_rule`` is the engine's structured rule id, and it is the only thing
+    this classification reads: the human-facing ``reasons`` text is never parsed,
+    because prose and cause drift apart. The three causes are the ones a caller
+    has to tell apart to describe a refusal honestly -- a budget wall is not a
+    human decision, and neither is a target outside the allow-list.
+
+    The repository's own budget wall uses the same vocabulary: ``consume_step``
+    raises ``BudgetExhausted`` for a cap it has already reached, which is a
+    budget refusal that never reached the engine. Both producers therefore hand
+    a caller the same ``RefusalCause``.
+    """
+
+    BUDGET = "budget"
+    HUMAN_CONTROL = "human_control"
+    POLICY = "policy"
+
+
+#: Rule ids that mean a budget wall rather than a decision. ``BUDGET_SOFT_EXHAUSTED``
+#: is the soft checkpoint (an extension can clear it); ``BUDGET_HARD_CAP`` is the wall.
+BUDGET_RULES = frozenset({"BUDGET_HARD_CAP", "BUDGET_SOFT_EXHAUSTED"})
+
+#: Rule ids that mean a human decided, or that a human's structured control is
+#: still in force. ``REJECTED_INTENT`` is a recorded human rejection.
+HUMAN_CONTROL_RULES = frozenset(
+    {
+        "HUMAN_TAKEOVER",
+        "CONSTRAINT_FREEZE_ACTIONS",
+        "CONSTRAINT_REQUIRE_MANUAL",
+        "CONSTRAINT_DENY_ACTION",
+        "CONSTRAINT_DENY_TARGET",
+        "REJECTED_INTENT",
+    }
+)
+
+#: Every remaining refusal: the fixed allow-lists, tool bindings, and the
+#: remediation posture. These are refusals by construction, not by a human act.
+POLICY_RULES = frozenset(
+    {
+        "TOOL_MISMATCH",
+        "TOOL_TARGET_BINDING",
+        "TARGET_NOT_ALLOW_LISTED",
+        "TARGET_NOT_REGISTERED",
+        "REMEDIATION_NOT_PERMITTED",
+        "AUTONOMOUS_REMEDIATION_NOT_ALLOW_LISTED",
+    }
+)
+
+
+def refusal_cause(decision: PolicyDecision) -> RefusalCause:
+    """Classify a refused decision by its rule id.
+
+    Only meaningful for a decision with ``allowed=False``. An unrecognised rule
+    id is reported as the generic ``POLICY`` cause rather than as a human act or
+    a budget wall, so a rule added without being classified can never be
+    described as something it is not; ``tests/unit/test_refusal_cause.py`` reads
+    the engine's own source and fails until every refusal rule is listed above.
+    """
+    if decision.matched_rule in BUDGET_RULES:
+        return RefusalCause.BUDGET
+    if decision.matched_rule in HUMAN_CONTROL_RULES:
+        return RefusalCause.HUMAN_CONTROL
+    return RefusalCause.POLICY
 
 
 @dataclass(frozen=True)

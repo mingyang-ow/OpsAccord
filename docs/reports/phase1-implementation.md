@@ -1134,6 +1134,180 @@ observed payloads with no sensitive values.
   the stack as idempotent (`demo.sh health || demo.sh start`) and its endpoint stage rewrites
   `.local/demo-endpoints.env`, so a stopped stack is recovered rather than assumed.
 
+## The verification refusal's cause (`d873dae` base) - a budget wall reported as a human control
+
+**Status: PARTIAL.** The misreported cause is fixed at its root, with the safety outcome and every
+limit untouched. The offline suite, the linter, the formatter and `mypy` pass on this revision. **The
+integration suite and the Payment live run still have not executed here** - the sandbox denies every
+socket and the one escalation attempt this pass made was rejected before the command ran by the same
+approval-provider error recorded below - so the new database-backed checks are written but
+unexecuted, and this revision of the Payment path has not been re-measured live. The user's own run
+of this revision reached the integration stage but was cut off inside it; it showed that the fix
+alone was not enough, because the previously failing test's cap arithmetic was one read short of the
+refusal it means to pin (see below).
+
+### The measured failure
+
+The user ran the full validation on `d873dae` with the project's own environment
+(`reports/local/validation-20260924T085852/`): offline `159 passed, 7 skipped`, lint, formatting and
+types clean, **integration `81 passed, 1 failed`**, and the later stages - including the Payment live
+path - were not reached, because the integration stage fails the run.
+
+The failing check was
+`tests/acceptance/test_adversarial_controls.py::test_an_unaffordable_edge_read_is_inconclusive_rather_than_fatal`.
+Its outcome was already correct - `VERIFICATION_INCONCLUSIVE`, never RESOLVED - but its detail was:
+
+```
+verification is inconclusive: a human control blocked the dependency-path verification
+read (hard step cap reached)
+```
+
+The test asserted that the explanation names an unaffordable read. It was right and the code was
+wrong: nothing human happened. This is a **misreported cause**, not a wrong safety outcome, and the
+historical `SAFE_ESCALATION` result is not relabelled.
+
+### The second measured run (the fix, and a second failure it exposed)
+
+The user then re-ran the full validation on this revision (`reports/local/validation-20260924T091302/`,
+`.local/user-live-checks-20260924T091302.log`). The offline suite, lint, formatting and types passed
+again - `191 passed, 7 skipped`, matching the offline runs recorded below - and the run was cut off
+inside the integration stage, after 43 of the 85 integration checks. The last thing recorded is
+
+```
+...............F...........................
+```
+
+The sixteenth integration check in collection order is the same
+`test_an_unaffordable_edge_read_is_inconclusive_rather_than_fatal`, so the fix removed the human
+wording but the test still failed. The abort left no summary line and no traceback, so the cause was
+established by reading the code and the accounting rather than from the run's own output.
+
+### Root cause
+
+There are two producers of a budget refusal, and the second one was being described as a human act:
+
+1. `repo.consume_step` raises `BudgetExhausted` when the cap has already been reached. The gateway
+   already handled this correctly, and its wording is a budget wall.
+2. `policy_engine.evaluate` also refuses a read at the cap, with `allowed=False` and
+   `matched_rule="BUDGET_HARD_CAP"` (and, for autonomous side effects, `BUDGET_SOFT_EXHAUSTED`).
+   `ToolGateway.read` consumes the step first and evaluates policy second, so a read that lands
+   exactly on the cap is charged first and refused second, and the refusal rolls that charge back
+   with it. That refusal arrives as
+   `PolicyBlocked`, and the verification round's `except PolicyBlocked` handler described **every**
+   policy refusal as `a human control blocked ...`. A hard cap was therefore reported as a human
+   decision, in the same sentence, every time the cap landed on a read rather than before it.
+
+Two smaller defects in the same path:
+
+3. The round kept reading after a refusal. Once the health or metrics read was refused, the
+   dependency-path read was still attempted, so the refusal a human was shown was whichever came
+   **last** rather than the one that stopped the round - and the budget was spent on a round that
+   could not settle.
+4. The classification was taken from the readable sentence (`str(exc)`, i.e. the verdict's `reasons`)
+   rather than from the verdict's structured rule id, which is why prose and cause could disagree.
+
+### The correction
+
+`RefusalCause` (`BUDGET` / `HUMAN_CONTROL` / `POLICY`) and `refusal_cause(decision)` now live in
+`policy/engine.py`, beside the rules, and classify a refused decision by `matched_rule` alone - never
+by its text. The rule ids are partitioned into three explicit sets, and the specific `RefusalCause` is
+carried alongside. The repository's `BudgetExhausted` maps to the same `BUDGET` cause, so both
+producers hand a caller the same vocabulary.
+
+The gateway builds a small `VerificationBlock(cause, detail)` for each refusal, with the sentence
+derived from the cause: a cap reads `the <subject> is/are no longer affordable (...)`, a human control
+reads `a human control blocked the <subject> (...)`, and any other refusal reads
+`policy refused the <subject> (...)`. The dependency-path verdict's detail is composed from the same
+block, so the two cannot drift apart. The round now stops at the first refusal
+(`if callers and blocked is None`), which keeps the stated cause the one that actually stopped it.
+
+Deliberately unchanged: the budget limits, `consume_step`'s ordering and accounting, the persistence
+schema (`VerificationRow` still stores `outcome` and `detail`, so existing rows and readers are
+unaffected), the sentence a successful verification writes, and the failing test itself - its
+assertion was correct and is not weakened. The new structure is in-flight only; what is persisted is
+the same two columns as before.
+
+| File | Change |
+| --- | --- |
+| `src/opsaccord/policy/engine.py` | `RefusalCause`, `BUDGET_RULES`, `HUMAN_CONTROL_RULES`, `POLICY_RULES`, `refusal_cause()` |
+| `src/opsaccord/tools/gateway.py` | `VerificationBlock`, `_verification_block()`, all three read refusals classified by cause, the round stops at the first refusal |
+
+### The check's cap arithmetic, and why the fix alone was not enough
+
+The refusals are now classified correctly, but the failing test's cap was one step short of the read
+it means to refuse. `ToolGateway.read` consumes the step *before* it evaluates policy, and the
+verdict's cap test is `steps_used >= hard_step_cap`; a refusal then rolls its own charge back
+(`Database.session` rolls back on the exception). A read is therefore refused when it *would land on*
+the cap, not after it. With `hard_step_cap = steps_used + 3` the health probe and the first metrics
+read are affordable, the **second metrics read is the one refused**, and the dependency-path read is
+never reached - so the verdict read `the verification reads are no longer affordable`, while the test
+(and its docstring) expects the refusal on the dependency-path read.
+
+That accounting is also what the measured failure proves: its detail names the *dependency-path* read
+as the refusal, which is only reachable when `steps_used < hard_step_cap` at that read, i.e. when the
+earlier refused metrics read was **not** left charged. A refused read spends no budget.
+
+The correction is the test's: `hard_step_cap = steps_used + 4` leaves the health probe and both
+metrics reads affordable and puts the refusal exactly on the dependency-path read, which is the case
+the check exists to cover. Its assertions are unchanged and none is weakened; the added comment says
+why the number is four. The same arithmetic was checked against both readings of the accounting (a
+charge that persists and one that is rolled back) and refuses the dependency-path read either way.
+
+### Tests and what was executed
+
+Executed at this revision (`reports/local/validation-20260924T091147/`):
+`scripts/validate.sh --offline-only` -> **exit 0**; offline suite **191 passed, 7 skipped, 85
+deselected** in both variants (with and without live settings); `ruff check` clean; `ruff format`
+clean (83 files); `mypy` clean (41 files).
+
+New offline coverage (30 checks):
+
+- `tests/unit/test_refusal_cause.py` (20) - each real rule id maps to its cause; an unknown id falls
+  back to the generic policy cause rather than to a human or a budget; a **source scan of the engine**
+  asserts the three sets cover every `matched_rule` the engine returns with `allowed=False`, in both
+  directions, so a rule added without a cause fails the suite; and four tests build *real*
+  `PolicyRequest`s for the dependency read and pin the engine's actual verdicts - a spent cap yields
+  `BUDGET_HARD_CAP`, a tool-scoped denial yields `CONSTRAINT_DENY_ACTION`, a takeover yields
+  `HUMAN_TAKEOVER`, and a read inside budget is still `ALLOW_READ_ONLY`.
+- `tests/unit/test_verification_blocks.py` (12) - the real round and the real verdict driven against a
+  scripted gateway: the measured failure's exact shape (a `BUDGET_HARD_CAP` policy refusal of the
+  dependency-path read) reports a budget cause and never the word "human"; the exception path does the
+  same; takeovers, freezes and manual-handling constraints report a human cause; an allow-list refusal
+  reports the third cause; a refused round takes no further read and no read is retried; and a healthy
+  round still returns `VERIFICATION_SUCCESS` with its four evidence ids.
+- Mutation-checked, all reverted: hard-coding the human cause at the path read fails three of the new
+  tests; removing the stop-at-first-refusal guard fails the no-extra-read test; deleting a rule id
+  from a classification set, and adding an unclassified rule id to the engine, each fail the drift
+  guard.
+
+Written, **not executed here** (they need PostgreSQL): three additions to
+`tests/acceptance/test_adversarial_controls.py` - a tool-scoped human denial of the path read
+(`CONSTRAINT_DENY_ACTION`, human wording, probes still answered, no tool call for the refused read),
+a takeover that stops the round before any read, and a cap spent before the round that refuses the
+first read without taking one. The previously failing test is unchanged apart from one added
+assertion that the detail does not say "human", and the `+ 3` -> `+ 4` cap correction described
+above, which is what makes it reach the read it means to refuse. Until that suite runs, all four
+checks are unverified here, so the acceptance fixtures - not the classification - remain the open
+risk on this pass.
+
+### What this pass could not do
+
+* **The integration suite has still not run on this revision.** The four new database-backed checks
+  and the previously failing test belong to the one command block below. The classification itself is
+  covered offline, including the engine's real verdicts, so the remaining risk is the acceptance
+  fixtures rather than the fix.
+* **Payment has still not been re-measured live**, and the client-side Charge series is still
+  unmeasured on the pinned stack (see the limitation above): if the stack does not expose
+  `span_kind`, the run reports `attributable: false` with the labels it did see, which is a
+  measurement to act on rather than a failure to paper over.
+* **One boundary behaviour, recorded rather than changed:** `read` consumes before it evaluates, so a
+  read that would *reach* the cap is refused by the engine's verdict (`BUDGET_HARD_CAP`) instead of
+  by `consume_step`'s exception. Accounting itself is unchanged - the refusal rolls its own charge
+  back, the read does not execute, and `steps_used` never exceeds the cap - but the two producers are
+  reached at adjacent boundaries, which is what the new acceptance checks pin from both sides. At the
+  live cap of 36 against an intended 32-step path the slack absorbs the difference; reordering budget
+  accounting was out of scope for a classification fix.
+
 ## Remaining work and discussion
 
 **Blockers (environment, not code):**
@@ -1241,20 +1415,23 @@ cd /home/brentiburo/projects/OpsAccord
   source .venv/bin/activate
   export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
   printf 'interpreter: %s\n' "$(python -c 'import sys; print(sys.executable)')"
-  scripts/validate.sh --live --scenario P1-01 2>&1 \
-    | tee ".local/user-live-checks-$(date -u +%Y%m%dT%H%M%S).log"
+  LOG=".local/user-live-checks-$(date -u +%Y%m%dT%H%M%S).log"
+  printf 'log: %s\n' "$LOG"
+  scripts/validate.sh --live --scenario P1-01 2>&1 | tee "$LOG"
 )
 ```
 
 `scripts/validate.sh` is what supplies the rest: it starts and verifies the project-local PostgreSQL
 cluster, runs the offline suite, the linter, the formatter and `mypy`, then the PostgreSQL-backed
-integration suite (which holds the four new checks in this pass), the sensitivity harness and the
-simulated scenarios, refuses to run if another live driver holds the demo flags, and only then runs the
-one live path with `PYTHONUNBUFFERED=1` so its per-event lines appear while it works. Every stage writes
+integration suite (which holds this pass's four new checks and the previously failing one), the
+sensitivity harness and the simulated scenarios, refuses to run if another live driver holds the demo
+flags, and only then runs the one live path with `PYTHONUNBUFFERED=1` so its per-event lines appear
+while it works. Every stage writes
 `reports/local/validation-<timestamp>/<stage>.log`.
 
-Read three things in that directory: `07-integration-suite.log` (the new acceptance checks have never
-run), `13-live-paths.log` plus the `live-scenarios-*.json` it names for a `read_dependency` evidence
+Read three things in that directory: `07-integration-suite.log` (the previously failing
+`test_an_unaffordable_edge_read_is_inconclusive_rather_than_fatal` and the four new acceptance checks
+have never run), `13-live-paths.log` plus the `live-scenarios-*.json` it names for a `read_dependency` evidence
 item carrying `caller=checkout-service`, `destination=payment-service`, `operation=Charge`,
 `span_kind=client` and `attributable: true`, and the persisted diagnosis. A run that escalates again is
 a measurement, not a failure of this command: read the reason, which will name the instrumentation gap
