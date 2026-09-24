@@ -21,6 +21,7 @@ def test_every_declared_tool_is_typed_and_has_no_shell_or_url_primitive(
         "read_metrics",
         "read_traces",
         "read_service_health",
+        "read_dependency",
         "read_recent_changes",
         "read_runbook",
         "apply_remediation",

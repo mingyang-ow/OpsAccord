@@ -33,11 +33,20 @@ be persisted with simulated provenance (or the reverse).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from opsaccord.domain.enums import ActionOutcome, ActionStatus
 from opsaccord.domain.models import ToolResult
+
+#: Failure share at or above which a signal is read as failing rather than as
+#: healthy traffic. The live health probe calls a service serving only when fewer
+#: than this share of its attempts in the window fail, so this is the same bound
+#: the probe uses: "the edge is failing" and "the service is not serving" then
+#: mean the same thing everywhere, and a diagnosis cannot rest on a share that the
+#: probe itself would call healthy.
+TELEMETRY_ERROR_BOUND = 0.05
 
 
 class ReadTimeout(RuntimeError):
@@ -61,6 +70,143 @@ class DispatchRefused(RuntimeError):
 
 class UnknownDemoTarget(KeyError):
     """The adapter has no verified mapping for the requested target."""
+
+
+#: Allow-listed service-to-service dependency edges, as
+#: ``(caller, callee, operation_alias)``.
+#:
+#: A dependency-path fault needs the *caller's* own observation of the RPC. When a
+#: caller cannot reach a callee, the callee receives nothing, so it emits no
+#: server span at all: asking only about the callee's own telemetry cannot see
+#: this class of failure, and a healthy callee reading is not evidence that the
+#: caller-to-callee path works. The client span is the observation that carries
+#: destination and operation, and only edges verified against the pinned revision
+#: are listed here (see docs/astronomy-shop.md, "Dependency attribution").
+DEPENDENCY_EDGES: tuple[tuple[str, str, str], ...] = (
+    ("checkout-service", "payment-service", "Charge"),
+)
+
+
+def dependency_callees(caller: str) -> tuple[str, ...]:
+    """Allow-listed callees for one caller, in declaration order."""
+    return tuple(callee for edge_caller, callee, _ in DEPENDENCY_EDGES if edge_caller == caller)
+
+
+def dependency_callers(callee: str) -> tuple[str, ...]:
+    """Callers whose own client spans can attribute a fault at ``callee``."""
+    return tuple(caller for caller, edge_callee, _ in DEPENDENCY_EDGES if edge_callee == callee)
+
+
+def dependency_operation(caller: str, callee: str) -> str | None:
+    """The operation alias that identifies this edge, or None if it is not one."""
+    for edge_caller, edge_callee, operation in DEPENDENCY_EDGES:
+        if edge_caller == caller and edge_callee == callee:
+            return operation
+    return None
+
+
+@dataclass(frozen=True)
+class DependencyVerdict:
+    """What one dependency-edge read establishes, and why."""
+
+    state: str
+    detail: str
+
+    @property
+    def failing(self) -> bool:
+        return self.state == "failing"
+
+    @property
+    def healthy(self) -> bool:
+        return self.state == "healthy"
+
+    @property
+    def indeterminate(self) -> bool:
+        return self.state == "indeterminate"
+
+
+def classify_dependency_edge(value: Mapping[str, Any]) -> DependencyVerdict:
+    """Read one dependency-edge observation as failing, healthy, or unproven.
+
+    The order of the checks is the whole contract, because the failure modes here
+    are the ones that make an incident lie to its operator:
+
+    * an edge that could not be attributed (``attributable`` is not true) is
+      **not** a healthy edge - the telemetry simply cannot answer the question,
+      and the caller must be told that instead of being reassured;
+    * a read that declares no usable observation window is malformed for the same
+      reason: there is no window to have measured anything in;
+    * a window with no calls proves nothing in either direction. Zero traffic is
+      neither a fault nor a recovery, so it is indeterminate, never healthy and
+      never failing;
+    * a missing or non-numeric error share is indeterminate for the same reason an
+      absent metric is not a zero;
+    * only then is the share compared against :data:`TELEMETRY_ERROR_BOUND`.
+    """
+    if not value.get("attributable"):
+        reason = str(value.get("reason") or "the schema does not expose this attribution")
+        return DependencyVerdict(
+            state="indeterminate",
+            detail=f"the caller's own calls to this dependency cannot be attributed: {reason}",
+        )
+    window = value.get("window_seconds")
+    if window is not None and not (
+        isinstance(window, (int, float)) and not isinstance(window, bool) and float(window) > 0
+    ):
+        return DependencyVerdict(
+            state="indeterminate",
+            detail=(
+                f"the dependency read declares a window of {window!r}, which is not a usable "
+                "observation window"
+            ),
+        )
+    calls = _as_float(value.get("calls_per_second"))
+    if calls <= 0:
+        return DependencyVerdict(
+            state="indeterminate",
+            detail=(
+                "the caller made no calls to this dependency inside the window, so there is "
+                "neither a failure to confirm nor a recovery to verify"
+            ),
+        )
+    rate = value.get("error_rate")
+    if rate is None or isinstance(rate, bool) or not isinstance(rate, (int, float, str)):
+        return DependencyVerdict(
+            state="indeterminate",
+            detail="the dependency edge returned no failure share for the window",
+        )
+    try:
+        share = float(rate)
+    except ValueError:
+        return DependencyVerdict(
+            state="indeterminate",
+            detail="the dependency edge returned a failure share that is not a number",
+        )
+    where = (
+        f"{value.get('caller') or 'the caller'} -> {value.get('destination') or 'the dependency'}"
+    )
+    if share >= TELEMETRY_ERROR_BOUND:
+        return DependencyVerdict(
+            state="failing",
+            detail=(
+                f"{where} failed on {share:.2%} of {calls:.3f} calls/second in the window, "
+                f"above the {TELEMETRY_ERROR_BOUND:.0%} telemetry bound"
+            ),
+        )
+    return DependencyVerdict(
+        state="healthy",
+        detail=f"{where} carried {calls:.3f} calls/second with a {share:.2%} failure share",
+    )
+
+
+def _as_float(value: object, default: float = 0.0) -> float:
+    """Telemetry is untrusted input; a non-numeric value is not a number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
 
 
 @dataclass(frozen=True)
@@ -129,6 +275,15 @@ class Environment(Protocol):
 
     def read_service_health(self, *, target: str, timeout_seconds: float) -> ToolResult: ...
 
+    def read_dependency(
+        self,
+        *,
+        target: str,
+        dependency: str,
+        window_seconds: int,
+        timeout_seconds: float,
+    ) -> ToolResult: ...
+
     def read_recent_changes(self, *, target: str, timeout_seconds: float) -> ToolResult: ...
 
     def read_runbook(self, *, target: str, timeout_seconds: float) -> ToolResult: ...
@@ -147,11 +302,18 @@ class Environment(Protocol):
 
 
 __all__ = [
+    "DEPENDENCY_EDGES",
+    "TELEMETRY_ERROR_BOUND",
+    "DependencyVerdict",
     "DispatchFailure",
     "DispatchRefused",
     "DispatchTimeout",
     "Environment",
     "ReadTimeout",
     "UnknownDemoTarget",
+    "classify_dependency_edge",
     "classify_dispatch_failure",
+    "dependency_callees",
+    "dependency_callers",
+    "dependency_operation",
 ]

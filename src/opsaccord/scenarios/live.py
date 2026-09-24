@@ -37,11 +37,7 @@ from opsaccord.config import Settings
 from opsaccord.domain.enums import ScenarioOutcome
 from opsaccord.persistence.db import Database
 from opsaccord.reasoning.base import ReasoningProvider
-from opsaccord.reasoning.deterministic import (
-    CPU_SATURATION_CEILING,
-    TELEMETRY_ERROR_BOUND,
-    DeterministicAdapter,
-)
+from opsaccord.reasoning.deterministic import CPU_SATURATION_CEILING, DeterministicAdapter
 from opsaccord.scenarios.fixtures import SCENARIOS, ScenarioSpec
 from opsaccord.scenarios.live_evidence import (
     COMPLETED,
@@ -56,7 +52,7 @@ from opsaccord.scenarios.live_evidence import (
     utc_stamp,
 )
 from opsaccord.scenarios.runner import ScenarioTrace, evaluate, run_scenario
-from opsaccord.tools.contracts import Environment
+from opsaccord.tools.contracts import TELEMETRY_ERROR_BOUND, Environment
 from opsaccord.tools.live_environment import (
     FLAG_SAFE_VARIANT,
     LiveEnvironment,
@@ -129,11 +125,14 @@ LIVE_SETTLE_SECONDS = 30.0
 # Span metrics are exported every ~60s on this stack, so a shorter window returns
 # no data at all rather than a fresher number.
 LIVE_VERIFICATION_WINDOW_SECONDS = 120
-# Budgets for a live run: the investigation costs 5 reads, dispatch 1, and up to
-# six settle rounds of 3 reads each can follow, so the hard cap has to sit above
-# that sum for bounded settling to be possible at all. Both remain enforced.
+# Budgets for a live run. The intended payment path costs six investigation reads,
+# one model decision, one dispatch, and up to six settle rounds of four reads each
+# (health, two metrics, and the caller-side dependency read) -- 32 steps in the
+# worst case. The hard cap sits above that sum on purpose: a cap with no headroom
+# would turn a real recovery into a verification that ran out of budget, which is
+# the failure the four reads exist to make visible. Both remain enforced.
 LIVE_SOFT_STEP_BUDGET = 12
-LIVE_HARD_STEP_CAP = 32
+LIVE_HARD_STEP_CAP = 36
 
 
 AppEnv = Literal["dev", "test", "ci", "scenario"]

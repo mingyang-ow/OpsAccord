@@ -31,14 +31,18 @@ def test_fault_signal_is_a_known_predicate() -> None:
 def test_settling_fits_inside_the_live_hard_cap() -> None:
     """Investigation + dispatch + settle rounds must fit the hard step cap.
 
-    Each settle round costs three reads (health plus two metrics), which is what
-    exhausted the cap during the first live run and turned a real recovery into an
-    inconclusive verification.
+    Each settle round costs four reads: health, two metrics, and the caller-side
+    dependency read that a callee-scoped probe cannot replace. The cap must sit
+    above the whole sum with headroom, because verification that runs out of
+    budget reads as inconclusive and would turn a real recovery into a handoff.
     """
     worst_investigation = max(len(plan) for plan in READ_PLAN.values())
-    verification_reads = live_scenarios.LIVE_SETTLE_ATTEMPTS * 3
+    verification_reads = live_scenarios.LIVE_SETTLE_ATTEMPTS * 4
+    model_decision = 1
     dispatch = 1
-    assert worst_investigation + dispatch + verification_reads <= live_scenarios.LIVE_HARD_STEP_CAP
+    worst_case = worst_investigation + model_decision + dispatch + verification_reads
+    assert worst_case <= live_scenarios.LIVE_HARD_STEP_CAP
+    assert worst_case + 4 <= live_scenarios.LIVE_HARD_STEP_CAP
 
 
 def test_live_settings_publish_the_calibrated_values() -> None:

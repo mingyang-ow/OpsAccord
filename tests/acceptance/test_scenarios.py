@@ -62,6 +62,46 @@ def test_p1_01_payment_requires_exact_approval_then_verifies_recovery(trace) -> 
     )
 
 
+@pytest.mark.parametrize("trace", ["P1-01"], indirect=True)
+def test_p1_01_attributes_the_fault_to_the_callers_own_view_of_the_edge(trace) -> None:
+    """The fault is only visible from the caller, so the caller is asked.
+
+    Payment's own telemetry cannot show a caller that cannot reach it: the calls
+    never arrive. This pins the whole attribution loop for the scenario that
+    produced the failed live run -- the caller-side read is collected with its
+    caller/destination/operation recorded, and recovery is verified against that
+    same path with evidence collected *after* the action completed.
+    """
+    edges = [item for item in trace.evidence if item.source == "read_dependency"]
+    assert edges, "the caller's own view of the dependency must be collected"
+    assert {item.service for item in edges} == {"checkout-service"}
+    for item in edges:
+        assert item.value.get("attributable") is True, item.summary
+        assert item.value.get("caller") == "checkout-service"
+        assert item.value.get("destination") == "payment-service"
+        assert item.value.get("operation") == "Charge"
+        assert item.value.get("span_kind") == "client"
+
+    action = trace.executed_actions[0]
+    assert action.completed_at is not None
+    successful = [
+        verification
+        for verification in trace.verifications
+        if verification.outcome is VerificationOutcome.VERIFICATION_SUCCESS
+    ]
+    assert successful, "the recovery must be verified"
+    edge_ids = {item.id for item in edges}
+    assert edge_ids & set(successful[0].evidence_ids), (
+        "recovery must be verified on the same caller-to-payment path that named the fault"
+    )
+    fresh = [
+        item
+        for item in edges
+        if item.id in successful[0].evidence_ids and item.collected_at >= action.completed_at
+    ]
+    assert fresh, "the path evidence used for recovery must be collected after the action"
+
+
 @pytest.mark.parametrize("trace", ["P1-02"], indirect=True)
 def test_p1_02_allow_listed_remediation_runs_without_a_human_gate(trace) -> None:
     assert trace.incident.status is IncidentStatus.RESOLVED

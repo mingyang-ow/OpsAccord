@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from opsaccord.domain.enums import SideEffect
 from opsaccord.domain.models import ToolSpec
+from opsaccord.tools.contracts import DEPENDENCY_EDGES, dependency_callees
 
 STR = {"type": "string"}
 
@@ -82,6 +83,30 @@ READ_TOOLS: tuple[ToolSpec, ...] = (
         description="Read the current health probe result for one demo service.",
         side_effect=SideEffect.READ,
         arguments_schema={"target": STR},
+        timeout_seconds=3.0,
+        max_attempts=3,
+    ),
+    ToolSpec(
+        name="read_dependency",
+        description=(
+            "Read one allow-listed caller-to-callee dependency edge as the caller "
+            "observed it: how many calls the caller made and how many failed. The "
+            "target is the caller; the dependency is the callee."
+        ),
+        side_effect=SideEffect.READ,
+        arguments_schema={
+            "target": STR,
+            "dependency": STR,
+            "window_seconds": {"type": "integer", "minimum": 30, "maximum": 900, "default": 300},
+        },
+        # A caller may only be asked about an edge that has been verified against
+        # the pinned revision, and only about the callee on the other end of it:
+        # the pair is what gives the observation its attribution.
+        fixed_arguments={"target": tuple(sorted({caller for caller, _, _ in DEPENDENCY_EDGES}))},
+        per_target_arguments={
+            caller: {"dependency": dependency_callees(caller)}
+            for caller in sorted({caller for caller, _, _ in DEPENDENCY_EDGES})
+        },
         timeout_seconds=3.0,
         max_attempts=3,
     ),

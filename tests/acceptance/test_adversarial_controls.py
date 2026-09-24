@@ -25,11 +25,11 @@ from opsaccord.domain.enums import (
     SideEffect,
     VerificationOutcome,
 )
-from opsaccord.domain.models import Action, ActionProposal, Approval
+from opsaccord.domain.models import Action, ActionProposal, Approval, ToolResult
 from opsaccord.ids import utcnow
 from opsaccord.persistence import repositories as repo
 from opsaccord.persistence.db import Database
-from opsaccord.persistence.tables import ApprovalRow, ToolCallRow
+from opsaccord.persistence.tables import ApprovalRow, ToolCallRow, VerificationRow, WorkflowRow
 from opsaccord.reasoning.deterministic import DeterministicAdapter
 from opsaccord.scenarios.fixtures import SCENARIOS, ScenarioSpec, build_environment_for_scenario
 from opsaccord.tools import demo_environment as demo
@@ -50,9 +50,14 @@ class Rig:
 
 @pytest.fixture
 def rig(db: Database, settings: Settings):
-    def build(scenario_id: str, **fault_overrides: object) -> Rig:
+    def build(
+        scenario_id: str,
+        *,
+        environment: demo.DemoEnvironment | None = None,
+        **fault_overrides: object,
+    ) -> Rig:
         spec = SCENARIOS[scenario_id]
-        environment = build_environment_for_scenario(spec)
+        environment = environment or build_environment_for_scenario(spec)
         if fault_overrides:
             environment.faults = demo.FaultInjection(
                 **{**vars(environment.faults), **fault_overrides}
@@ -505,6 +510,152 @@ def test_verification_requires_evidence_collected_after_the_action(db: Database,
     )
     assert result.outcome is VerificationOutcome.VERIFICATION_INCONCLUSIVE
     assert "at or after the action" in result.detail
+
+
+# --- dependency-path recovery ---------------------------------------------------
+#
+# The fault class behind these tests: the caller cannot reach the callee while the
+# callee's own telemetry looks perfectly healthy, because the calls never arrive.
+# A recovery verdict taken from the callee's probe alone would be a false recovery.
+
+
+class PathStillBroken(demo.DemoEnvironment):
+    """The flag landed and the callee's probe recovered; the path did not.
+
+    The caller keeps failing to reach the callee -- a broken path rather than a
+    broken process -- so the caller-side read is the only signal that can see it.
+    """
+
+    def read_dependency(
+        self, *, target: str, dependency: str, window_seconds: int, timeout_seconds: float
+    ) -> ToolResult:
+        result = super().read_dependency(
+            target=target,
+            dependency=dependency,
+            window_seconds=window_seconds,
+            timeout_seconds=timeout_seconds,
+        )
+        return result.model_copy(update={"value": {**result.value, "error_rate": 1.0}})
+
+
+class StaleEdgeRead(demo.DemoEnvironment):
+    """The edge read answers, but from a window that predates the action."""
+
+    def read_dependency(
+        self, *, target: str, dependency: str, window_seconds: int, timeout_seconds: float
+    ) -> ToolResult:
+        result = super().read_dependency(
+            target=target,
+            dependency=dependency,
+            window_seconds=window_seconds,
+            timeout_seconds=timeout_seconds,
+        )
+        return result.model_copy(update={"collected_at": result.collected_at - timedelta(hours=1)})
+
+
+def verifications(db: Database, incident_id: str) -> list[VerificationRow]:
+    with db.read_session() as session:
+        return list(
+            session.scalars(
+                sa.select(VerificationRow).where(VerificationRow.incident_id == incident_id)
+            ).all()
+        )
+
+
+def test_a_recovered_target_probe_is_not_a_recovered_dependency_path(db: Database, rig) -> None:
+    """One successful action, no error from the adapter, and still no recovery.
+
+    This is the false-recovery case the caller-side read exists to stop: the
+    payment process is healthy again and its own probe says so, but the caller
+    still cannot complete the Charge. Nothing here may resolve, and no second
+    side effect may be attempted to "fix" the path.
+    """
+    base = build_environment_for_scenario(SCENARIOS["P1-01"])
+    case = rig("P1-01", environment=PathStillBroken(services=base.services, faults=base.faults))
+    case.controller.run(case.incident_id)
+    approval = pending(db, case.incident_id)
+    approve(db, approval)
+    case.controller.advance(case.incident_id)
+
+    assert case.environment.services["payment-service"].healthy, (
+        "the remediation really did recover the payment process"
+    )
+    assert len(case.environment.applied) == 1, "exactly one side effect was attempted"
+
+    recorded = verifications(db, case.incident_id)
+    assert [item.outcome for item in recorded] == [VerificationOutcome.VERIFICATION_FAILURE.value]
+    assert "dependency path is still failing" in recorded[0].detail
+    with db.read_session() as session:
+        incident = repo.get_incident(session, case.incident_id)
+        actions = repo.list_actions(session, case.incident_id)
+    assert incident is not None and incident.status is not IncidentStatus.RESOLVED
+    assert len(actions) == 1, "a failing verification must not trigger a second action"
+
+
+def test_a_stale_edge_read_cannot_verify_recovery(db: Database, rig) -> None:
+    """Freshness is per read, on the path that named the fault.
+
+    A window that closed before the action says nothing about what the action
+    changed, so the round is not fresh even though the health probe in the same
+    round was collected afterwards.
+    """
+    base = build_environment_for_scenario(SCENARIOS["P1-01"])
+    case = rig("P1-01", environment=StaleEdgeRead(services=base.services, faults=base.faults))
+    case.controller.run(case.incident_id)
+    approve(db, pending(db, case.incident_id))
+    case.controller.advance(case.incident_id)
+
+    recorded = verifications(db, case.incident_id)
+    assert [item.outcome for item in recorded] == [
+        VerificationOutcome.VERIFICATION_INCONCLUSIVE.value
+    ]
+    assert "at or after the action" in recorded[0].detail
+    with db.read_session() as session:
+        incident = repo.get_incident(session, case.incident_id)
+    assert incident is not None and incident.status is not IncidentStatus.RESOLVED
+
+
+def test_an_unaffordable_edge_read_is_inconclusive_rather_than_fatal(
+    db: Database, settings: Settings, rig
+) -> None:
+    """The budget is a wall on the path reads too, and the verdict says so.
+
+    The dependency read is the fourth read of a verification round, so a cap that
+    lands exactly there must produce an unproven recovery -- never a success, and
+    never an exception that loses the incident.
+    """
+    case = rig("P1-01")
+    case.controller.run(case.incident_id)
+    approve(db, pending(db, case.incident_id))
+    action = action_of(db, case.incident_id)
+    execution = case.gateway.execute_action(action_id=action.id)
+    assert execution.action.completed_at is not None
+
+    with db.session() as session:
+        workflow = repo.get_workflow(session, case.incident_id)
+        assert workflow is not None
+        # The next three reads (health plus two metrics) are affordable; the
+        # dependency read that follows them is not.
+        session.execute(
+            sa.update(WorkflowRow)
+            .where(WorkflowRow.id == workflow.id)
+            .values(hard_step_cap=workflow.steps_used + 3)
+        )
+        workflow_id = workflow.id
+
+    result = case.gateway.verify_service(
+        incident_id=case.incident_id,
+        workflow_id=workflow_id,
+        target="payment-service",
+        action_id=action.id,
+        action_completed_at=execution.action.completed_at,
+    )
+
+    assert result.outcome is VerificationOutcome.VERIFICATION_INCONCLUSIVE
+    assert "dependency-path verification read is no longer affordable" in result.detail
+    with db.read_session() as session:
+        incident = repo.get_incident(session, case.incident_id)
+    assert incident is not None and incident.status is not IncidentStatus.RESOLVED
 
 
 def test_the_requesting_actor_cannot_approve_its_own_action(db: Database, rig) -> None:

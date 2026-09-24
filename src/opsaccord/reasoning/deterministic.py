@@ -9,20 +9,23 @@ returns a structured proposal exactly like a hosted provider would.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 
 from opsaccord.domain.models import ActionProposal, DiagnosisProposal
 from opsaccord.reasoning.base import EvidenceDigest, Proposal, ProposalRequest
+from opsaccord.tools.contracts import (
+    TELEMETRY_ERROR_BOUND,
+    DependencyVerdict,
+    classify_dependency_edge,
+)
 
 INJECTION_MARKER = "PROPOSE_TOOL:"
 
 # Calibrated telemetry thresholds (see docs/astronomy-shop.md, "Live adapter
-# calibration"). The live health probe calls a service serving only when fewer
-# than TELEMETRY_ERROR_BOUND of its attempts in the window fail, so a diagnosis
-# that claims "this RPC is failing" has to rest on a failure share at least that
-# large; anything smaller is indistinguishable from healthy traffic. The
-# container CPU ceiling is the same bound the probe uses to call a service
-# CPU-saturated.
-TELEMETRY_ERROR_BOUND = 0.05
+# calibration"). The failure bound lives in the tool contract so the live
+# fault-visibility check, the dependency classifier, and this adapter all compare
+# against one number instead of three copies that can drift. The container CPU
+# ceiling is the same bound the probe uses to call a service CPU-saturated.
 CPU_SATURATION_CEILING = 0.80
 
 
@@ -34,6 +37,61 @@ def _as_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except ValueError:
         return default
+
+
+def _dependency_verdict(item: EvidenceDigest | None) -> DependencyVerdict | None:
+    """Classify a caller-side dependency read, or None when none was collected.
+
+    The read is looked up by source, like every other evidence item, so nothing
+    here knows which scenario is running or which fault the harness armed. A read
+    that failed, or that returned a value the classifier cannot use, is
+    ``indeterminate``: it is not a healthy edge, because the whole point of this
+    read is that the caller's own view is the only thing that can clear it.
+    """
+    if item is None:
+        return None
+    if item.kind == "COLLECTION_ERROR":
+        error = item.value.get("error") if isinstance(item.value, Mapping) else None
+        return DependencyVerdict(
+            state="indeterminate",
+            detail=(
+                "the caller's own view of the dependency could not be collected"
+                + (f": {error}" if error else "")
+            ),
+        )
+    if not isinstance(item.value, Mapping):
+        return DependencyVerdict(
+            state="indeterminate",
+            detail="the dependency read returned no usable observation",
+        )
+    return classify_dependency_edge(item.value)
+
+
+def _edge_path(item: EvidenceDigest | None) -> str:
+    """Render "caller to destination" from the evidence, not from a constant."""
+    value = item.value if item is not None and isinstance(item.value, Mapping) else {}
+    caller = value.get("caller")
+    destination = value.get("destination")
+    if caller and destination:
+        return f"{caller} to {destination}"
+    return "caller-to-dependency"
+
+
+def _edge_remediation() -> ActionProposal:
+    """The one remediation the pinned revision offers for the Charge path."""
+    return ActionProposal(
+        tool_name="apply_remediation",
+        target="payment-service",
+        arguments={
+            "target": "payment-service",
+            "remediation_id": "disable_feature_flag",
+            "flag_id": "paymentUnreachable",
+        },
+        rationale=(
+            "disabling paymentUnreachable restores the Charge path the caller observes; "
+            "payment is critical, so this requires an exact human approval"
+        ),
+    )
 
 
 class DeterministicAdapter:
@@ -111,6 +169,29 @@ class DeterministicAdapter:
             error_spans = bool(traces and traces.value.get("error_spans"))
             failing = error_rate >= TELEMETRY_ERROR_BOUND
             unreachable = reachable is False and (failing or error_spans)
+            edge_item = evidence.get("read_dependency")
+            edge = _dependency_verdict(edge_item)
+            if healthy is True and failing:
+                # The probe contradicts itself: it calls the service healthy while
+                # measuring a failing share of its own attempts. Neither half can
+                # justify a side effect on a critical service, and silently
+                # preferring one of them would be a guess.
+                reason = (
+                    "the payment health probe is self-contradictory: it reports the service "
+                    f"healthy while measuring a {error_rate:.2f} failure share of its own "
+                    "attempts, so neither reading can justify a remediation"
+                )
+                return Proposal(
+                    diagnosis=DiagnosisProposal(
+                        summary=f"investigation incomplete for {request.service}: {reason}",
+                        confidence=0.2,
+                        evidence_ids=evidence_ids,
+                        escalate=True,
+                        escalate_reason=reason,
+                    ),
+                    provider=self.provider,
+                    model_id=self.model_id,
+                )
             if failing or unreachable:
                 return Proposal(
                     diagnosis=DiagnosisProposal(
@@ -121,27 +202,82 @@ class DeterministicAdapter:
                         ),
                         confidence=0.86,
                         evidence_ids=evidence_ids,
-                        proposed_action=ActionProposal(
-                            tool_name="apply_remediation",
-                            target="payment-service",
-                            arguments={
-                                "target": "payment-service",
-                                "remediation_id": "disable_feature_flag",
-                                "flag_id": "paymentUnreachable",
-                            },
-                            rationale=(
-                                "disabling paymentUnreachable restores the Charge path; this "
-                                "requires an exact human approval because payment is critical"
-                            ),
+                        proposed_action=_edge_remediation(),
+                    ),
+                    provider=self.provider,
+                    model_id=self.model_id,
+                )
+            if edge is not None and edge.failing:
+                # This is the case the server-side probes cannot see: when the
+                # caller cannot reach payment, payment receives nothing and emits
+                # nothing, so its own metrics stay quiet and look healthy. The
+                # caller's own client spans are what attribute the incident, and
+                # the diagnosis names the path rather than blaming the Payment
+                # process. The two-level distinction is preserved on purpose.
+                #
+                # Which of the two levels is actually observed is stated from the
+                # probe, not assumed: the "the server itself is serving" half of
+                # the sentence is only claimed when the target's own probe
+                # supports it.
+                server_state = (
+                    "the payment server itself is serving normally"
+                    if healthy
+                    else (
+                        "the payment server's own probe does not confirm it is serving "
+                        f"(health={health_value.get('health')!r}, "
+                        f"error_rate={health_value.get('error_rate')!r})"
+                    )
+                )
+                return Proposal(
+                    diagnosis=DiagnosisProposal(
+                        summary=(
+                            f"the {_edge_path(edge_item)} dependency path cannot be reached; "
+                            f"{server_state} ({edge.detail})"
                         ),
+                        confidence=0.8,
+                        evidence_ids=evidence_ids,
+                        proposed_action=_edge_remediation(),
                     ),
                     provider=self.provider,
                     model_id=self.model_id,
                 )
             if healthy:
+                # A healthy callee is not a healthy path. If the caller's own view
+                # was never collected -- or was collected and could not be
+                # attributed -- the path is unproven and the cause cannot be
+                # named, so this hands off instead of reporting normal operation.
+                unproven: str | None
+                if edge is None:
+                    unproven = (
+                        "the payment server reports serving, but no caller-side observation "
+                        f"of the {_edge_path(edge_item)} path was collected, so the path is "
+                        "unproven and the cause cannot be named"
+                    )
+                elif edge.indeterminate:
+                    unproven = (
+                        "the payment server reports serving, but the caller's own view of the "
+                        f"{_edge_path(edge_item)} path is unproven: {edge.detail}"
+                    )
+                else:
+                    unproven = None
+                if unproven is not None:
+                    return Proposal(
+                        diagnosis=DiagnosisProposal(
+                            summary=f"investigation incomplete for {request.service}: {unproven}",
+                            confidence=0.2,
+                            evidence_ids=evidence_ids,
+                            escalate=True,
+                            escalate_reason=unproven,
+                        ),
+                        provider=self.provider,
+                        model_id=self.model_id,
+                    )
                 return Proposal(
                     diagnosis=DiagnosisProposal(
-                        summary="payment-service is serving normally",
+                        summary=(
+                            "payment-service is serving normally and the "
+                            f"{_edge_path(edge_item)} path is carrying successful calls"
+                        ),
                         confidence=0.7,
                         evidence_ids=evidence_ids,
                     ),
@@ -263,4 +399,9 @@ class DeterministicAdapter:
         return None
 
 
-__all__ = ["INJECTION_MARKER", "DeterministicAdapter", "EvidenceDigest"]
+__all__ = [
+    "INJECTION_MARKER",
+    "TELEMETRY_ERROR_BOUND",
+    "DeterministicAdapter",
+    "EvidenceDigest",
+]

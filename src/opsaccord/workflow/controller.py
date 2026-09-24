@@ -64,6 +64,18 @@ READ_PLAN: dict[str, tuple[dict[str, Any], ...]] = {
                 "window_seconds": 300,
             },
         },
+        {
+            # The caller's own view of the edge. When checkout cannot reach
+            # payment, payment emits nothing at all, so every target-scoped probe
+            # above stays quiet and reads as healthy; the failing client spans are
+            # the only signal that can attribute this incident to the dependency.
+            "tool_name": "read_dependency",
+            "arguments": {
+                "target": "checkout-service",
+                "dependency": "payment-service",
+                "window_seconds": 300,
+            },
+        },
         {"tool_name": "read_recent_changes", "arguments": {"target": "payment-service"}},
         {"tool_name": "read_runbook", "arguments": {"target": "payment-service"}},
     ),
@@ -386,7 +398,10 @@ class WorkflowController:
                     incident_id=incident_id,
                     workflow_id=workflow_id,
                     step=step,
-                    target=target,
+                    # The step carries its own target. For every single-service
+                    # step that is the incident's service; a dependency step names
+                    # the caller, because the observation belongs to the caller.
+                    target=step["arguments"]["target"],
                     notes=notes,
                 )
                 if outcome is None:

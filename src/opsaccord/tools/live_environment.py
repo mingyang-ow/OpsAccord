@@ -40,6 +40,7 @@ from opsaccord.tools.contracts import (
     DispatchTimeout,
     ReadTimeout,
     UnknownDemoTarget,
+    dependency_operation,
 )
 from opsaccord.tools.demo_environment import DEFAULT_RUNBOOKS, REVISION, REVISION_SOURCE
 
@@ -87,6 +88,18 @@ CONTAINER_RESTART_CANDIDATES = ("container_restarts_total", "container_restart_c
 # CPU questions can use shorter windows -- see the read plan in
 # ``opsaccord.workflow.controller``.
 LIVE_HEALTH_WINDOW_SECONDS = 120
+
+# Span-metrics labels that can carry the two facts an edge attribution needs:
+# which service emitted the span, and whether it was the client or the server
+# side of the RPC. Candidates are tried against the schema the server actually
+# exposes (``/api/v1/series`` for the operation), never assumed: if neither name
+# is present the adapter reports that the edge cannot be attributed instead of
+# guessing a label and reading a number that means something else.
+SERVICE_LABEL_CANDIDATES = ("service_name", "service")
+SPAN_KIND_LABEL_CANDIDATES = ("span_kind", "span_kind_client")
+# A span-kind value counts as the client side when it contains this token,
+# case-insensitively (observed form: ``SPAN_KIND_CLIENT``).
+CLIENT_SPAN_KIND_TOKEN = "client"
 
 # Feature-flag variants that mean "the fault is switched off". Verified against
 # src/flagd/demo.flagd.json at the pinned revision: every entry below is a
@@ -218,6 +231,21 @@ class PrometheusClient:
             "/api/v1/query", {"query": f"count({selector})"}, timeout_seconds=timeout_seconds
         )
         return bool(payload.get("data", {}).get("result"))
+
+    def series_labels(self, selector: str, timeout_seconds: float) -> set[str]:
+        """Every label name the server attaches to series matching ``selector``."""
+        payload = self._get(
+            "/api/v1/series", {"match[]": selector}, timeout_seconds=timeout_seconds
+        )
+        names: set[str] = set()
+        for series in payload.get("data") or []:
+            names.update(str(key) for key in series)
+        return names
+
+    def label_values(self, label: str, timeout_seconds: float) -> set[str]:
+        """Every value the server currently holds for one label name."""
+        payload = self._get(f"/api/v1/label/{label}/values", {}, timeout_seconds=timeout_seconds)
+        return {str(value) for value in payload.get("data") or []}
 
     def scalar(self, query: str, timeout_seconds: float) -> float | None:
         """Evaluate one PromQL expression and return a single scalar, or None."""
@@ -557,6 +585,171 @@ class LiveEnvironment:
                 "window_seconds": window_seconds,
                 "source": "prometheus",
                 "queries": [cpu_query] if cpu_query else [],
+            },
+            is_simulated=False,
+            collected_at=self._now(),
+            observation_window_start=start,
+            observation_window_end=end,
+        )
+
+    # --- dependency attribution ------------------------------------------
+
+    def _resolve_edge_labels(
+        self, *, operation: str, timeout_seconds: float
+    ) -> tuple[str, str, str] | str:
+        """Resolve (service_label, kind_label, client_value) or return a reason.
+
+        The schema is read from the server rather than assumed. Only two label
+        names are needed -- which service emitted the span, and which side of the
+        RPC it observed -- and if the exposed schema cannot supply them, the edge
+        is not attributable from span metrics and the caller must say so.
+        """
+        selector = f"span_name='{operation}'"
+        labels = self.prometheus.series_labels(selector, timeout_seconds)
+        if not labels:
+            return (
+                f"no series matches span_name={operation!r} in Prometheus, so the edge "
+                "cannot be attributed"
+            )
+        service_label = next((name for name in SERVICE_LABEL_CANDIDATES if name in labels), None)
+        if service_label is None:
+            return (
+                f"the series for span_name={operation!r} expose no service label "
+                f"(looked for {list(SERVICE_LABEL_CANDIDATES)}; saw {sorted(labels)}), so the "
+                "caller cannot be separated from the callee"
+            )
+        kind_label = next((name for name in SPAN_KIND_LABEL_CANDIDATES if name in labels), None)
+        if kind_label is None:
+            return (
+                f"the series for span_name={operation!r} expose no span-kind label "
+                f"(looked for {list(SPAN_KIND_LABEL_CANDIDATES)}; saw {sorted(labels)}), so a "
+                "client-side call cannot be told from a server-side one"
+            )
+        client_value = next(
+            (
+                value
+                for value in self.prometheus.label_values(kind_label, timeout_seconds)
+                if CLIENT_SPAN_KIND_TOKEN in value.lower()
+            ),
+            None,
+        )
+        if client_value is None:
+            return (
+                f"the {kind_label!r} label has no client-side value, so no caller-side call "
+                "is recorded for this operation"
+            )
+        return service_label, kind_label, client_value
+
+    @staticmethod
+    def _edge_selector(
+        metric: str,
+        *,
+        operation: str,
+        service_label: str,
+        caller_service: str,
+        kind_label: str,
+        client_value: str,
+        window_seconds: int,
+        **labels: str,
+    ) -> str:
+        parts = [
+            f"span_name='{operation}'",
+            f"{service_label}='{caller_service}'",
+            f"{kind_label}='{client_value}'",
+        ]
+        parts.extend(f"{name}='{value}'" for name, value in sorted(labels.items()))
+        return f"sum(rate({metric}{{{', '.join(parts)}}}[{window_seconds}s]))"
+
+    def read_dependency(
+        self, *, target: str, dependency: str, window_seconds: int, timeout_seconds: float
+    ) -> ToolResult:
+        """The caller's own client-side view of one allow-listed dependency edge.
+
+        This is the read that can see a caller-to-callee failure, and it is
+        deliberately not the callee's health: when a caller cannot reach a callee
+        the callee emits nothing at all, so every callee-scoped series stays quiet
+        and looks healthy. The attribution comes from three facts recorded on the
+        evidence -- caller, destination and operation -- and it is only claimed
+        when the exposed span-metric schema can supply the caller's own client
+        spans. When it cannot, the read succeeds and reports
+        ``attributable: false`` with the reason, which reasoning must treat as an
+        instrumentation gap rather than as a healthy edge.
+
+        A window with no calls reports no calls. It never reports a zero failure
+        share, and a quiet window is not a recovery.
+        """
+        caller = self._target(target)
+        callee = self._target(dependency)
+        start, end = self._window(window_seconds)
+        operation = dependency_operation(target, dependency)
+        if operation is None:
+            # The registry refuses unverified edges before dispatch; this is the
+            # adapter's own guard for a direct call.
+            raise UnknownDemoTarget(
+                f"{target} -> {dependency} is not an allow-listed dependency edge"
+            )
+        span_name = callee.operation
+        resolved = self._resolve_edge_labels(operation=span_name, timeout_seconds=timeout_seconds)
+        if isinstance(resolved, str):
+            return ToolResult(
+                tool_name="read_dependency",
+                target=target,
+                succeeded=True,
+                value={
+                    "caller": target,
+                    "destination": dependency,
+                    "operation": operation,
+                    "span_kind": "client",
+                    "attributable": False,
+                    "reason": resolved,
+                    "window_seconds": window_seconds,
+                    "source": "jaeger+prometheus-schema",
+                    "queries": [],
+                },
+                is_simulated=False,
+                collected_at=self._now(),
+                observation_window_start=start,
+                observation_window_end=end,
+            )
+        service_label, kind_label, client_value = resolved
+        metric = self._calls_metric(timeout_seconds)
+        calls_query = self._edge_selector(
+            metric,
+            operation=span_name,
+            service_label=service_label,
+            caller_service=caller.service_name,
+            kind_label=kind_label,
+            client_value=client_value,
+            window_seconds=window_seconds,
+        )
+        errors_query = self._edge_selector(
+            metric,
+            status_code="STATUS_CODE_ERROR",
+            operation=span_name,
+            service_label=service_label,
+            caller_service=caller.service_name,
+            kind_label=kind_label,
+            client_value=client_value,
+            window_seconds=window_seconds,
+        )
+        calls = self.prometheus.scalar(calls_query, timeout_seconds) or 0.0
+        errors = self.prometheus.scalar(errors_query, timeout_seconds) or 0.0
+        return ToolResult(
+            tool_name="read_dependency",
+            target=target,
+            succeeded=True,
+            value={
+                "caller": target,
+                "destination": dependency,
+                "operation": operation,
+                "span_kind": "client",
+                "attributable": True,
+                "calls_per_second": calls,
+                "errors_per_second": errors,
+                "error_rate": (errors / calls) if calls > 0 else None,
+                "window_seconds": window_seconds,
+                "source": "prometheus-span-metrics",
+                "queries": [calls_query, errors_query],
             },
             is_simulated=False,
             collected_at=self._now(),

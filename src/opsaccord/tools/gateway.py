@@ -58,9 +58,12 @@ from opsaccord.persistence import repositories as repo
 from opsaccord.persistence.db import Database
 from opsaccord.policy import engine as policy_engine
 from opsaccord.tools.contracts import (
+    DependencyVerdict,
     Environment,
     ReadTimeout,
+    classify_dependency_edge,
     classify_dispatch_failure,
+    dependency_callers,
 )
 from opsaccord.tools.registry import ToolRegistry
 
@@ -68,6 +71,9 @@ _EVIDENCE_KIND = {
     "read_metrics": EvidenceKind.METRIC,
     "read_traces": EvidenceKind.TRACE,
     "read_service_health": EvidenceKind.HEALTH,
+    # The dependency read is span-derived in live mode, so it is trace evidence:
+    # what it adds is the caller's own observation of the edge, not a new kind.
+    "read_dependency": EvidenceKind.TRACE,
     "read_recent_changes": EvidenceKind.CHANGE,
     "read_runbook": EvidenceKind.RUNBOOK,
 }
@@ -99,6 +105,18 @@ class ActionExecution:
     action: Action
     executed: bool
     detail: str
+
+
+@dataclass(frozen=True)
+class _VerificationRound:
+    """One round of fresh verification reads, and what it established."""
+
+    evidence_ids: list[str]
+    collected_after_action: bool
+    blocked: str | None
+    health: ReadOutcome | None
+    metrics_ok: bool
+    dependency: DependencyVerdict | None = None
 
 
 class ToolGateway:
@@ -272,6 +290,13 @@ class ToolGateway:
             )
         if tool_name == "read_service_health":
             return env.read_service_health(target=arguments["target"], timeout_seconds=timeout)
+        if tool_name == "read_dependency":
+            return env.read_dependency(
+                target=arguments["target"],
+                dependency=arguments["dependency"],
+                window_seconds=arguments["window_seconds"],
+                timeout_seconds=timeout,
+            )
         if tool_name == "read_recent_changes":
             return env.read_recent_changes(target=arguments["target"], timeout_seconds=timeout)
         if tool_name == "read_runbook":
@@ -612,13 +637,20 @@ class ToolGateway:
         workflow_id: str,
         target: str,
         action_completed_at: datetime | None,
-    ) -> tuple[list[str], bool, str | None, ReadOutcome | None, bool]:
-        """One round of fresh, service-specific verification reads."""
+    ) -> _VerificationRound:
+        """One round of fresh, service-specific verification reads.
+
+        Recovery is verified on the same path the incident was diagnosed on. When
+        the target sits behind an allow-listed dependency edge, a healthy target
+        probe is not enough: the caller's own calls to it have to succeed too,
+        because a target can read healthy while the caller still cannot reach it.
+        """
         evidence_ids: list[str] = []
         collected_after_action = False
         blocked: str | None = None
         health: ReadOutcome | None = None
         metrics_ok = True
+        dependency: DependencyVerdict | None = None
 
         try:
             health = self.read(
@@ -678,7 +710,68 @@ class ToolGateway:
             else:
                 metrics_ok = False
 
-        return evidence_ids, collected_after_action, blocked, health, metrics_ok
+        callers = dependency_callers(target)
+        if callers:
+            caller = callers[0]
+            try:
+                edge = self.read(
+                    incident_id=incident_id,
+                    workflow_id=workflow_id,
+                    tool_name="read_dependency",
+                    arguments={
+                        "target": caller,
+                        "dependency": target,
+                        "window_seconds": self.settings.verification_window_seconds,
+                    },
+                    target=caller,
+                    budget_class="verification",
+                )
+            except repo.BudgetExhausted as exc:
+                # The round is already unaffordable, so stop settling instead of
+                # spending the remaining attempts on reads that cannot happen.
+                blocked = f"the dependency-path verification read is no longer affordable ({exc})"
+                dependency = DependencyVerdict(
+                    state="indeterminate",
+                    detail=(
+                        "the dependency-path verification read is no longer affordable "
+                        f"({exc}), so recovery was not established on the affected path"
+                    ),
+                )
+            except PolicyBlocked as exc:
+                blocked = f"a human control blocked the dependency-path verification read ({exc})"
+                dependency = DependencyVerdict(
+                    state="indeterminate",
+                    detail=(
+                        "a human control blocked the dependency-path verification read "
+                        f"({exc}), so recovery was not established on the affected path"
+                    ),
+                )
+            else:
+                evidence_ids.append(edge.evidence_id)
+                if not (
+                    action_completed_at is not None
+                    and edge.result.collected_at >= action_completed_at
+                ):
+                    collected_after_action = False
+                if not edge.result.succeeded:
+                    dependency = DependencyVerdict(
+                        state="indeterminate",
+                        detail=(
+                            "the dependency-path verification read failed "
+                            f"({edge.result.error}), so recovery was not established"
+                        ),
+                    )
+                else:
+                    dependency = classify_dependency_edge(edge.result.value)
+
+        return _VerificationRound(
+            evidence_ids=evidence_ids,
+            collected_after_action=collected_after_action,
+            blocked=blocked,
+            health=health,
+            metrics_ok=metrics_ok,
+            dependency=dependency,
+        )
 
     def verify_service(
         self,
@@ -714,18 +807,18 @@ class ToolGateway:
         for attempt in range(attempts):
             if attempt and settle_seconds:
                 time.sleep(settle_seconds)
-            (
-                evidence_ids,
-                collected_after_action,
-                blocked,
-                health,
-                metrics_ok,
-            ) = self._collect_verification_evidence(
+            fresh = self._collect_verification_evidence(
                 incident_id=incident_id,
                 workflow_id=workflow_id,
                 target=target,
                 action_completed_at=action_completed_at,
             )
+            evidence_ids = fresh.evidence_ids
+            collected_after_action = fresh.collected_after_action
+            blocked = fresh.blocked
+            health = fresh.health
+            metrics_ok = fresh.metrics_ok
+            dependency = fresh.dependency
             if blocked is not None:
                 break
             if (
@@ -733,6 +826,7 @@ class ToolGateway:
                 and health.result.succeeded
                 and metrics_ok
                 and bool(health.result.value.get("healthy"))
+                and (dependency is None or dependency.healthy)
             ):
                 break
 
@@ -761,6 +855,32 @@ class ToolGateway:
                 service=target,
                 evidence_ids=tuple(evidence_ids),
                 detail="no evidence collected at or after the action completed",
+                checked_at=utcnow(),
+            )
+        elif dependency is not None and dependency.failing:
+            # The flag is off and the target's own probe recovered, but the caller
+            # still cannot complete the operation. A path that is still failing is
+            # not a recovery, so this can never be RESOLVED.
+            result = VerificationResult(
+                outcome=VerificationOutcome.VERIFICATION_FAILURE,
+                service=target,
+                evidence_ids=tuple(evidence_ids),
+                detail=(
+                    "the affected dependency path is still failing after the action: "
+                    f"{dependency.detail}; target probe health="
+                    f"{health.result.value.get('health')} error_rate="
+                    f"{health.result.value.get('error_rate')}"
+                ),
+                checked_at=utcnow(),
+            )
+        elif dependency is not None and dependency.indeterminate:
+            # Unproven is not recovered: no traffic, no attribution, or a missing
+            # share leaves the verdict inconclusive and hands off.
+            result = VerificationResult(
+                outcome=VerificationOutcome.VERIFICATION_INCONCLUSIVE,
+                service=target,
+                evidence_ids=tuple(evidence_ids),
+                detail=f"recovery is unproven on the affected dependency path: {dependency.detail}",
                 checked_at=utcnow(),
             )
         elif bool(health.result.value.get("healthy")):

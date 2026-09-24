@@ -18,7 +18,12 @@ from datetime import UTC, datetime
 
 from opsaccord.domain.enums import ActionOutcome, SideEffect
 from opsaccord.domain.models import ToolResult
-from opsaccord.tools.contracts import DispatchRefused, DispatchTimeout, ReadTimeout
+from opsaccord.tools.contracts import (
+    DispatchRefused,
+    DispatchTimeout,
+    ReadTimeout,
+    dependency_operation,
+)
 
 REVISION = "3.1.0"
 REVISION_SOURCE = "https://github.com/open-telemetry/opentelemetry-demo"
@@ -195,6 +200,71 @@ class DemoEnvironment:
             },
             is_simulated=True,
             collected_at=now,
+        )
+
+    def read_dependency(
+        self, *, target: str, dependency: str, window_seconds: int, timeout_seconds: float
+    ) -> ToolResult:
+        """The caller's own view of one dependency edge (simulated).
+
+        The simulated surface models the edge from the callee's condition: a callee
+        that is unreachable cannot be reached by its caller, and a callee that is
+        failing has failing callers. That is the fixture's fault model, and it is
+        the fixture's job to be explicit about it -- the value still reaches
+        reasoning only through this typed read, with the caller, destination and
+        operation recorded, never as hidden scenario knowledge.
+
+        A caller with no allow-listed edge is a programming error, not a quiet
+        zero: an absent edge must never be read as "healthy".
+        """
+        self.read_calls.append(("read_dependency", target, dependency))
+        # The read is span-derived, so the simulated trace-timeout knob governs it:
+        # a scenario that makes traces time out must not get a dependency answer
+        # from a different channel than the one it broke.
+        if self._bump("read_dependency") <= self.faults.traces_timeout_attempts:
+            raise ReadTimeout(
+                f"dependency query for {target} -> {dependency} exceeded {timeout_seconds}s"
+            )
+        operation = dependency_operation(target, dependency)
+        if operation is None:
+            return ToolResult(
+                tool_name="read_dependency",
+                target=target,
+                succeeded=False,
+                error=(
+                    f"{target} -> {dependency} is not an allow-listed dependency edge; "
+                    "an unverified edge has no attributable telemetry"
+                ),
+                is_simulated=True,
+                collected_at=self._now(),
+            )
+        state = self._state(dependency)
+        now = self._now()
+        # An unreachable callee is still *called*: the caller makes the attempt and
+        # it fails. Calls are therefore non-zero in both conditions, which is what
+        # keeps "no traffic" meaning no traffic rather than "the callee is down".
+        calls_per_second = 0.2
+        error_rate = 1.0 if not state.reachable else state.error_rate
+        return ToolResult(
+            tool_name="read_dependency",
+            target=target,
+            succeeded=True,
+            value={
+                "caller": target,
+                "destination": dependency,
+                "operation": operation,
+                "span_kind": "client",
+                "attributable": True,
+                "calls_per_second": calls_per_second,
+                "error_rate": error_rate,
+                "window_seconds": window_seconds,
+                "source": "simulated-spans",
+                "queries": [],
+            },
+            is_simulated=True,
+            collected_at=now,
+            observation_window_start=now,
+            observation_window_end=now,
         )
 
     def read_recent_changes(self, *, target: str, timeout_seconds: float) -> ToolResult:
