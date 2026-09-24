@@ -12,6 +12,16 @@ control write takes it as the *first* lock of its transaction, so no control can
 commit inside the window between an authorization reading the control set and
 that authorization's transaction committing.
 
+Two things hold that property in place. Every control write and every
+authorization calls :func:`lock_control_gate` itself, and
+``repositories.lock_incident`` - the only other entry point to the per-incident
+row lock - takes the gate before the row as well. That second call is deliberate:
+a caller that takes the incident row first and asks for the gate afterwards has
+already inverted the documented order, and PostgreSQL answers that inversion with
+a deadlock rather than with a wrong result. Acquiring the same transaction-scoped
+lock twice inside one transaction is not a conflict; the server releases it when
+the transaction ends, however many times it was requested.
+
 Two properties of ``pg_advisory_xact_lock`` are load-bearing:
 
 * it is *transaction*-scoped, so the server releases it at commit, at rollback,

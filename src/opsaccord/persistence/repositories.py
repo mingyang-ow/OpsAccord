@@ -367,9 +367,15 @@ def lock_incident(session: Session, incident_id: str) -> IncidentRow:
 
     This is the *per-incident* half of the ordering guarantee. The global half is
     :func:`~opsaccord.persistence.locks.lock_control_gate`, which covers controls
-    with no incident to lock. Callers that take both must take the gate first:
-    the documented order is control gate -> incident row -> workflow row.
+    with no incident to lock, and **this helper takes it first**. The documented
+    order - control gate -> incident row -> workflow row - is therefore a property
+    of this function rather than a convention its callers have to remember: taking
+    the row lock first and only then asking for the gate is precisely the cycle
+    PostgreSQL resolves as a deadlock, and a test that composed the two by hand
+    did exactly that. Re-acquiring the gate inside the transaction that already
+    holds it is free, so the callers that take it themselves are unaffected.
     """
+    lock_control_gate(session)
     row = session.get(IncidentRow, incident_id, with_for_update=True)
     if row is None:
         raise RepositoryError(f"unknown incident {incident_id}")
@@ -591,6 +597,8 @@ def grant_extension(
 def set_takeover(session: Session, *, incident_id: str, actor: str) -> Workflow:
     # Every human control write takes the gate first, so that dispatch
     # authorization cannot read the control set while a control is mid-commit.
+    # ``lock_incident`` takes the same transaction-scoped lock again for its own
+    # callers; within one transaction that is not a conflict.
     lock_control_gate(session)
     lock_incident(session, incident_id)
     workflow_row = _lock_workflow_row(

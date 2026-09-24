@@ -9,7 +9,6 @@ gateway calls rather than against the private helpers, except where the defect
 from __future__ import annotations
 
 import threading
-import time
 from datetime import timedelta
 from typing import Any
 
@@ -296,46 +295,97 @@ def test_an_exhausted_hard_cap_stops_the_side_effect_at_dispatch(
 def test_a_human_control_that_commits_during_dispatch_is_not_ignored(
     db: Database, settings: Settings
 ) -> None:
-    """Takeover is serialised against the dispatch, not merely re-read.
+    """A takeover is ordered against dispatch, and a committed one is never ignored.
 
-    The window this closes: a takeover that commits after the revalidation read
-    but before the claim would be invisible under READ COMMITTED. The dispatch
-    holds the incident row lock across revalidate+claim, and this test commits a
-    takeover while that lock is held, so the dispatcher must observe it.
+    Both properties are coordinated deterministically - events and bounded waits,
+    never sleeps:
+
+    1. *Ordering.* A takeover cannot commit inside an authorization window. The
+       writer waits on the control gate until the transaction that holds it ends,
+       so the pre-fix interleaving (a control commits between the dispatcher's
+       control read and its claim, and is invisible under READ COMMITTED) is not
+       merely unlikely, it is unrepresentable. The test asserts the writer is
+       *still waiting* when the bounded window expires, not just that nothing has
+       committed yet.
+    2. *Safety.* A takeover that has committed before the authorization is
+       observed by revalidation, so the side effect never reaches the demo.
+
+    History, because the orchestration is the point: this test used to take the
+    incident row lock itself and then call ``set_takeover`` inside the same
+    transaction. Once every control write takes the control gate first, that
+    composition is the reverse of the documented order (gate -> incident row ->
+    workflow row) and PostgreSQL ends it with a deadlock instead of a result. The
+    supported path is to call ``set_takeover`` and let the repository take the
+    locks in order, which is what this test does now; the safety assertion it has
+    always carried is unchanged.
     """
     _, environment, gateway, controller, incident_id = build_case(db, settings)
     controller.run(incident_id)
     grant(db, pending_approval(db, incident_id))
     action = first_action(db, incident_id)
 
-    holding = threading.Event()
-    release = threading.Event()
+    gate_held = threading.Event()
+    release_gate = threading.Event()
+    writer_entered = threading.Event()
+    takeover_committed = threading.Event()
+    worker_failures: list[BaseException] = []
 
-    def hold_the_lock_then_take_over() -> None:
-        with db.session() as session:
-            repo.lock_incident(session, incident_id)
-            holding.set()
-            release.wait(timeout=20)
-            repo.set_takeover(session, incident_id=incident_id, actor="on-call")
+    def hold_the_gate() -> None:
+        try:
+            with db.session() as session:
+                repo.lock_control_gate(session)
+                gate_held.set()
+                release_gate.wait(timeout=20)
+        except BaseException as exc:  # reported below, never swallowed
+            worker_failures.append(exc)
+            gate_held.set()
 
-    holder = threading.Thread(target=hold_the_lock_then_take_over, daemon=True)
-    holder.start()
-    assert holding.wait(timeout=20), "the test could not take the incident lock"
+    def take_over() -> None:
+        writer_entered.set()
+        try:
+            writer = Database(settings.test_database_url)
+            try:
+                with writer.session() as session:
+                    repo.set_takeover(session, incident_id=incident_id, actor="on-call")
+            finally:
+                writer.dispose()
+        except BaseException as exc:  # reported below, never swallowed
+            worker_failures.append(exc)
+        finally:
+            takeover_committed.set()
 
-    results: dict[str, Any] = {}
+    holder = threading.Thread(target=hold_the_gate, daemon=True, name="gate-holder")
+    writer = threading.Thread(target=take_over, daemon=True, name="takeover-writer")
+    try:
+        holder.start()
+        assert gate_held.wait(timeout=20), "the test could not take the control gate"
+        writer.start()
+        assert writer_entered.wait(timeout=20), "the takeover writer never started"
+        committed_inside_the_window = takeover_committed.wait(timeout=1.0)
+        writer_was_waiting = writer.is_alive()
+    finally:
+        # Released even if the assertion above failed, so no worker is left waiting.
+        release_gate.set()
+        holder.join(timeout=20)
+        writer.join(timeout=20)
 
-    def dispatch() -> None:
-        results["execution"] = gateway.execute_action(action_id=action.id)
+    assert not holder.is_alive(), "the gate holder did not terminate"
+    assert not writer.is_alive(), "the takeover writer did not terminate"
+    assert worker_failures == [], f"a worker failed with a database error: {worker_failures!r}"
+    assert writer_was_waiting, (
+        "the takeover writer was not waiting on the gate: it either finished (which the "
+        "commit check above reports) or never reached the write"
+    )
+    assert committed_inside_the_window is False, (
+        "a takeover committed while the control gate was held: it could land between a "
+        "dispatcher's control read and its claim and be missed"
+    )
+    assert takeover_committed.is_set(), "the takeover must commit once the gate is released"
 
-    worker = threading.Thread(target=dispatch, daemon=True)
-    worker.start()
-    time.sleep(0.5)
-    release.set()
-    worker.join(timeout=30)
-    holder.join(timeout=30)
+    execution = gateway.execute_action(action_id=action.id)
 
-    execution = results["execution"]
     assert execution.executed is False
+    assert "human takeover active" in execution.detail
     assert environment.applied == {}, "a superseded dispatch must not reach the demo"
     with db.read_session() as session:
         workflow = repo.get_workflow(session, incident_id)
