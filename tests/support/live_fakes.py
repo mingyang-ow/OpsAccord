@@ -22,7 +22,11 @@ from opsaccord.domain.enums import IncidentStatus
 from opsaccord.scenarios import live as live_scenarios
 from opsaccord.scenarios.runner import ScenarioTrace
 from opsaccord.tools.contracts import DispatchRefused, DispatchTimeout
-from opsaccord.tools.live_environment import FLAG_SAFE_VARIANT, LiveEnvironmentUnavailable
+from opsaccord.tools.live_environment import (
+    FLAG_SAFE_VARIANT,
+    LIVE_TARGETS,
+    LiveEnvironmentUnavailable,
+)
 
 # The controller is stubbed and the fake stack ignores its settings, so this is
 # never dereferenced; it only keeps the call signature honest.
@@ -95,7 +99,24 @@ def health(
         "cpu_utilization": cpu,
         "error_rate": error_rate,
         "calls_per_second": calls,
+        "window_seconds": 120,
     }
+
+
+def cleared(value: dict[str, Any]) -> dict[str, Any]:
+    """The same target with its fault absent: what a safe flag position reads.
+
+    A fault only exists while its flag is armed, so the probe table describes the
+    *armed* demo and this is the pre-injection reading a scenario compares against.
+    Traffic is carried through -- a quiet fault (paymentUnreachable stops the
+    Charge arriving) is still quiet, and reading it as error-free would be the
+    absent-series-as-zero mistake in the other direction.
+    """
+    calls = value.get("calls_per_second")
+    observed = (
+        float(calls) if isinstance(calls, (int, float)) and not isinstance(calls, bool) else 0.0
+    )
+    return health(calls=observed, error_rate=None if observed == 0.0 else 0.0, cpu=0.01)
 
 
 def stack_health(**per_target: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -120,6 +141,7 @@ class FakeStack:
         store: FakeFlagStore,
         probes: dict[str, dict[str, Any]] | None = None,
         *,
+        fault_only_when_armed: bool = True,
         interrupt_on: str | None = None,
         interrupt_after: int | None = None,
         interrupt_on_flag_read: int | None = None,
@@ -127,6 +149,10 @@ class FakeStack:
     ) -> None:
         self.store = store
         self.probes = probes or {}
+        #: The demo shows a fault only while its flag is armed. Turning this off
+        #: models a demo that is already failing with every flag at its safe
+        #: variant, which is the state a scenario must refuse to measure against.
+        self.fault_only_when_armed = fault_only_when_armed
         self.interrupt_on = interrupt_on
         self.interrupt_after = interrupt_after
         self.interrupt_on_flag_read = interrupt_on_flag_read
@@ -163,7 +189,18 @@ class FakeStack:
         interrupting = target == self.interrupt_on and self.interrupt_after is not None
         if interrupting and self.reads.count(target) > int(self.interrupt_after or 0):
             raise KeyboardInterrupt
-        return Probe(succeeded=True, value=dict(self.probes.get(target, {})))
+        value = dict(self.probes.get(target, {}))
+        if self.fault_only_when_armed and not self._armed(target):
+            value = cleared(value)
+        return Probe(succeeded=True, value=value)
+
+    def _armed(self, target: str) -> bool:
+        """Whether the flag that faults this target is armed right now."""
+        live_target = LIVE_TARGETS.get(target)
+        if live_target is None or live_target.fault_flag is None:
+            return False
+        flag_id = live_target.fault_flag
+        return self.store.variants.get(flag_id) != FLAG_SAFE_VARIANT.get(flag_id)
 
 
 class EnvironmentFactory:

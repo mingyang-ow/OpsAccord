@@ -594,6 +594,52 @@ def _fault_visible(signal: str, probe: dict[str, Any]) -> bool:
     return error_rate is not None and _as_float(error_rate) > TELEMETRY_ERROR_BOUND
 
 
+def _reading(value: Any) -> float | None:
+    """One telemetry reading as a number, or ``None`` when it is not one.
+
+    ``_as_float`` answers a question about arithmetic and has a default; this
+    answers a question about evidence, where "not a number" and "absent" are the
+    same answer and neither of them is a zero.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _signal_key(signal: str) -> str:
+    return "cpu_utilization" if signal == "cpu" else "error_rate"
+
+
+def _fault_is_new(signal: str, probe: dict[str, Any], baseline: dict[str, Any] | None) -> bool:
+    """True when the probe shows a fault the pre-injection reading did not.
+
+    A scenario's premise is a *transition*, not a level: the demo was not showing
+    this fault before the write and shows it after. A level test cannot tell the
+    two apart, and the 2026-09-24 run is the measurement of exactly that failure -
+    the observation the harness accepted was collected 0.0s after the write and
+    read a 100% error share that the pre-injection window already carried, so the
+    scenario "proved" its premise with telemetry the write had not caused, and the
+    controller was then handed a fault it could not attribute.
+
+    Missing evidence is never a zero here. Without a pre-injection reading there is
+    no rise to observe, so the observation is not accepted rather than accepted on
+    the strength of an assumed baseline of zero - which is also the hole this
+    closes in the corroborating branch, where an absent baseline used to read as
+    ``0.0`` and made every caller-side failure a rise.
+    """
+    if baseline is None:
+        return False
+    key = _signal_key(signal)
+    current = _reading(probe.get(key))
+    previous = _reading(baseline.get(key))
+    if current is None or previous is None:
+        return False
+    return current > previous
+
+
 def _health_snapshot(value: dict[str, Any]) -> dict[str, Any]:
     """The fields a health probe reports, copied out of the untrusted value."""
     return {
@@ -605,6 +651,10 @@ def _health_snapshot(value: dict[str, Any]) -> dict[str, Any]:
             "cpu_utilization",
             "error_rate",
             "calls_per_second",
+            # The window the reading averages over. It is part of the claim: a
+            # reading this harness accepts averages a minute or two, so a reader
+            # of the record can see how far back the evidence reaches.
+            "window_seconds",
         )
     }
 
@@ -614,8 +664,9 @@ def wait_for_fault(
     *,
     target: str,
     signal: str = "error_rate",
+    target_before: dict[str, Any] | None,
     corroborating_target: str | None = None,
-    corroborating_before: dict[str, Any] | None = None,
+    corroborating_before: dict[str, Any] | None,
     timeout_seconds: float | None = None,
     poll_seconds: float | None = None,
     observe: Callable[[dict[str, Any]], None] | None = None,
@@ -642,12 +693,17 @@ def wait_for_fault(
     strictly above the telemetry bound, so a quiet demo keeps waiting and the
     failure mode is an honest setup failure rather than a fabricated one.
 
-    The corroborating observation is differential. ``corroborating_before`` carries
-    that target's error share from *before* this scenario armed anything, and the
-    caller's share has to be both above the bound and higher than that baseline.
-    Without it, a checkout container failing for a reason this scenario did not
-    cause would satisfy the premise: the corroborating series is a caller-side
-    signal, and a caller can be broken on its own.
+    *Both* observations are differential, and that is now the whole premise.
+    ``target_before`` and ``corroborating_before`` carry each target's own reading
+    from *before* this scenario armed anything, and an observation only counts when
+    it is above the bound **and** higher than its own pre-injection reading. A
+    level test alone cannot tell an injected fault from a demo that was already
+    failing: the 2026-09-24 run accepted payment's 100% error share 0.0s after the
+    write, on a window that began two minutes before the write, so the scenario
+    proved a fault it had not caused and could not have caused. Without a
+    baseline there is no rise, so an unreadable baseline keeps the harness waiting
+    and ends in an honest setup failure rather than in an invented baseline of
+    zero.
     """
     timeout_seconds = (
         FAULT_VISIBILITY_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
@@ -658,31 +714,33 @@ def wait_for_fault(
     started = time.monotonic()
     while time.monotonic() < deadline:
         health = environment.read_service_health(target=target, timeout_seconds=8.0)
+        probe = _health_snapshot(health.value)
         last = {
             "target": target,
             "signal": signal,
             "attribution": "target",
-            "probe": _health_snapshot(health.value),
+            "probe": probe,
+            "target_before": target_before,
             "corroborating": None,
             "corroborating_before": corroborating_before,
         }
-        if health.succeeded and _fault_visible(signal, last["probe"]):
+        if (
+            health.succeeded
+            and _fault_visible(signal, probe)
+            and _fault_is_new(signal, probe, target_before)
+        ):
             last["elapsed_seconds"] = round(time.monotonic() - started, 1)
             return last
         if corroborating_target is not None:
             caller = environment.read_service_health(
                 target=corroborating_target, timeout_seconds=8.0
             )
-            last["corroborating"] = {
-                "target": corroborating_target,
-                "probe": _health_snapshot(caller.value),
-            }
-            share = _as_float(last["corroborating"]["probe"].get("error_rate"))
-            before = _as_float((corroborating_before or {}).get("error_rate"))
+            caller_probe = _health_snapshot(caller.value)
+            last["corroborating"] = {"target": corroborating_target, "probe": caller_probe}
             if (
                 caller.succeeded
-                and _fault_visible("error_rate", last["corroborating"]["probe"])
-                and share > before
+                and _fault_visible("error_rate", caller_probe)
+                and _fault_is_new("error_rate", caller_probe, corroborating_before)
             ):
                 last["attribution"] = "caller"
                 last["elapsed_seconds"] = round(time.monotonic() - started, 1)
@@ -987,6 +1045,21 @@ def run_live_scenario(
                 budget_seconds=budget.remaining,
                 message=f"arming {plan.fault_flag}={fault.armed_variant}",
             )
+            # Both pre-injection readings, taken *before* the write and adjacent to
+            # it. The premise below is a rise, so a reading taken after the write
+            # would make the differential compare the fault with itself - which is
+            # how an already-failing demo came to satisfy a scenario's premise.
+            target_before = _health_baseline(environment, spec.service)
+            corroborating_before = _health_baseline(environment, plan.corroborating_target)
+            reporter.observation(
+                "pre-injection readings: "
+                f"{spec.service}={target_before}"
+                + (
+                    f"; {plan.corroborating_target}={corroborating_before}"
+                    if plan.corroborating_target
+                    else ""
+                )
+            )
             # Recorded before the write is attempted, not after it is acknowledged:
             # if the write is applied and its response is lost, the scenario must
             # still restore what it may have installed.
@@ -998,10 +1071,6 @@ def run_live_scenario(
                 timeout_seconds=FAULT_WRITE_TIMEOUT_SECONDS,
             )
             fault.armed = True
-
-            # The caller's own error share *before* the fault was armed, so the
-            # corroborating observation below is a rise and not just a level.
-            corroborating_before = _corroborating_baseline(environment, plan.corroborating_target)
 
             stage = "fault-visibility"
             visibility_budget = budget.clamp(FAULT_VISIBILITY_TIMEOUT_SECONDS)
@@ -1015,6 +1084,7 @@ def run_live_scenario(
                 environment,
                 target=spec.service,
                 signal=plan.fault_signal,
+                target_before=target_before,
                 corroborating_target=plan.corroborating_target,
                 corroborating_before=corroborating_before,
                 timeout_seconds=visibility_budget,
@@ -1183,12 +1253,14 @@ def _traffic_observation(target: str, probe: dict[str, Any]) -> str:
     )
 
 
-def _corroborating_baseline(environment: Environment, target: str | None) -> dict[str, Any] | None:
+def _health_baseline(environment: Environment, target: str | None) -> dict[str, Any] | None:
     """One target's health *before* a scenario arms anything.
 
-    Used as the differential baseline for the corroborating observation. A probe
-    that does not answer is not a baseline of zero: it is no baseline, and the
-    differential test is then skipped rather than invented.
+    Read for both the fault target and the corroborating target, and read before
+    the write: the visibility predicate is a rise, so a baseline taken afterwards
+    would compare the fault with itself. A probe that does not answer is not a
+    baseline of zero: it is no baseline, and the observation it would have
+    qualified is then not accepted rather than accepted against an invented zero.
     """
     if target is None:
         return None
@@ -1216,15 +1288,25 @@ def _fault_observation(probe: dict[str, Any]) -> str:
 
 
 def _fault_reason(fault_visible: dict[str, Any]) -> str:
-    """One recorded line saying which series proved the fault, and what it read."""
+    """One recorded line saying which series proved the fault, and what it rose from.
+
+    The baseline is part of the claim, not decoration. A probe reading on its own
+    cannot show that the fault is the one this scenario armed - that is the reading
+    the 2026-09-24 run accepted - so the record carries both sides of the rise.
+    """
     if fault_visible.get("attribution") == "caller":
         corroborating = fault_visible.get("corroborating") or {}
         return (
             "fault visible after arming on the caller's own RPCs: "
-            f"{corroborating.get('target')} probe {corroborating.get('probe')}; "
-            f"target probe {fault_visible.get('probe')}"
+            f"{corroborating.get('target')} probe {corroborating.get('probe')} above its "
+            f"pre-injection reading {fault_visible.get('corroborating_before')}; "
+            f"target probe {fault_visible.get('probe')} against its pre-injection reading "
+            f"{fault_visible.get('target_before')}"
         )
-    return f"fault visible after arming: {fault_visible.get('probe')}"
+    return (
+        f"fault visible after arming: {fault_visible.get('probe')} above its "
+        f"pre-injection reading {fault_visible.get('target_before')}"
+    )
 
 
 def _unmeasured_result(

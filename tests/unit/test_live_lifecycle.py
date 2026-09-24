@@ -406,18 +406,21 @@ def test_unreachable_payment_visibility_uses_the_callers_failing_rpcs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The connection failure removes the payment series; the caller still proves it."""
+    # The flag is armed, so this is the armed demo the probe table describes.
     probes = stack_health(
         **{
             "payment-service": health(calls=0.0, error_rate=None),
             "checkout-service": health(calls=1.0, error_rate=0.75),
         }
     )
-    stack = FakeStack(FakeFlagStore(), probes)
+    stack = FakeStack(FakeFlagStore({"paymentUnreachable": "on"}), probes)
 
     probe = live_scenarios.wait_for_fault(
         stack,
         target="payment-service",
+        target_before=health(calls=0.0, error_rate=None),
         corroborating_target="checkout-service",
+        corroborating_before=health(calls=1.0, error_rate=0.0),
         timeout_seconds=0.2,
         poll_seconds=0.01,
     )
@@ -435,13 +438,15 @@ def test_a_quiet_payment_path_is_a_setup_failure_not_a_fault(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """No calls and no errors on either target: no fault is claimed."""
-    stack = FakeStack(FakeFlagStore(), stack_health())
+    stack = FakeStack(FakeFlagStore({"paymentUnreachable": "on"}), stack_health())
 
     with pytest.raises(live_scenarios.LiveSetupFailed) as excinfo:
         live_scenarios.wait_for_fault(
             stack,
             target="payment-service",
+            target_before=health(calls=0.0, error_rate=None),
             corroborating_target="checkout-service",
+            corroborating_before=health(calls=0.0, error_rate=None),
             timeout_seconds=0.2,
             poll_seconds=0.01,
         )
@@ -453,7 +458,7 @@ def test_a_quiet_payment_path_is_a_setup_failure_not_a_fault(
 def test_traffic_without_errors_is_not_a_fault(monkeypatch: pytest.MonkeyPatch) -> None:
     """A caller with traffic and a clean error share keeps the harness waiting."""
     stack = FakeStack(
-        FakeFlagStore(),
+        FakeFlagStore({"paymentUnreachable": "on"}),
         stack_health(
             **{
                 "payment-service": health(calls=0.2, error_rate=0.0),
@@ -466,7 +471,9 @@ def test_traffic_without_errors_is_not_a_fault(monkeypatch: pytest.MonkeyPatch) 
         live_scenarios.wait_for_fault(
             stack,
             target="payment-service",
+            target_before=health(calls=0.2, error_rate=0.0),
             corroborating_target="checkout-service",
+            corroborating_before=health(calls=3.0, error_rate=0.0),
             timeout_seconds=0.2,
             poll_seconds=0.01,
         )
@@ -474,18 +481,21 @@ def test_traffic_without_errors_is_not_a_fault(monkeypatch: pytest.MonkeyPatch) 
     # ...while the payment target's own failing RPCs still prove the fault on their
     # own, which is the attribution the report has to keep.
     proving = FakeStack(
-        FakeFlagStore(),
+        FakeFlagStore({"paymentUnreachable": "on"}),
         stack_health(**{"payment-service": health(calls=0.05, error_rate=0.33)}),
     )
     probe = live_scenarios.wait_for_fault(
         proving,
         target="payment-service",
+        target_before=health(calls=0.05, error_rate=0.0),
         corroborating_target="checkout-service",
+        corroborating_before=health(calls=0.0, error_rate=None),
         timeout_seconds=0.2,
         poll_seconds=0.01,
     )
     assert probe["attribution"] == "target"
     assert probe["corroborating"] is None or probe["corroborating"]["probe"]["error_rate"] is None
+    assert probe["target_before"]["error_rate"] == 0.0
 
 
 def test_a_simulated_surface_is_refused_by_the_driver() -> None:
@@ -631,7 +641,7 @@ def test_a_caller_that_was_already_erroring_is_not_the_fault(
 ) -> None:
     """The corroborating series has to rise, not merely sit above the bound."""
     stack = FakeStack(
-        FakeFlagStore(),
+        FakeFlagStore({"paymentUnreachable": "on"}),
         stack_health(
             **{
                 "payment-service": health(calls=0.0, error_rate=None),
@@ -644,11 +654,114 @@ def test_a_caller_that_was_already_erroring_is_not_the_fault(
         live_scenarios.wait_for_fault(
             stack,
             target="payment-service",
+            target_before=health(calls=0.0, error_rate=None),
             corroborating_target="checkout-service",
-            corroborating_before={"error_rate": 0.75},
+            corroborating_before=health(calls=1.0, error_rate=0.75),
             timeout_seconds=0.2,
             poll_seconds=0.01,
         )
+
+
+def test_a_target_that_was_already_failing_is_not_the_armed_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A demo already at this error share cannot prove the fault this run armed.
+
+    This is the 2026-09-24 shape: payment read a 100% error share 0.0s after the
+    write, because that is what it read *before* the write too. A level test
+    accepted it and handed the controller a premise the write had not caused; the
+    differential keeps waiting instead.
+    """
+    already_failing = health(calls=0.0167, error_rate=1.0)
+    stack = FakeStack(
+        FakeFlagStore({"paymentUnreachable": "on"}),
+        stack_health(
+            **{
+                "payment-service": already_failing,
+                "checkout-service": already_failing,
+            }
+        ),
+    )
+
+    with pytest.raises(live_scenarios.LiveSetupFailed) as excinfo:
+        live_scenarios.wait_for_fault(
+            stack,
+            target="payment-service",
+            target_before=already_failing,
+            corroborating_target="checkout-service",
+            corroborating_before=already_failing,
+            timeout_seconds=0.2,
+            poll_seconds=0.01,
+        )
+
+    # The refusal is a premise that was never established, and the last observation
+    # carries both sides of the comparison so the record explains itself.
+    assert "never showed the armed fault" in str(excinfo.value)
+    assert "'error_rate': 1.0" in str(excinfo.value)
+
+
+def test_an_unreadable_baseline_is_not_a_baseline_of_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing evidence is not clean evidence: no baseline, no rise, no premise."""
+    stack = FakeStack(
+        FakeFlagStore({"paymentUnreachable": "on"}),
+        stack_health(
+            **{
+                "payment-service": health(calls=0.05, error_rate=0.33),
+                "checkout-service": health(calls=1.0, error_rate=0.75),
+            }
+        ),
+    )
+
+    with pytest.raises(live_scenarios.LiveSetupFailed):
+        live_scenarios.wait_for_fault(
+            stack,
+            target="payment-service",
+            target_before=None,
+            corroborating_target="checkout-service",
+            corroborating_before=None,
+            timeout_seconds=0.2,
+            poll_seconds=0.01,
+        )
+
+
+def test_the_pre_injection_readings_are_taken_before_the_fault_is_armed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both baselines are read while the flag is still safe, so the rise is real.
+
+    The fake shows the fault only while its flag is armed - the same shape the real
+    demo has - so a baseline read *after* the write would read the fault and the
+    scenario could not prove a rise. Reading it before the write is what makes the
+    premise attributable, and this test fails on the code that read the caller's
+    baseline after arming.
+    """
+    store = FakeFlagStore()
+    probes = stack_health(
+        **{
+            "payment-service": health(calls=0.033, error_rate=0.0),
+            "checkout-service": health(calls=0.033, error_rate=1.0),
+        }
+    )
+    use_fake_stack(monkeypatch, FakeStack(store, probes), StubController())
+
+    result = live_scenarios.run_live_scenario(
+        live_scenarios.SCENARIOS["P1-01"],
+        live_scenarios.LIVE_PLANS["P1-01"],
+        db=UNUSED_DB,
+        settings=live_settings(),
+        budget_seconds=0.5,
+        poll_seconds=0.01,
+    )
+
+    assert result.status == "MEASURED"
+    fault_visible = result.fault_visible or {}
+    assert fault_visible["attribution"] == "caller"
+    assert fault_visible["corroborating_before"]["error_rate"] == 0.0
+    assert fault_visible["corroborating"]["probe"]["error_rate"] == 1.0
+    assert fault_visible["target_before"]["error_rate"] == 0.0
+    assert any("pre-injection reading" in reason for reason in result.reasons)
 
 
 def test_ctrl_c_with_a_failed_cleanup_still_ends_as_an_interrupt(
