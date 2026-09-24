@@ -674,7 +674,13 @@ def test_an_unaffordable_edge_read_is_inconclusive_rather_than_fatal(
         )
         workflow_id = workflow.id
 
-    before = [call.tool_name for call in tool_calls(db, case.incident_id)]
+    # Scope the round by persisted id rather than by position. `tool_calls()`
+    # orders by `started_at` alone, and the incident history legitimately already
+    # contains a dependency read: the P1-01 diagnosis plan reads the caller's own
+    # view of the edge before anything is remediated. An earlier version of this
+    # check asked the whole history for the absence of a dependency read and
+    # failed on that diagnostic read, which says nothing about this round.
+    before = {call.id for call in tool_calls(db, case.incident_id)}
     result = case.gateway.verify_service(
         incident_id=case.incident_id,
         workflow_id=workflow_id,
@@ -687,13 +693,30 @@ def test_an_unaffordable_edge_read_is_inconclusive_rather_than_fatal(
     assert "dependency-path verification read is no longer affordable" in result.detail
     # A budget wall, described as a budget wall: the cause is the cap, not a human.
     assert "human" not in result.detail
+
     # The message alone would also be produced by refusing the *first* read, so
-    # assert the shape too: the health probe and both metrics reads ran under the
-    # cap, and the refused read is the dependency-path read specifically. A
-    # refused read records no tool call at all, so its absence is the evidence.
-    where = [call.tool_name for call in tool_calls(db, case.incident_id)]
-    assert where[len(before) :] == ["read_service_health", "read_metrics", "read_metrics"], where
-    assert "read_dependency" not in where
+    # assert the shape of this round's own reads too. Exactly the health probe and
+    # the two metrics reads were added, which also means they were affordable and
+    # answered: the verdict reaches the dependency branches only after
+    # `health.result.succeeded` and `metrics_ok` are both true. The dependency read
+    # that follows them is the refused one -- a refused read raises before it is
+    # recorded, so its absence from the round is the evidence.
+    added = [call for call in tool_calls(db, case.incident_id) if call.id not in before]
+    assert sorted(call.tool_name for call in added) == [
+        "read_metrics",
+        "read_metrics",
+        "read_service_health",
+    ], [call.tool_name for call in added]
+    assert "read_dependency" not in {call.tool_name for call in added}
+
+    # The persisted verdict is what the console and the audit trail carry, so it
+    # has to report the same budget cause as the returned one.
+    recorded = verifications(db, case.incident_id)
+    assert [item.outcome for item in recorded] == [
+        VerificationOutcome.VERIFICATION_INCONCLUSIVE.value
+    ]
+    assert "dependency-path verification read is no longer affordable" in recorded[0].detail
+    assert "human" not in recorded[0].detail
     assert_no_resolution_and_one_action(db, case.incident_id)
 
 
