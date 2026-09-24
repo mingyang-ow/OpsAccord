@@ -961,13 +961,24 @@ sandbox denies its socket. See `docs/reports/phase1-review.md` for the honest re
 ## Dependency attribution for Payment (`2286565` base) - the caller's own view of the edge
 
 **Status: PARTIAL.** The measured Payment failure is fixed at its root cause, and the diagnostic and
-verification contract behind it is now explicit and pinned by **31 new tests**. The offline suite, the
+verification contract behind it is now explicit and pinned by **38 new tests**. The offline suite, the
 linter, the formatter and `mypy` pass on this revision. **No database-backed test, no scenario run and no
 live path has executed against it**: the escalation that the integration suite needs is rejected before
 the command runs by the approval provider's own error (`The supported API model names are deepseek-flash,
 deepseek-v4-pro, but you passed codex-auto-review`), the same misconfiguration recorded in the previous
 pass. The new integration tests are therefore *written but unexecuted*, and Payment has not been
 re-measured live. Both are stated as gaps below, not as results.
+
+That blocker was re-measured on this revision rather than inherited, and it is wider than the approval
+provider: **this sandbox denies every socket syscall.** `AF_UNIX` `connect`, `AF_INET` socket creation
+and netlink all return `Operation not permitted`, so the project cluster cannot even start here
+(`pg_ctl` fails with `could not create IPv4 socket for address "127.0.0.1": Operation not permitted` and
+then `FATAL: could not create any TCP/IP sockets`), and an HTTP read of the demo stack is impossible for
+the same reason. The cluster left running for the planning discussion is no longer up: the previous
+session's `postgres` process is gone and `.local/pg/run/` holds only its stale socket and lock file, so
+`scripts/validate.sh` stage `01-database` is what starts it again on your terminal. The escalation
+attempt fails identically to the previous pass, with the approval reviewer's provider error quoted
+above. Neither the code nor the tests are implicated, and neither was changed to suit the environment.
 
 ### The measured failure
 
@@ -1075,13 +1086,21 @@ would leave a real recovery with zero headroom and turn a budget landing into a 
 ### Tests in this session
 
 Executed: `ruff check .`, `ruff format --check .`, `mypy src/opsaccord` (41 files) and
-`pytest -q -m "not integration"` -> **152 passed, 7 skipped, 82 deselected**. New: 10 rule cases in
+`pytest -q -m "not integration"` -> **159 passed, 7 skipped, 82 deselected**. New: 10 rule cases in
 `tests/unit/test_deterministic_adapter.py` (a healthy payment with a failing caller edge is a path
 diagnosis; a failing edge is never reported as the payment service failing; a healthy edge on both sides
 is not remediated; a quiet window; a missing read; an unattributable read; malformed evidence; a
 collection error; a self-contradictory probe) and 17 in `tests/unit/test_dependency_attribution.py`
 (the classifier's answers including the bound itself, the edge list, the simulated edge surface, and the
-registry's refusal of any other pair).
+registry's refusal of any other pair). Seven more pin the **live** edge read in
+`tests/unit/test_live_adapter.py` against the fake stack, because that is the half of this pass that
+cannot run offline against the real stack and would otherwise have had no executed coverage at all: the
+caller-side triple (`span_name` + `service_name='checkout'` + `span_kind='SPAN_KIND_CLIENT'`) and the
+error selector that carry the attribution, the four ways the schema can fail to attribute (no series, no
+service label, no span-kind label, no client-side kind value) each reported as `attributable: false`
+with its reason and **no** value query, a quiet window that reports no calls and no share, and the
+refusal of an unverified pair. Both halves were mutation-checked: dropping the span-kind predicate from
+the selector and hard-coding the service label each fail the new tests, and the failures were reverted.
 
 Written, **not executed here** (they need PostgreSQL): `test_p1_01_attributes_the_fault_to_the_callers_own_view_of_the_edge`
 in `tests/acceptance/test_scenarios.py` (the caller-side evidence exists with its attribution, and the
@@ -1105,6 +1124,15 @@ observed payloads with no sensitive values.
 * **The new integration tests have not run.** They are written against the fixtures and the persistence
   contract, and they collect cleanly, but "written" is not "verified"; they belong to the same command as
   the live run.
+* **The live edge read is pinned offline, not proven live.** The seven new fake-stack checks in
+  `tests/unit/test_live_adapter.py` fix the selector, the error label and the four unattributable
+  answers, and they are mutation-checked, so a regression in the adapter's *reasoning* now fails
+  offline. They cannot say whether the stack exports a client-side Charge series at all; that number
+  exists only in a live run, and the read is written to report its absence rather than paper over it.
+* **The demo stack's own state is unknown from here.** Every HTTP read is denied by the sandbox, so
+  whether Docker Desktop still holds the pinned stack up is unverified; `scripts/validate.sh` treats
+  the stack as idempotent (`demo.sh health || demo.sh start`) and its endpoint stage rewrites
+  `.local/demo-endpoints.env`, so a stopped stack is recovered rather than assumed.
 
 ## Remaining work and discussion
 
@@ -1197,30 +1225,41 @@ observed payloads with no sensitive values.
 - Whether Phase 1's live scope should include a paid reasoning provider at all,
   or stay deterministic with live tools.
 
-**One command block for the remaining live checks.** This is the whole of what is left to run. It
-selects the project's environment, saves a timestamped log, stops on the first unexpected failure
-while preserving the failing stage's exit status, keeps live settings inside a subprocess, refuses to
-start beside another driver, and shows progress immediately:
+**One command block for the remaining checks.** This is the whole of what is left to run: the Payment
+path, focused, because the handoff says the remaining scenarios must not start until Payment's result
+has been assessed. It runs in a subshell so the operator's interactive shell is not closed by a failing
+stage, activates the project's own environment explicitly, saves a timestamped log outside the stage
+logs, keeps live settings inside the live subprocess, refuses to start beside another driver, and shows
+progress immediately:
 
 ```bash
-set -euo pipefail
 cd /home/brentiburo/projects/OpsAccord
-export UV_CACHE_DIR=/tmp/uvcache
-LOGS="reports/local/user-live-checks-$(date -u +%Y%m%dT%H%M%S)"; mkdir -p "$LOGS"
-run() { printf '\n=== %s ===\n' "$*" | tee -a "$LOGS/live-checks.log"; "$@" 2>&1 | tee -a "$LOGS/live-checks.log"; }
-# 1. the one path the interrupted run never reached, with progress and verified cleanup
-run scripts/validate.sh --live --scenario P1-01
-# 2. the remaining paths contribute the fault/injection coverage
-for id in P1-02 P1-03 P1-04 P1-05 P1-06 P1-07; do run scripts/validate.sh --live --scenario "$id"; done
-# 3. the complete seven-path suite, only once the focused runs hold
-run scripts/validate.sh --live
+(
+  set -euo pipefail
+  deactivate 2>/dev/null || true
+  # shellcheck disable=SC1091
+  source .venv/bin/activate
+  export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+  printf 'interpreter: %s\n' "$(python -c 'import sys; print(sys.executable)')"
+  scripts/validate.sh --live --scenario P1-01 2>&1 \
+    | tee ".local/user-live-checks-$(date -u +%Y%m%dT%H%M%S).log"
+)
 ```
 
-Stamp out the block after any stage that fails unexpectedly, and read
-`reports/local/validation-<timestamp>/` for that stage. A stage that reports a scenario as *not
-measured* is not a failure of this command; it means the fault premise did not appear and the run
-will say why. The live paths still have not run on this revision, so this block is what turns the
-`PARTIAL` above into a measurement.
+`scripts/validate.sh` is what supplies the rest: it starts and verifies the project-local PostgreSQL
+cluster, runs the offline suite, the linter, the formatter and `mypy`, then the PostgreSQL-backed
+integration suite (which holds the four new checks in this pass), the sensitivity harness and the
+simulated scenarios, refuses to run if another live driver holds the demo flags, and only then runs the
+one live path with `PYTHONUNBUFFERED=1` so its per-event lines appear while it works. Every stage writes
+`reports/local/validation-<timestamp>/<stage>.log`.
+
+Read three things in that directory: `07-integration-suite.log` (the new acceptance checks have never
+run), `13-live-paths.log` plus the `live-scenarios-*.json` it names for a `read_dependency` evidence
+item carrying `caller=checkout-service`, `destination=payment-service`, `operation=Charge`,
+`span_kind=client` and `attributable: true`, and the persisted diagnosis. A run that escalates again is
+a measurement, not a failure of this command: read the reason, which will name the instrumentation gap
+(`attributable: false` with the label names the stack actually exposes) if the client-side Charge series
+is not there.
 
 **Startup, demonstration, verification, teardown:**
 

@@ -20,7 +20,12 @@ import pytest
 
 from opsaccord.config import Settings
 from opsaccord.domain.enums import ActionOutcome
-from opsaccord.tools.contracts import DispatchTimeout, ReadTimeout, UnknownDemoTarget
+from opsaccord.tools.contracts import (
+    DispatchTimeout,
+    ReadTimeout,
+    UnknownDemoTarget,
+    classify_dependency_edge,
+)
 from opsaccord.tools.live_environment import LiveEnvironment, LiveEnvironmentUnavailable
 
 CALLS = "traces_span_metrics_calls_total"
@@ -41,6 +46,13 @@ FLAG_DOCUMENT = {
     }
 }
 
+#: The span-metric label schema the pinned revision exposes. ``read_dependency``
+#: reads this from the server instead of assuming it, so the fake has to answer
+#: the schema endpoints too; a fake that only answered value queries would let a
+#: hard-coded label name pass these tests.
+SPAN_LABELS = frozenset({"__name__", "service_name", "span_kind", "span_name", "status_code"})
+SPAN_KIND_VALUES = ("SPAN_KIND_SERVER", "SPAN_KIND_CLIENT")
+
 
 class FakeStack:
     """Minimal Prometheus + Jaeger + flagd-ui stand-in."""
@@ -54,6 +66,8 @@ class FakeStack:
         traces: list[dict[str, Any]] | None = None,
         flags: dict[str, Any] | None = None,
         fail: Exception | None = None,
+        span_labels: set[str] | None = None,
+        span_kind_values: list[str] | None = None,
     ) -> None:
         self.calls = calls
         self.errors = errors
@@ -61,8 +75,13 @@ class FakeStack:
         self.traces = traces if traces is not None else []
         self.flags = json.loads(json.dumps(flags if flags is not None else FLAG_DOCUMENT))
         self.fail = fail
+        self.span_labels = set(SPAN_LABELS if span_labels is None else span_labels)
+        self.span_kind_values = list(
+            SPAN_KIND_VALUES if span_kind_values is None else span_kind_values
+        )
         self.queries: list[str] = []
         self.writes: list[dict[str, Any]] = []
+        self.series_selectors: list[str] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         if self.fail is not None:
@@ -103,6 +122,14 @@ class FakeStack:
             self.writes.append(body)
             self.flags = body["data"]
             return httpx.Response(200, json={})
+        if path == "/api/v1/series":
+            self.series_selectors.append(request.url.params.get("match[]", ""))
+            data = [dict.fromkeys(sorted(self.span_labels))] if self.span_labels else []
+            return httpx.Response(200, json={"status": "success", "data": data})
+        if path.startswith("/api/v1/label/") and path.endswith("/values"):
+            label = path.removeprefix("/api/v1/label/").removesuffix("/values")
+            values = self.span_kind_values if label == "span_kind" else []
+            return httpx.Response(200, json={"status": "success", "data": values})
         raise AssertionError(f"unexpected request to {path}")
 
 
@@ -368,3 +395,130 @@ def test_timeout_is_reported_as_a_read_timeout() -> None:
         environment.read_metrics(
             target="payment-service", metric="error_rate", window_seconds=300, timeout_seconds=0.05
         )
+
+
+# --- the caller's own view of one dependency edge -----------------------------
+#
+# This is the read the focused Payment run added. It never ran against the stack
+# in the offline suite, so its schema resolution and its query construction are
+# pinned here instead: the live stage proves the numbers, these prove that the
+# read asks the right question and refuses to answer when it cannot.
+
+
+def test_the_edge_read_pins_the_callers_own_client_side_spans() -> None:
+    """The attribution is the triple (caller, operation, client side).
+
+    Reading the operation without the caller and the span kind is what let the
+    pre-fix evidence mix the callee's server spans into the caller's share.
+    """
+    stack = FakeStack(calls=0.4, errors=0.4)
+    environment = build(stack)
+
+    result = environment.read_dependency(
+        target="checkout-service",
+        dependency="payment-service",
+        window_seconds=120,
+        timeout_seconds=2.0,
+    )
+
+    assert result.succeeded is True
+    assert result.is_simulated is False
+    value = result.value
+    assert value["caller"] == "checkout-service"
+    assert value["destination"] == "payment-service"
+    assert value["operation"] == "Charge"
+    assert value["span_kind"] == "client"
+    assert value["attributable"] is True
+    assert value["error_rate"] == pytest.approx(1.0)
+    assert stack.series_selectors == ["span_name='oteldemo.PaymentService/Charge'"]
+    calls_query, errors_query = value["queries"]
+    for query in (calls_query, errors_query):
+        assert "span_name='oteldemo.PaymentService/Charge'" in query
+        assert "service_name='checkout'" in query
+        assert "span_kind='SPAN_KIND_CLIENT'" in query
+    assert "status_code='STATUS_CODE_ERROR'" in errors_query
+    assert "status_code=" not in calls_query
+    assert classify_dependency_edge(value).failing
+
+
+@pytest.mark.parametrize(
+    ("stack_kwargs", "expected"),
+    [
+        (
+            {"span_labels": set()},
+            "no series matches span_name=",
+        ),
+        (
+            {"span_labels": {"__name__", "span_name", "span_kind", "status_code"}},
+            "expose no service label",
+        ),
+        (
+            {"span_labels": {"__name__", "span_name", "service_name", "status_code"}},
+            "expose no span-kind label",
+        ),
+        (
+            {"span_kind_values": ["SPAN_KIND_SERVER"]},
+            "has no client-side value",
+        ),
+    ],
+    ids=["no-series", "no-service-label", "no-span-kind-label", "no-client-kind-value"],
+)
+def test_an_unattributable_edge_says_why_and_never_claims_health(
+    stack_kwargs: dict[str, Any], expected: str
+) -> None:
+    """An instrumentation gap is reported as a gap, not as a quiet healthy edge."""
+    stack = FakeStack(**stack_kwargs)
+    environment = build(stack)
+
+    result = environment.read_dependency(
+        target="checkout-service",
+        dependency="payment-service",
+        window_seconds=120,
+        timeout_seconds=2.0,
+    )
+
+    assert result.succeeded is True
+    value = result.value
+    assert value["attributable"] is False
+    assert expected in value["reason"]
+    # No share is invented, and no value query is built from labels the server
+    # did not confirm: the read stays inside its declared boundary.
+    assert "calls_per_second" not in value
+    assert "error_rate" not in value
+    assert stack.queries == []
+    verdict = classify_dependency_edge(value)
+    assert not verdict.failing and not verdict.healthy
+
+
+def test_a_quiet_edge_is_not_a_recovered_edge() -> None:
+    """A window with no calls proves neither failure nor recovery."""
+    environment = build(FakeStack(calls=0.0, errors=0.0))
+
+    result = environment.read_dependency(
+        target="checkout-service",
+        dependency="payment-service",
+        window_seconds=120,
+        timeout_seconds=2.0,
+    )
+
+    value = result.value
+    assert value["attributable"] is True
+    assert value["calls_per_second"] == 0.0
+    assert value["error_rate"] is None
+    verdict = classify_dependency_edge(value)
+    assert not verdict.failing and not verdict.healthy
+
+
+def test_the_edge_read_refuses_an_unverified_pair() -> None:
+    """Attribution is the declared pair; another pair has no evidence to read."""
+    stack = FakeStack()
+    environment = build(stack)
+
+    with pytest.raises(UnknownDemoTarget, match="not an allow-listed dependency edge"):
+        environment.read_dependency(
+            target="checkout-service",
+            dependency="ad-service",
+            window_seconds=120,
+            timeout_seconds=2.0,
+        )
+    assert stack.queries == []
