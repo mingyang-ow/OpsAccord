@@ -16,3 +16,11 @@ Read README.md, docs/architecture.md, docs/phase1.md, and docs/evaluation.md bef
 - External review is optional and is never a completion gate. Final review and acceptance happen with the user in their planning conversation, so finish with an honest report and stop. Use READY_FOR_DISCUSSION / PARTIAL / BLOCKED in docs/report-template.md rather than declaring completion.
 - Report exact branch and commit, commands and results, scenarios, findings and fixes, limitations, and next decisions using docs/report-template.md.
 - Do not merge implementation work, publish a release, or change repository visibility without explicit instruction.
+
+## Commands for the user
+
+- Give the user one copy-and-paste shell block in execution order, rather than separate lines to assemble. Split blocks only when a result must be inspected before proceeding.
+- Include the project directory and explicit project Python environment selection. Prefer `.venv/bin/python -m ...` or project-scoped `uv run python -m ...` over bare `pytest` or `mypy` that can resolve to another project or system installation.
+- Make validation blocks stop on unexpected failure, using a subshell with `set -euo pipefail` where appropriate so the user's interactive shell is not closed. Respect harnesses whose expected negative tests are represented by an overall successful exit.
+- Keep commands on single lines where practical; avoid fragile backslash continuations. State the expected result and evidence destination briefly, without promising an unverified pass.
+- Do not require manual package installation one dependency at a time; use the project's dependency manifest and lockfile when environment setup is necessary.
