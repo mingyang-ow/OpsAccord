@@ -715,10 +715,12 @@ Two behaviours worth naming:
 
 `OPSACCORD_LIVE_DEMO` is the one variable that cannot simply be left to the tests: it is the opt-in
 switch for `tests/integration/test_live_demo.py`, which is deliberately *not* marked `integration`,
-so leaving it exported makes `pytest -m "not integration"` select four tests that need the live
-stack (they error without it, and would write real feature flags with it). The runner removes it for
-the offline stages. Whether that module should carry the `integration` mark is a discussion item
-below rather than a change made here, because it would redefine an already-validated suite.
+so those seven tests are already inside the `-m "not integration"` selection (measured: 104 tests
+collected, 7 of them from this module) and the variable is the only thing that decides whether they
+skip or **execute** against the live stack - where they would write real feature flags. The runner
+removes it for the offline stages. Whether that module should carry the `integration` mark is a
+discussion item below rather than a change made here, because it would redefine an
+already-validated suite.
 
 ### Results from this session
 
@@ -813,11 +815,12 @@ that is an expectation, not a measurement, and `scripts/validate.sh` is what set
   in-database transaction, and a timeout would introduce a new failure path this
   environment cannot exercise.
 - Whether `tests/integration/test_live_demo.py` should carry the `integration` mark. It is opt-in
-  through `OPSACCORD_LIVE_DEMO=1` and deliberately outside the integration mark, which is why the
-  runner has to remove that variable: with it exported, `pytest -m "not integration"` selects four
-  tests that need the live stack. Adding the mark would fix that at the source, but it would also
-  grow the integration suite from 78 tests to 85 with seven skips, and that suite has just been
-  validated at 78.
+  through `OPSACCORD_LIVE_DEMO=1` and deliberately outside the integration mark. Measured: its seven
+  tests are collected by `-m "not integration"` either way (104 collected, 78 deselected), so that
+  variable alone decides whether they skip or execute - which is why the runner has to remove it.
+  Adding the mark would move them out of the offline selection at the source, but it would also grow
+  the integration suite from 78 tests to 85 collected, with seven skips when the opt-in is unset, and
+  that suite has just been validated at 78.
 - Whether the corrected control-ordering test should keep its `pg_locks` observation
   now that it is the only thing that proves the writer contended for the gate. It reads
   a system view (`pg_locks` is world-readable, so no grant is needed) and it is what
