@@ -16,11 +16,15 @@ Two things hold that property in place. Every control write and every
 authorization calls :func:`lock_control_gate` itself, and
 ``repositories.lock_incident`` - the only other entry point to the per-incident
 row lock - takes the gate before the row as well. That second call is deliberate:
-a caller that takes the incident row first and asks for the gate afterwards has
-already inverted the documented order, and PostgreSQL answers that inversion with
-a deadlock rather than with a wrong result. Acquiring the same transaction-scoped
-lock twice inside one transaction is not a conflict; the server releases it when
-the transaction ends, however many times it was requested.
+the documented order then belongs to the helper instead of being a convention a
+caller has to remember. The inversion is not merely untidy. A control writer that
+takes the incident row first and asks for the gate second is harmless by itself,
+but against a dispatcher that holds the gate and is waiting for that same row it
+is a cycle, and PostgreSQL ends it with a deadlock rather than letting the control
+commit inside the authorization window it was supposed to be excluded from.
+Acquiring the same transaction-scoped lock twice inside one transaction is not a
+conflict; the server releases it when the transaction ends, however many times it
+was requested.
 
 Two properties of ``pg_advisory_xact_lock`` are load-bearing:
 

@@ -62,15 +62,25 @@ def test_the_gate_is_transaction_scoped_and_uses_its_registered_key() -> None:
 
 
 class OrderRecordingSession(RecordingSession):
-    """A session stand-in that also records the row lock it was asked for."""
+    """A session stand-in that records the gate and the row lock in one sequence.
+
+    ``RecordingSession`` keeps the two kinds of call in separate lists, which cannot
+    express an order between them: "the gate was taken" and "the row was locked" are
+    each true of the inverted composition too. This one merges them into a single
+    log, because the order is the only thing the guard is for.
+    """
 
     def __init__(self, row: Any) -> None:
         super().__init__()
         self.row = row
-        self.gets: list[tuple[str, bool]] = []
+        self.sequence: list[str] = []
+
+    def execute(self, statement: Any, parameters: dict[str, Any] | None = None) -> None:
+        self.sequence.append(str(statement))
+        super().execute(statement, parameters)
 
     def get(self, entity: Any, ident: Any, with_for_update: bool = False) -> Any:
-        self.gets.append((ident, with_for_update))
+        self.sequence.append(f"row lock {ident} with_for_update={with_for_update}")
         return self.row
 
 
@@ -79,8 +89,10 @@ def test_the_incident_row_lock_is_requested_only_after_the_control_gate() -> Non
 
     A regression here is a real deadlock rather than a failed assertion: a control
     writer that holds the incident row and then asks for the gate waits on a
-    dispatch that holds the gate and waits for the row. This asserts the statement
-    order only, so it needs no database and cannot flake.
+    dispatch that holds the gate and waits for the row. The guard is therefore the
+    merged sequence and not the two statements separately - swapping the two lines
+    of ``lock_incident`` leaves both statements present, and only their order
+    changes.
     """
     row = object()
     session = OrderRecordingSession(row)
@@ -88,11 +100,14 @@ def test_the_incident_row_lock_is_requested_only_after_the_control_gate() -> Non
     returned = repo.lock_incident(session, "inc-1")
 
     assert returned is row
-    assert len(session.calls) == 1, "the gate must be the first lock in the transaction"
-    gate_statement, gate_parameters = session.calls[0]
+    assert len(session.sequence) == 2, "one gate statement and one row-lock request"
+    gate_statement, row_request = session.sequence
     assert "pg_advisory_xact_lock" in gate_statement
-    assert gate_parameters == {"classid": CONTROL_GATE_LOCK[0], "objid": CONTROL_GATE_LOCK[1]}
-    assert session.gets == [("inc-1", True)], "the row must be locked, and only after the gate"
+    assert row_request == "row lock inc-1 with_for_update=True"
+    assert session.calls[0][1] == {
+        "classid": CONTROL_GATE_LOCK[0],
+        "objid": CONTROL_GATE_LOCK[1],
+    }
 
 
 def test_an_unknown_incident_fails_after_the_gate_is_taken() -> None:
@@ -101,4 +116,5 @@ def test_an_unknown_incident_fails_after_the_gate_is_taken() -> None:
     with pytest.raises(repo.RepositoryError):
         repo.lock_incident(session, "inc-missing")
 
-    assert "pg_advisory_xact_lock" in session.calls[0][0]
+    assert "pg_advisory_xact_lock" in session.sequence[0]
+    assert session.sequence[1] == "row lock inc-missing with_for_update=True"

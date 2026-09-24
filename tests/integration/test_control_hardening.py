@@ -9,6 +9,7 @@ gateway calls rather than against the private helpers, except where the defect
 from __future__ import annotations
 
 import threading
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -25,6 +26,7 @@ from opsaccord.domain.enums import (
 from opsaccord.ids import utcnow
 from opsaccord.persistence import repositories as repo
 from opsaccord.persistence.db import Database
+from opsaccord.persistence.locks import CONTROL_GATE_LOCK
 from opsaccord.persistence.tables import ToolCallRow, WorkflowRow
 from opsaccord.reasoning.deterministic import DeterministicAdapter
 from opsaccord.scenarios.fixtures import SCENARIOS, build_environment_for_scenario
@@ -297,27 +299,34 @@ def test_a_human_control_that_commits_during_dispatch_is_not_ignored(
 ) -> None:
     """A takeover is ordered against dispatch, and a committed one is never ignored.
 
-    Both properties are coordinated deterministically - events and bounded waits,
-    never sleeps:
+    Two properties are established here, each with a bounded wait rather than a
+    fixed sleep:
 
-    1. *Ordering.* A takeover cannot commit inside an authorization window. The
-       writer waits on the control gate until the transaction that holds it ends,
-       so the pre-fix interleaving (a control commits between the dispatcher's
-       control read and its claim, and is invisible under READ COMMITTED) is not
-       merely unlikely, it is unrepresentable. The test asserts the writer is
-       *still waiting* when the bounded window expires, not just that nothing has
-       committed yet.
-    2. *Safety.* A takeover that has committed before the authorization is
-       observed by revalidation, so the side effect never reaches the demo.
+    1. *Ordering.* A control write cannot commit while an authorization transaction
+       holds the control gate, so it cannot land in the window between a
+       dispatcher's control read and its claim and be missed under READ COMMITTED.
+       The gate holder stands in for that window, and the takeover writer is
+       *observed waiting* on the gate - a blocked advisory-lock request appears in
+       ``pg_locks`` with ``granted = false`` - rather than assumed to have arrived.
+       That distinction is the whole point: "nothing committed in the last second"
+       is also true of a writer that never reached the gate.
+    2. *Safety.* A takeover that has committed before the authorization is observed
+       by revalidation, so the side effect never reaches the demo.
+
+    The dispatcher's half of the clock - ``execute_action`` holding the gate across
+    its control read and its claim, and releasing it before the external call - is
+    proven separately in
+    ``test_dispatch_safety.py::test_the_authorization_holds_the_gate_and_releases_it_before_the_external_call``,
+    because the gate holder here never dispatches.
 
     History, because the orchestration is the point: this test used to take the
     incident row lock itself and then call ``set_takeover`` inside the same
     transaction. Once every control write takes the control gate first, that
     composition is the reverse of the documented order (gate -> incident row ->
-    workflow row) and PostgreSQL ends it with a deadlock instead of a result. The
-    supported path is to call ``set_takeover`` and let the repository take the
-    locks in order, which is what this test does now; the safety assertion it has
-    always carried is unchanged.
+    workflow row), and with a dispatcher on the other side it is a deadlock instead
+    of a result. The supported path is to call ``set_takeover`` and let the
+    repository take the locks in order, which is what this test does now; the safety
+    assertion it has always carried is unchanged.
     """
     _, environment, gateway, controller, incident_id = build_case(db, settings)
     controller.run(incident_id)
@@ -326,9 +335,22 @@ def test_a_human_control_that_commits_during_dispatch_is_not_ignored(
 
     gate_held = threading.Event()
     release_gate = threading.Event()
-    writer_entered = threading.Event()
     takeover_committed = threading.Event()
     worker_failures: list[BaseException] = []
+
+    def gate_waiters() -> int:
+        """How many backends are blocked on the control gate right now."""
+        with db.read_session() as session:
+            return int(
+                session.execute(
+                    sa.text(
+                        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'"
+                        " AND classid::bigint = :classid AND objid::bigint = :objid"
+                        " AND granted = false"
+                    ),
+                    {"classid": CONTROL_GATE_LOCK[0], "objid": CONTROL_GATE_LOCK[1]},
+                ).scalar_one()
+            )
 
     def hold_the_gate() -> None:
         try:
@@ -341,7 +363,6 @@ def test_a_human_control_that_commits_during_dispatch_is_not_ignored(
             gate_held.set()
 
     def take_over() -> None:
-        writer_entered.set()
         try:
             writer = Database(settings.test_database_url)
             try:
@@ -356,27 +377,34 @@ def test_a_human_control_that_commits_during_dispatch_is_not_ignored(
 
     holder = threading.Thread(target=hold_the_gate, daemon=True, name="gate-holder")
     writer = threading.Thread(target=take_over, daemon=True, name="takeover-writer")
+    holder.start()
     try:
-        holder.start()
         assert gate_held.wait(timeout=20), "the test could not take the control gate"
         writer.start()
-        assert writer_entered.wait(timeout=20), "the takeover writer never started"
-        committed_inside_the_window = takeover_committed.wait(timeout=1.0)
-        writer_was_waiting = writer.is_alive()
+        # Bounded poll for positive evidence that the control write reached the gate
+        # and is blocked on it. The cadence is a poll interval, not a delay the
+        # result depends on: the loop exits the moment the waiter is visible.
+        deadline = time.monotonic() + 20
+        while gate_waiters() == 0:
+            assert time.monotonic() < deadline, (
+                "no backend ever waited for the control gate, so this test would have "
+                "passed without ever contending for the ordering it claims to exercise"
+            )
+            time.sleep(0.05)
+        committed_while_waiting = takeover_committed.is_set()
     finally:
-        # Released even if the assertion above failed, so no worker is left waiting.
+        # Released even if an assertion above failed, and joined only if the thread
+        # actually started, so cleanup cannot replace the real failure with a
+        # "cannot join thread before it is started" error.
         release_gate.set()
-        holder.join(timeout=20)
-        writer.join(timeout=20)
+        for worker in (holder, writer):
+            if worker.ident is not None:
+                worker.join(timeout=20)
 
     assert not holder.is_alive(), "the gate holder did not terminate"
     assert not writer.is_alive(), "the takeover writer did not terminate"
     assert worker_failures == [], f"a worker failed with a database error: {worker_failures!r}"
-    assert writer_was_waiting, (
-        "the takeover writer was not waiting on the gate: it either finished (which the "
-        "commit check above reports) or never reached the write"
-    )
-    assert committed_inside_the_window is False, (
+    assert committed_while_waiting is False, (
         "a takeover committed while the control gate was held: it could land between a "
         "dispatcher's control read and its claim and be missed"
     )
