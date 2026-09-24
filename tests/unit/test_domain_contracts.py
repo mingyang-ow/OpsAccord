@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from opsaccord.config import Settings, canonical_json, digest, to_libpq_dsn
@@ -53,7 +55,9 @@ def test_sqlalchemy_urls_convert_to_libpq_dsns() -> None:
     assert to_libpq_dsn("postgresql://user@host/db") == "postgresql://user@host/db"
 
 
-def test_test_environment_keeps_state_and_checkpoints_in_one_database() -> None:
+def test_test_environment_keeps_state_and_checkpoints_in_one_database(
+    isolated_config: Path,
+) -> None:
     settings = Settings(app_env="test")
     assert settings.state_database_url == settings.test_database_url
     assert settings.checkpoint_url == settings.test_database_url
@@ -62,14 +66,14 @@ def test_test_environment_keeps_state_and_checkpoints_in_one_database() -> None:
     assert overridden.checkpoint_url == "postgresql://other/checkpoints"
 
 
-def test_application_runtime_model_is_explicit_and_not_inherited() -> None:
+def test_application_runtime_model_is_explicit_and_not_inherited(isolated_config: Path) -> None:
     settings = Settings()
     assert settings.model_provider == "deterministic"
     assert settings.allow_paid_model_calls is False
     assert settings.model_input_cost_per_1k_usd is None
 
 
-def test_demo_mode_selects_the_adapter_and_never_falls_back() -> None:
+def test_demo_mode_selects_the_adapter_and_never_falls_back(isolated_config: Path) -> None:
     # The simulated surface stays the default, and each mode has exactly one
     # adapter: live never resolves to the in-process simulator, so live evidence
     # can never be produced by the simulated model.

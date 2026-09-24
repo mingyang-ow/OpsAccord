@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
@@ -40,12 +41,51 @@ from support.isolation import (
 DEFAULT_TEST_DATABASE_URL = "postgresql+psycopg://opsaccord@127.0.0.1:55432/opsaccord_test"
 
 
+#: Variables that a live session leaves in the shell. ``scripts/demo.sh endpoints``
+#: writes them to ``.local/demo-endpoints.env`` and the documented live command
+#: exports them with ``set -a; . .local/demo-endpoints.env``, so they can outlive
+#: the run that produced them.
+LIVE_SESSION_VARS = (
+    "OPSACCORD_DEMO_MODE",
+    "OPSACCORD_PROMETHEUS_BASE_URL",
+    "OPSACCORD_JAEGER_BASE_URL",
+    "OPSACCORD_FLAG_CONTROL_BASE_URL",
+    "OPSACCORD_LIVE_DEMO",
+)
+
+
 @pytest.fixture(scope="session")
 def settings() -> Settings:
     return Settings(
         app_env="test",
         test_database_url=os.environ.get("OPSACCORD_TEST_DATABASE_URL", DEFAULT_TEST_DATABASE_URL),
     )
+
+
+@pytest.fixture
+def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Observe *default* configuration, ignoring this developer's environment.
+
+    ``Settings`` is supposed to read ``OPSACCORD_*`` variables and the ``.env``
+    file beside the working directory - that is the runtime override mechanism,
+    and the tests in ``test_config_isolation.py`` verify it. A test that asserts a
+    *default* therefore has to say which environment it is observing, or it fails
+    for a reason that has nothing to do with the code: a shell that still exports
+    ``OPSACCORD_DEMO_MODE=live`` (or a model, paid-call, budget or checkpoint
+    override) makes the default assertions fail while everything is working.
+
+    This fixture removes the inherited ``OPSACCORD_*`` variables and moves the
+    working directory to an empty temporary one, so neither the process
+    environment nor a real ``.env`` file can reach the test. It is **opt-in and
+    never autouse**: tests that want the ambient environment - the override tests,
+    the integration fixtures, anything reading ``OPSACCORD_TEST_DATABASE_URL`` -
+    still see it. Nothing is changed globally and nothing the user configured is
+    modified; ``monkeypatch`` restores the environment and the directory.
+    """
+    for name in [key for key in os.environ if key.startswith("OPSACCORD_")]:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
 
 
 @pytest.fixture(scope="session")
