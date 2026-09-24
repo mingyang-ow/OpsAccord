@@ -1049,6 +1049,31 @@ sandbox denies its socket. See `docs/reports/phase1-review.md` for the honest re
 - Whether Phase 1's live scope should include a paid reasoning provider at all,
   or stay deterministic with live tools.
 
+**One command block for the remaining live checks.** This is the whole of what is left to run. It
+selects the project's environment, saves a timestamped log, stops on the first unexpected failure
+while preserving the failing stage's exit status, keeps live settings inside a subprocess, refuses to
+start beside another driver, and shows progress immediately:
+
+```bash
+set -euo pipefail
+cd /home/brentiburo/projects/OpsAccord
+export UV_CACHE_DIR=/tmp/uvcache
+LOGS="reports/local/user-live-checks-$(date -u +%Y%m%dT%H%M%S)"; mkdir -p "$LOGS"
+run() { printf '\n=== %s ===\n' "$*" | tee -a "$LOGS/live-checks.log"; "$@" 2>&1 | tee -a "$LOGS/live-checks.log"; }
+# 1. the one path the interrupted run never reached, with progress and verified cleanup
+run scripts/validate.sh --live --scenario P1-01
+# 2. the remaining paths contribute the fault/injection coverage
+for id in P1-02 P1-03 P1-04 P1-05 P1-06 P1-07; do run scripts/validate.sh --live --scenario "$id"; done
+# 3. the complete seven-path suite, only once the focused runs hold
+run scripts/validate.sh --live
+```
+
+Stamp out the block after any stage that fails unexpectedly, and read
+`reports/local/validation-<timestamp>/` for that stage. A stage that reports a scenario as *not
+measured* is not a failure of this command; it means the fault premise did not appear and the run
+will say why. The live paths still have not run on this revision, so this block is what turns the
+`PARTIAL` above into a measurement.
+
 **Startup, demonstration, verification, teardown:**
 
 ```bash
