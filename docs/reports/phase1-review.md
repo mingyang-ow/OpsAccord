@@ -278,3 +278,26 @@ rather than import errors. It was verified offline only as far as collection; it
 execution, like every database-backed check in this pass, is outstanding and is
 listed with exact commands in `docs/reports/phase1-implementation.md`,
 "Validation attempt after `b508a0f`".
+
+### Update, deadlock-correction pass
+
+Claude was not retried again, and it could not have run: the invocation was denied
+before it started by the harness's own broken approval review
+(*"The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed
+codex-auto-review"*), and this sandbox denies socket creation outright. **The optional
+external review still does not exist**, for `5102dbe`, `b508a0f`, `cb60242`, `7b66f11` or
+`7becf98`. Nothing in this file is a review of them.
+
+What did happen is recorded in `docs/reports/phase1-implementation.md`, "Independent
+agent review (not the external reviewer, and not Claude)": a separate agent instance, a
+different model (`gpt-5.5-codex`), read-only, reviewing `7b66f11`. It confirmed the
+production lock-order audit, found no production defect, and found two real defects in
+the tests this pass had just written - a guard that could not detect the very inversion
+it was written to prevent, and a cleanup path that would have replaced an assertion
+failure with a `join()` error. Both were fixed in `7becf98`, and the guard's failure on
+the inverted composition is demonstrated in
+`reports/local/lock-order-guard-falsification.log`.
+
+That is a second pair of eyes on this pass's work, and it is still **not** the
+independent external review this repository's earlier instructions wanted. The
+distinction is kept because it is the difference between evidence and reassurance.

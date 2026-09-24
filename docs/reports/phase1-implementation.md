@@ -8,16 +8,17 @@
 | Branch | `phase1/baseline` |
 | Base commit | `3168bcf` (branch point: design baseline and Phase 1 foundation) |
 | Implementation commit | `5102dbe` (the commit immediately preceding this report) |
-| Branch commits | `1296b23`, `821414a`, `b4b75aa`, `5102dbe`, then `5cbcce2` and `b508a0f` - the per-revision totals are reproducible with `git diff --shortstat 3168bcf <rev>`; for the branch tip as it stood at `b508a0f` that reports 87 files changed, 18404 insertions(+), 42 deletions(-) |
+| Branch commits | `1296b23`, `821414a`, `b4b75aa`, `5102dbe`, `5cbcce2`, `b508a0f`, `cb60242`, then the deadlock-correction commits `ed0d132` (committed user guidance), `7b66f11` (the fix), `7becf98` (review fixes) and this report's own commit as the tip - per-revision totals are reproducible with `git diff --shortstat 3168bcf <rev>`; for the branch tip as it stood at `b508a0f` that reports 87 files changed, 18404 insertions(+), 42 deletions(-) |
 | Dirty state | Clean apart from this report and the two evidence files it commits; only gitignored local state (`.local/`, `reports/local/`, `.venv/`) otherwise remains |
 | Host | WSL 2, kernel `6.18.33.2-microsoft-standard-WSL2`, Ubuntu 26.04 LTS, 16 CPU, 15.5 GB RAM |
 | Toolchain | `uv` 0.12.5, Python 3.12.14 (`.python-version`), project-local PostgreSQL 18.6 on `127.0.0.1:55432`, Docker 29.7.2 (client and server), Docker Compose v5.4.0 |
 | Coding agent | Codex CLI agent on the user's configured DeepSeek provider; the environment reports `deepseek-flash` / `deepseek-v4-pro` as its supported models |
 | Application runtime model | `deterministic` / `deterministic-v1` - no paid application-model calls were made |
-| Optional second review | Claude Code 2.1.267, model `claude-opus-5`, subscription-backed - see `docs/reports/phase1-review.md` |
+| Optional second review | **Not run, and not available in the deadlock-correction pass.** Claude Code 2.1.267 is installed and subscription-backed, but the invocation was denied before it ran by the harness's broken automatic approval review, and a GPT-6 Luna reviewer was rejected by the provider (only `deepseek-flash` and `deepseek-v4-pro` are accepted). A fresh-context agent review on `gpt-5.5-codex` did run - see `docs/reports/phase1-review.md` and "Independent agent review" below |
 | **Overall status at `5102dbe`** | **READY_FOR_DISCUSSION** |
 | Safety-pass status (branch tip) | **PARTIAL** - both follow-up defects are implemented with regression tests and every offline check passes, but the PostgreSQL concurrency, recovery, scenario and live checks could not run and no optional review ran. See "Safety pass after `5cbcce2`". |
 | Validation-pass status | **PARTIAL** - the environment was diagnosed precisely (host services up, sandbox networking denied) and a runnable pre-fix sensitivity harness was added, but no database-backed check has still executed. See "Validation attempt after `b508a0f`". |
+| **Deadlock-correction status (branch tip with this report)** | **PARTIAL** - the deadlock the user's integration run found is fixed, an independent review found and this pass fixed two further defects in the new tests, and every offline check passes; the corrected test, the pre-fix harness, the nine scenarios and the seven live paths remain unrun because this sandbox denies socket creation. See "Deadlock correction after the integration suite". |
 
 `READY_FOR_DISCUSSION` means every executable technical gate in `docs/phase1.md`
 passed on this commit, including the four primary paths against the real isolated
@@ -427,12 +428,188 @@ with the implementation agent's own deterministic checks - is what was used.
 The first review (`docs/reports/phase1-review.md`, revision `b4b75aa`) reviewed
 neither these fixes nor the ones in `5102dbe`.
 
+## Deadlock correction after the integration suite (`7b66f11`)
+
+The user ran the suites from their own WSL terminal and reported: pre-fix sensitivity
+harness behaving as designed, **77 passed / 1 failed** for the integration suite, 89
+passed / 7 skipped offline, 9/9 simulated scenarios, live preflight succeeded with no
+final result supplied. Those are the user's measurements, not this session's.
+
+### The failure: a deadlock, and then a misleading KeyError
+
+`tests/integration/test_control_hardening.py::test_a_human_control_that_commits_during_dispatch_is_not_ignored`
+failed with a PostgreSQL deadlock. The `KeyError: 'execution'` that followed was a
+symptom, not a second defect: the dispatch thread died on the deadlock before it
+stored its result, and the test read `results["execution"]` regardless.
+
+### Root cause: the test composed two helpers in the reverse of the documented order
+
+The old test body took the incident row lock by hand and then called
+`set_takeover` inside that same transaction. Every human control write takes the
+global control gate first, so that transaction was holding the incident row and
+*then* asking for the gate, while `ToolGateway.execute_action` holds the gate and
+then asks for the incident row. Two sessions, two opposite orders, one cycle -
+PostgreSQL is correct to abort it.
+
+The order that must hold is **control gate -> incident row -> workflow row**.
+
+### Was production affected? No - and the audit is the reason that claim is made
+
+Every production caller was read in this pass, not assumed:
+
+| Caller | Order it takes | Verdict |
+| --- | --- | --- |
+| `ToolGateway.execute_action` (`tools/gateway.py:377,385`) | gate, then incident row, then claim | correct |
+| `repositories.set_takeover` (`repositories.py:602-603`) | gate, incident row, workflow row | correct |
+| `repositories.add_constraint` (`repositories.py:1320-1322`) | gate, then incident row when scoped | correct |
+| `repositories.lock_incident` (`repositories.py:378`) | gate **now**, then incident row | was the gap |
+| the old test body | incident row, then `set_takeover`'s gate | inverted |
+
+No production path inverted the order, so no production defect was fixed here and no
+production behaviour changed. The honest statement of the defect is narrower and more
+useful than "the test was wrong": **`lock_incident` had no guard of its own**, so the
+documented order was a convention callers had to remember, and a caller that forgot
+got a deadlock instead of an error. The test was the caller that forgot.
+
+### The correction
+
+- `repositories.lock_incident` now takes the control gate before the row lock, so the
+  order is a property of the helper. Re-acquiring a transaction-scoped lock inside a
+  transaction that already holds it is free, so callers that take the gate themselves
+  are unaffected. `persistence/locks.py` now says both why that is safe and why an
+  inversion produces a deadlock rather than a wrong result.
+- The test was rewritten onto the supported path - it calls `set_takeover` and lets the
+  repository take the locks in order - while keeping the assertion it has always
+  carried: a takeover committed before the authorization is observed by revalidation
+  and the side effect never reaches the demo.
+- Thread handling was improved as the handoff required. Coordination is event-based
+  with bounded waits (the 0.5s `time.sleep` is gone). Worker exceptions are captured in
+  a list and asserted empty, so a database error now reports itself instead of being
+  laundered into `KeyError: 'execution'`. Both workers are asserted terminated, the
+  writer is shown to be blocked on the gate by observing an ungranted advisory-lock
+  request in `pg_locks`, and the gate is released in a `finally` that joins only threads
+  that actually started, so a failed assertion cannot leave a thread blocked and cannot
+  be replaced by a `join()` error. The first version of both of those properties was
+  defective, and the independent review below is what found it; `7becf98` fixes it.
+- `tests/unit/test_persistence_locks.py` gained two database-free guards that assert
+  `lock_incident` issues the gate statement *before* it requests the row lock, and that
+  an unknown incident still fails after the gate is taken.
+
+No timeout was increased, no deadlock was suppressed, no retry was added around the
+external action, and the safety assertion was not weakened.
+
+### Verification performed in this session
+
+In-sandbox, after the corrections, on the working tree that became `7b66f11`:
+
+| Check | Exact command | Result |
+| --- | --- | --- |
+| Lint | `UV_CACHE_DIR=/tmp/uvcache uv run ruff check .` | clean |
+| Format | `UV_CACHE_DIR=/tmp/uvcache uv run ruff format --check .` | 75 files already formatted |
+| Types | `UV_CACHE_DIR=/tmp/uvcache uv run mypy src/opsaccord` | success, 40 source files |
+| Offline suite | `UV_CACHE_DIR=/tmp/uvcache uv run pytest -m "not integration" -q` | **91 passed, 7 skipped, 78 deselected** (was 89 passed: +2 new unit guards) |
+| New lock-order guards | `UV_CACHE_DIR=/tmp/uvcache uv run pytest tests/unit/test_persistence_locks.py -v` | 4 passed |
+| Integration collection | `UV_CACHE_DIR=/tmp/uvcache uv run pytest tests/integration/test_control_hardening.py tests/integration/test_dispatch_safety.py --collect-only -q` | 25 tests collected (imports clean) |
+
+The same four commands were re-run after the review fixes in `7becf98` with identical
+results (lint clean, 75 files formatted, 40 source files typed, 91 passed / 7 skipped /
+78 deselected).
+
+Collection is not execution, and it is not offered as evidence of the concurrency
+guarantee. It only shows the corrected files import.
+
+### Verification that could not run, and why
+
+The blocker is the same one as in the previous two passes, re-confirmed directly rather
+than inherited: this session's own probe found `socket.socket(AF_INET)` raising
+`PermissionError [Errno 1] Operation not permitted` before any `connect` was attempted.
+That is a sandbox seccomp denial inside the agent's process tree - not a stopped
+cluster, not a DSN problem. The project cluster is up on the host
+(`.local/pg/data/postmaster.pid`, PID 22096, port 55432).
+
+Consequently these remain outstanding for the corrected revision, and none of them is
+claimed as passing:
+
+- the corrected test in isolation, and any bounded repeat of it;
+- `tests/integration/test_dispatch_safety.py` (14) and the rest of the integration suite;
+- `scripts/prefix-sensitivity.sh` against `5cbcce2`;
+- the nine simulated scenarios and the seven live paths.
+
+The critical open question is narrow and specific: **does the corrected test now pass
+under real PostgreSQL?** It exercises a takeover that commits before the authorization
+and after the gate is released, and it is written to fail rather than pass if the
+ordering assumption is wrong. Only a database can answer it, so it is a user-run check
+below.
+
+### Optional review for this pass
+
+Two reviewers were prepared and both are unavailable; neither is a completion gate.
+
+- **A GPT-6 Luna reviewer could not be started.** One bounded attempt was made through
+  the agent's sub-agent channel and the provider rejected it:
+  *"The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed
+  gpt-6-luna."* No retry, per the bounded-attempt rule.
+- **The Claude harness could not be invoked.** `claude --version` reports
+  `2.1.267 (Claude Code)`, but the invocation itself was denied before it ran: the
+  harness's automatic approval review rejected the command with its own failure,
+  *"The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed
+  codex-auto-review."* That is the same misconfiguration recorded in the previous two
+  passes, so the known-failing escalation route was not retried, and no 90-120s
+  hang-prone run was repeated.
+- **What did run instead.** A fresh-context independent reviewer agent accepted the
+  review task on the harness default model (`gpt-5.5-codex`, reported by the agent
+  itself). Its scope, findings and my responses are in the "Independent agent review"
+  subsection below. This is a separate agent instance and a different model, but it is
+  the same harness and the same provider family, so it is **not** an external
+  independent review and is not presented as one.
+
+### Independent agent review (not the external reviewer, and not Claude)
+
+A fresh-context reviewer agent was given commit `7b66f11` and an explicitly read-only
+brief: audit the lock order in every caller, check whether taking the gate inside
+`lock_incident` introduces a new problem, check whether the rewritten test still proves
+both properties, and check whether the database-free guard can actually fail. It
+reported findings rather than editing anything, and reported its own model as
+`gpt-5.5-codex`.
+
+**Verdict: sound with caveats** - no production defect, and the audit confirmed
+independently. It checked that the only `FOR UPDATE` row locks in the tree are on
+`IncidentRow` (`repositories.py:379`), `WorkflowRow` (`:387`) and `ApprovalRow`
+(`:1174`); that `lock_incident` is the only entry point to the incident row and all
+three production callers already took the gate first; and that `claim_action`
+(action -> approval) and `decide_approval` (approval -> action) are opposite orders but
+not a reachable cycle, because `claim_action` locks the action row only for an
+`APPROVED` action, and an `APPROVED` row cannot be decided again.
+
+It also found two real defects in *this pass's* work. Both are fixed in `7becf98`:
+
+| Finding | Kind | Status |
+| --- | --- | --- |
+| The database-free guard could not detect a re-inversion: `execute` and `get` were recorded in two separate lists, so `lock_incident` taking the row first and the gate second still satisfied all four assertions. The reviewer reproduced it, and a bare swap is exactly the regression the guard existed to prevent. | **defect** | fixed - the stand-in records one merged sequence and the guard asserts it; `reports/local/lock-order-guard-falsification.{py,log}` shows the new guard failing on the inversion and the old guard passing on it |
+| `finally` joined `writer` unconditionally, but a failed `gate_held.wait()` means `writer.start()` never ran, and `Thread.join()` on an unstarted thread raises `RuntimeError: cannot join thread before it is started` - which would have replaced the real `AssertionError` with a confusing error. | **defect** | fixed - the gate is released, then only threads with `ident is not None` are joined |
+| `writer.is_alive()` was offered as evidence the writer was waiting on the gate, but it only means "not finished", so the ordering check could pass without the gate ever being contended. | caveat | fixed - the test now requires observing an ungranted advisory-lock request for the gate key in `pg_locks`, and fails with a clear message if none appears |
+| `persistence/locks.py` said PostgreSQL answers the inversion with a deadlock, unconditionally. A lone transaction taking the row first and the gate second succeeds. | overstatement | fixed - the text now names the cycle (a gate-holding dispatcher waiting on the same row) that is aborted |
+| The test name and docstring implied a takeover committing concurrently with a dispatch, which this test no longer does: its gate holder never dispatches. | overstatement | docstring corrected, and it now names `test_dispatch_safety.py:194` as where the dispatcher's half is proven |
+
+The review's remaining criticism is one this pass cannot close from inside the sandbox:
+the corrected test needs PostgreSQL to run, so the reviewed revision is still unobserved.
+That is the first item of the user-run block below, and the reason the status stays
+PARTIAL.
+
+Two things it confirmed are worth recording precisely because they were previously only
+the author's argument: re-acquiring a transaction-scoped advisory lock inside the same
+transaction really is free, and `lock_incident` really is the only other entry point to
+the per-incident row lock. It also named the residual limit: nothing prevents a future
+raw `session.get(..., with_for_update=True)` from bypassing the helper, and no test can
+stop that.
+
 ## Remaining work and discussion
 
 **Blockers (environment, not code):**
 
-- **Push and draft PR are blocked.** Re-attempted in the safety pass and still
-  blocked for two independent reasons: `git push -u origin phase1/baseline` fails
+- **Push and draft PR are blocked.** Re-attempted in the deadlock-correction pass
+  (`git push -u origin phase1/baseline`, exit `128`), and still blocked for two
+  independent reasons: the push fails
   with *"Bad owner or permissions on /etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf"*
   before it reaches the network, and even with working SSH this sandbox forbids
   every socket. The escalated retry is rejected by the harness: *"The supported API
@@ -449,8 +626,12 @@ neither these fixes nor the ones in `5102dbe`.
   `AF_UNIX` `bind()`/`connect()` raise the same, so no local cluster can be
   reached by any client.
 - **The optional Claude harness cannot be reached.** It is installed and
-  subscription-configured, but three bounded non-interactive attempts hung with no
-  output at all. Recorded rather than worked around; no review is claimed.
+  subscription-configured; in the earlier pass three bounded non-interactive attempts
+  hung with no output, and in this pass the invocation was denied before it ran by the
+  harness's own broken approval review (`codex-auto-review`). Recorded rather than
+  worked around, and not retried; no external review is claimed. A GPT-6 Luna reviewer
+  was also rejected by the provider for the same class of reason (see the review
+  section above).
 - `/snap/bin/codex` does not run here: `snap-confine is packaged without necessary
   permissions ... required permitted capability cap_dac_override not found`. The
   working path is the project's `uv` environment (`uv run ...`). Nothing was
@@ -483,6 +664,13 @@ neither these fixes nor the ones in `5102dbe`.
   authorization transaction. Not added now: the gate is held only for a short
   in-database transaction, and a timeout would introduce a new failure path this
   environment cannot exercise.
+- Whether the corrected control-ordering test should keep its `pg_locks` observation
+  now that it is the only thing that proves the writer contended for the gate. It reads
+  a system view (`pg_locks` is world-readable, so no grant is needed) and it is what
+  turns a possibly-vacuous wait into a check that fails loudly. It is also the only part
+  of this pass that has never executed, so if it misbehaves on your terminal the honest
+  fallback is to drop the observation and accept the weaker wait - which the independent
+  review already flagged as able to pass without contention.
 - Whether the live adapter should ever be able to report `CONFIRMED_NOT_APPLIED`
   again. It cannot today, because a flag-document API answers a state question
   rather than an authorship question; a surface that proves authorship would
