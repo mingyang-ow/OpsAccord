@@ -337,3 +337,39 @@ is the reason to keep running it even when it is not a completion gate.
 That is a second pair of eyes on this pass's work, and it is still **not** the
 independent external review this repository's earlier instructions wanted. The
 distinction is kept because it is the difference between evidence and reassurance.
+
+### Update, live-run-recovery pass
+
+No Claude attempt was made. The handoff for this pass says in as many words: *"Do not retry
+unavailable model reviewers in this pass. No GPT-6 reviewer setup is required."* The GPT-6 Luna
+reviewer is not merely unavailable - it is **retired** (`1296b23`, recorded in
+`.local/obsidian/OpsAccord/decisions/D14-development-workflow-and-retired-reviewer.md`, untracked), the repository contains no
+`.codex/agents/luna_reviewer.toml`, and this environment's only configured provider is
+`deepseek`. Preparing that reviewer therefore meant verifying that it does not exist and using the
+recorded fallback, not registering one. **The optional external review still does not exist**, for
+any revision on this branch.
+
+What did run is a **fresh-context reviewer sub-agent on the harness default model**, read-only,
+briefed to falsify the live-run-recovery pass rather than to read it. It changed no files. It
+reported **9 findings with reproductions**, reported in full in
+`docs/reports/phase1-implementation.md`, "Independent agent review of the live-run-recovery pass",
+and all 9 are fixed and pinned. The two high-severity ones were failures a live operator would have
+felt:
+
+- an evidence-write failure raised out of the suite lifecycle, **skipping the fault restore** and
+  escaping with a fault still armed;
+- an arm write that was applied but never **acknowledged** left the flag armed while the record
+  claimed nothing needed restoring.
+
+The seven remaining findings were a mislabelled failure stage with a dropped observation/cleanup, an
+absent flag document read as a verified clean baseline, a corroboration signal that was not
+differential, an in-progress record saying `INTERRUPTED`, a missing competing-driver guard in
+`scripts/run_live_scenarios.sh`, lost interrupt status when Ctrl+C met a failed cleanup, and six
+labelling/provenance defects. Each was confirmed in the code before being fixed, and
+`reports/local/live-recovery-falsification.log` shows the new tests failing when the fixes are
+removed and passing when they are restored.
+
+This is a third independent-brief agent review on this branch, and it is still **not** the optional
+external review. It is the third time an independent review found defects in the pass that wrote
+them - this time in production code rather than only in tests - which is the argument for keeping
+the fallback even though it is not a completion gate.

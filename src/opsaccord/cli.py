@@ -19,6 +19,7 @@ from opsaccord.scenarios.live import (
     LIVE_SETTLE_ATTEMPTS,
     LIVE_SETTLE_SECONDS,
     LIVE_VERIFICATION_WINDOW_SECONDS,
+    LiveProgress,
     live_settings,
     preflight,
     run_live_suite,
@@ -179,65 +180,65 @@ def cmd_run_live_scenarios(args: argparse.Namespace) -> int:
         )
 
     db = _db(settings)
-    results = run_live_suite(db=db, settings=settings, scenario_ids=args.scenario)
-    records = []
-    failures = 0
+    try:
+        run = run_live_suite(
+            db=db,
+            settings=settings,
+            scenario_ids=args.scenario,
+            # Progress goes to stdout and is flushed per line: the live stage is
+            # normally piped through `tee`, and a buffered run looks hung.
+            progress=LiveProgress(stream=sys.stdout),
+            evidence_path=args.json,
+        )
+    except KeyboardInterrupt:
+        print(
+            "\nlive run interrupted: completed scenarios are recorded in the evidence and the "
+            "active scenario is recorded as interrupted, not as a result"
+        )
+        if args.json:
+            print(f"  evidence: {args.json}")
+        print(
+            "  check the demo's fault flags before the next run: an interrupted scenario "
+            "still restores what it armed, and the evidence notes say whether it could"
+        )
+        db.dispose()
+        return 130
+
     print(f"{'id':<7} {'outcome':<19} {'status':<20} actions setup")
-    for result in results:
-        if result.outcome is not ScenarioOutcome.PASS:
-            failures += 1
+    for result in run.results:
         trace = result.trace
         if trace is None:
-            records.append(
-                {
-                    "scenario_id": result.scenario_id,
-                    "title": result.title,
-                    "setup": result.setup,
-                    "outcome": "NOT_MEASURED",
-                    "reasons": result.reasons,
-                    "simulated": False,
-                }
-            )
             print(f"{result.scenario_id:<7} {'NOT MEASURED':<19} {'-':<20} {'-':<7} {result.setup}")
-            for reason in result.reasons:
-                print(f"        cause: {reason}")
-            continue
-        records.append(
-            {
-                "scenario_id": result.scenario_id,
-                "title": result.title,
-                "setup": result.setup,
-                "outcome": str(result.outcome),
-                "incident_id": trace.incident.id,
-                "final_status": str(trace.incident.status),
-                "executed_actions": len(trace.executed_actions),
-                "duplicate_side_effects": trace.duplicate_side_effects,
-                "forbidden_actions": len(trace.forbidden_actions),
-                "resolved_without_verification": trace.resolved_without_verification,
-                "evidence": len(trace.evidence),
-                "simulated_evidence": sum(1 for e in trace.evidence if e.is_simulated),
-                "approvals": len(trace.approvals),
-                "verifications": [str(v.outcome) for v in trace.verifications],
-                "reasons": result.reasons,
-                "simulated": False,
-                "run_notes": trace.run_notes,
-            }
-        )
-        print(
-            f"{result.scenario_id:<7} {result.outcome!s:<19} {trace.incident.status!s:<20} "
-            f"{len(trace.executed_actions):<7} {result.setup}"
-        )
+        else:
+            print(
+                f"{result.scenario_id:<7} {result.outcome!s:<19} {trace.incident.status!s:<20} "
+                f"{len(trace.executed_actions):<7} {result.setup}"
+            )
         for reason in result.reasons:
             print(f"        cause: {reason}")
-    if args.json:
-        path = Path(args.json)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(records, indent=2), encoding="utf-8")
-        print(f"wrote {path}")
-    passed = len(records) - failures
-    print(f"\n{passed}/{len(records)} live scenarios passed")
+    if run.evidence_path is not None:
+        print(
+            f"wrote {run.evidence_path} "
+            f"({len(run.measured)}/{len(run.selected)} scenarios measured, run {run.status})"
+        )
+    for message in run.evidence_errors:
+        print(f"  evidence error: {message}")
+    simulated = [result for result in run.results if result.simulated]
+    if simulated:
+        # A live path that collected simulator evidence is a defect, not a live
+        # result, and the command must not exit 0 on it.
+        print(
+            f"\n{len(simulated)} live result(s) carry simulator evidence: "
+            f"{[result.scenario_id for result in simulated]}"
+        )
+    passed = len(run.results) - len(run.failures)
+    print(f"\n{passed}/{len(run.results)} live scenarios passed")
+    if not run.finished:
+        print(f"run status: {run.status}")
+        for note in run.notes:
+            print(f"  note: {note}")
     db.dispose()
-    return 1 if failures else 0
+    return 1 if run.failures or not run.finished or run.evidence_errors or simulated else 0
 
 
 def build_parser() -> argparse.ArgumentParser:

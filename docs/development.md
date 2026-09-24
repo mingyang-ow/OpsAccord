@@ -86,6 +86,20 @@ the PostgreSQL integration suite, the pre-fix sensitivity harness and the nine s
 `.local/demo-endpoints.env`, inside a nested subshell so no earlier stage can inherit live mode. It
 also refuses to start the live stage while another live scenario driver is running.
 
+`--live --scenario P1-01` narrows the live stage to the named paths (repeat `--scenario` for
+several), which is the intended way to check one path — Payment first — before spending an hour on
+all seven. It refuses to run without `--live`, and the log directory is printed before the first
+stage so an aborted run still says where its logs are. `scripts/run_live_scenarios.sh` carries the
+same competing-driver refusal; a bare `uv run python -m opsaccord.cli run-live-scenarios` does not,
+so do not start one while a validation run is in its live stage.
+
+The driver writes one flushed, timestamped progress line per event (scenario, position, stage,
+elapsed, remaining stage budget, latest observation) and rewrites its evidence document — an object,
+not the bare array of earlier revisions — after every event, so an interrupted run keeps what
+completed and records the active scenario as interrupted. Cleanup is outside the stage budgets: a
+scenario that ran out of time still restores the flag it armed. A budget bounds a *wait*; it does
+not cancel an operation that is already in flight.
+
 ### Configuration isolation in tests
 
 `Settings` reads `OPSACCORD_*` variables and the `.env` file beside the working directory, which is

@@ -3,6 +3,8 @@
 #
 #   scripts/validate.sh                 offline, lint, types, integration, sensitivity, simulated
 #   scripts/validate.sh --live          the above, then the seven live paths
+#   scripts/validate.sh --live --scenario P1-01
+#                                       the above, but only the named live path(s); repeatable
 #   scripts/validate.sh --offline-only  offline, lint, types only (no PostgreSQL needed)
 #
 # Properties this script is responsible for:
@@ -15,6 +17,9 @@
 #   always runs from the repository root.
 # * Evidence. Every stage writes `reports/local/validation-<timestamp>/<stage>.log`
 #   and appends to `summary.log`.
+# * Visible live progress. The live driver writes one flushed, timestamped line per
+#   event and runs under `python -u`, so a run piped through `tee` reports what it
+#   is doing while it does it instead of appearing to hang.
 # * Scoped configuration. See `LIVE_SESSION_VARS` below: the offline, integration
 #   and simulated stages run without the demo-mode and endpoint settings a live
 #   session exports, and the live stage is the only one that loads
@@ -28,17 +33,37 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 MODE="full"
-case "${1:-}" in
-  "" ) MODE="full" ;;
-  --live ) MODE="live" ;;
-  --offline-only ) MODE="offline" ;;
-  -h | --help ) sed -n '2,18p' "$0"; exit 0 ;;
-  * ) printf 'usage: scripts/validate.sh [--live|--offline-only]\n' >&2; exit 2 ;;
-esac
+SCENARIO_IDS=()
+usage() { printf 'usage: scripts/validate.sh [--live|--offline-only] [--scenario ID]...\n' >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --live ) MODE="live" ;;
+    --offline-only ) MODE="offline" ;;
+    --scenario )
+      shift
+      [ $# -gt 0 ] || usage
+      SCENARIO_IDS+=("$1")
+      ;;
+    -h | --help ) sed -n '2,22p' "$0"; exit 0 ;;
+    * ) usage ;;
+  esac
+  shift
+done
+
+# A scenario selection only means something for the live stage; refusing here is
+# better than silently running all seven paths.
+if [ "${#SCENARIO_IDS[@]}" -gt 0 ] && [ "$MODE" != "live" ]; then
+  printf 'refusing to run: --scenario needs --live\n' >&2
+  usage
+fi
 
 TS="$(date -u +%Y%m%dT%H%M%S)"
 LOGS="reports/local/validation-$TS"
 mkdir -p "$LOGS"
+# Printed before the first stage, not only at the end: a stage that aborts the run
+# must still leave the operator knowing which directory holds the logs.
+printf 'logs: %s\n' "$LOGS" | tee -a "$LOGS/summary.log"
 
 say() { printf '\n=== %s ===\n' "$1" | tee -a "$LOGS/summary.log"; }
 run() {
@@ -138,13 +163,25 @@ if [ "$MODE" = "live" ]; then
 
   # The endpoint file is loaded here and nowhere else, so no earlier stage can
   # inherit live mode from it.
-  say "13-live-paths (seven paths against the pinned stack)"
+  if [ "${#SCENARIO_IDS[@]}" -gt 0 ]; then
+    LIVE_SELECTION="focused run: ${SCENARIO_IDS[*]}"
+  else
+    LIVE_SELECTION="seven paths against the pinned stack"
+  fi
+  say "13-live-paths ($LIVE_SELECTION)"
+  SCENARIO_ARGS=()
+  for scenario_id in ${SCENARIO_IDS[@]+"${SCENARIO_IDS[@]}"}; do
+    SCENARIO_ARGS+=(--scenario "$scenario_id")
+  done
+  # `-u` and PYTHONUNBUFFERED keep the driver's progress unbuffered through `tee`:
+  # buffered output makes a seven-minute live run look like a hung command.
   (
     set -a
     # shellcheck disable=SC1091
     . .local/demo-endpoints.env
     set +a
-    uv run python -m opsaccord.cli run-live-scenarios --json "reports/local/live-scenarios-$TS.json"
+    PYTHONUNBUFFERED=1 uv run python -u -m opsaccord.cli run-live-scenarios \
+      ${SCENARIO_ARGS[@]+"${SCENARIO_ARGS[@]}"} --json "reports/local/live-scenarios-$TS.json"
   ) 2>&1 | tee "$LOGS/13-live-paths.log"
 fi
 

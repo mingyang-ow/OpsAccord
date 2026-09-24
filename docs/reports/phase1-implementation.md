@@ -14,12 +14,13 @@
 | Toolchain | `uv` 0.12.5, Python 3.12.14 (`.python-version`), project-local PostgreSQL 18.6 on `127.0.0.1:55432`, Docker 29.7.2 (client and server), Docker Compose v5.4.0 |
 | Coding agent | Codex CLI agent on the user's configured DeepSeek provider; the environment reports `deepseek-flash` / `deepseek-v4-pro` as its supported models |
 | Application runtime model | `deterministic` / `deterministic-v1` - no paid application-model calls were made |
-| Optional second review | **Not run, and not available on any revision.** Claude Code 2.1.267 is installed and subscription-backed, but the invocation was denied before it ran by the harness's broken automatic approval review, and a GPT-6 Luna reviewer was rejected by the provider (only `deepseek-flash` and `deepseek-v4-pro` are accepted; `gpt-6-sol` was rejected identically when re-tested in the configuration-isolation pass). Fresh-context agent reviews did run in two passes - see `docs/reports/phase1-review.md` and the two "Independent agent review" sections |
+| Optional second review | **Not run, and not available on any revision.** Claude Code 2.1.267 is installed and subscription-backed, but it is blocked before it runs: one bounded probe returned no output with exit 124 because the sandbox denies its socket, and an earlier invocation was denied by the harness's broken automatic approval review. A GPT-6 Luna reviewer does not exist to run - it was retired in `1296b23` (recorded in `.local/obsidian/OpsAccord/decisions/D14-development-workflow-and-retired-reviewer.md`, untracked) and the provider accepts only `deepseek-flash` and `deepseek-v4-pro` (`gpt-6-sol` was rejected identically when re-tested in the configuration-isolation pass). Fresh-context agent reviews did run in three passes - see `docs/reports/phase1-review.md` and the three "Independent agent review" sections |
 | **Overall status at `5102dbe`** | **READY_FOR_DISCUSSION** |
 | Safety-pass status (branch tip) | **PARTIAL** - both follow-up defects are implemented with regression tests and every offline check passes, but the PostgreSQL concurrency, recovery, scenario and live checks could not run and no optional review ran. See "Safety pass after `5cbcce2`". |
 | Validation-pass status | **PARTIAL** - the environment was diagnosed precisely (host services up, sandbox networking denied) and a runnable pre-fix sensitivity harness was added, but no database-backed check has still executed. See "Validation attempt after `b508a0f`". |
 | **Deadlock-correction status (branch tip with this report)** | **PARTIAL** - the deadlock the user's integration run found is fixed, an independent review found and this pass fixed two further defects in the new tests, and every offline check passes; the corrected test, the pre-fix harness, the nine scenarios and the seven live paths remain unrun because this sandbox denies socket creation. See "Deadlock correction after the integration suite". |
 | **Configuration-isolation status** | **PARTIAL** - the offline failure is fixed and the offline suite is independent of the operator's shell in either spelling of an override (99 passed, 7 skipped, 78 deselected); a fresh-context review falsified two guarantees in the first version of the fix and both are closed at `7f8c71e`. The user's integration results were measured on `e8a8e76`, and the pre-fix harness, the nine scenarios and the seven live paths have not run on these test-only changes. See "Configuration-test isolation". |
+| **Live-run-recovery status (branch tip with this report)** | **PARTIAL** - a live run is now observable while it happens and safe to interrupt, cleanup runs on every exit path, and the Payment fault premise is differential instead of a wait for an observation the fault prevents; the new behaviour is pinned by 26 new tests and every offline check passes, but no live path, simulated scenario or database-backed check has run against this revision, and the only live evidence is the user's interrupted run. See "Live-run recovery". |
 
 `READY_FOR_DISCUSSION` means every executable technical gate in `docs/phase1.md`
 passed on this commit, including the four primary paths against the real isolated
@@ -791,6 +792,171 @@ One observation was deliberately **not** "fixed". An *inconsistent* pair of inhe
 deliberately keeps budget settings. That is the application failing closed on an invalid
 configuration, not a test observing the shell; isolating it away would hide a real configuration
 error. A consistent pair leaves the suite at 99 passed.
+
+## Live-run recovery (`db0bb31` base) - progress, cleanup on every exit path, and the Payment premise
+
+**Status: PARTIAL.** This pass makes a live run observable while it happens and safe to interrupt,
+and it removes a setup defect that could wait for an observation the Payment fault prevents from ever
+existing. Every offline check passes and the new behaviour is pinned by **26 new tests** (22 in
+`tests/unit/test_live_lifecycle.py`, 4 in `tests/unit/test_live_cli.py`). No live path, no scenario and
+no database-backed check has executed against this revision: the agent sandbox denies socket creation,
+the same environmental blocker that has applied to every pass on this branch. The seven live paths stay
+the last unexecuted technical gate.
+
+### The interrupted run, and what it left
+
+The user stopped a `scripts/validate.sh --live` run with Ctrl+C because it produced no progress and
+appeared to be waiting through unhealthy setup conditions. Its directory is
+`reports/local/validation-20260924T071253/` (untracked). `summary.log` shows stage 00 recording the
+revision under test (`db0bb31`), stages 01-09 completing, the live preflight and the pre-driver guard
+both reporting "no competing live scenario driver", and stage 12 writing `.local/demo-endpoints.env` at
+`2026-09-24T07:13:52Z`. `11-demo-stack.log` and `13-live-paths.log` are **0 bytes** and the summary has
+no terminal line, so the run produced no live result. **Recorded as interrupted / incomplete. It is
+never cited as a pass, and no earlier passing evidence is presented as validation of this revision.**
+
+Checked before any change was made: `pgrep` finds no `opsaccord.cli run-live-scenarios` driver and no
+`validate.sh` wrapper, so the interrupted run has exited. The project's PostgreSQL cluster is still up
+(`.local/pg/data/postmaster.pid`, PID 22876, started 13:11) and was deliberately not restarted; the demo
+stack was left running. No competing driver was started at any point in this pass.
+
+### Observed baseline contamination - and what could not be established
+
+Read-only probes taken **by the user, before this pass**, observed `paymentUnreachable=on`,
+`adHighCpu=on` and `cartFailure=off`, with Payment unreachable and the ad service burning CPU. Those
+observations do not establish **who** set each flag, **when**, or which scenario (if any) was active.
+They cannot be re-measured from here: reading the flag document needs a socket, and socket creation is
+denied in this sandbox, so nothing below upgrades the user's observation into an agent measurement.
+
+What this pass changes is the consequence of that state: the suite now **refuses to proceed on a
+baseline it has not read**. `detect_residual_faults` raises `LiveBaselineUnavailable` when the flag
+document is absent or does not contain all six verified scenario flags - absence is not safety, and "no
+residual faults" is a claim about state the harness actually observed. When a residual fault is present
+the suite resets the scenario-owned flags, re-reads the document, and stops the suite if the repair does
+not verify. The reset is a read-modify-write of the whole document, so unrelated flags are carried
+through unchanged; no container, database, volume or user setting is touched.
+
+### Setup and cleanup defects, and their fixes
+
+The "no progress, appears hung" report had a structural cause and several distinct failure paths behind
+it. All of the following are fixed in the working tree described by this section:
+
+| # | Finding (with the failure it produces) | Kind | Fix |
+| --- | --- | --- | --- |
+| 1 | An evidence-write failure inside the suite raised out of the lifecycle, **skipping the fault restore** and escaping the suite with a fault still armed. | high | `persist()` is wrapped, the failure is recorded on `LiveRun.evidence_errors` and echoed to stderr, and cleanup still runs. |
+| 2 | An arm write that was applied but never **acknowledged** left the flag armed while the record claimed nothing needed restoring. | high | `_ScenarioFault.attempted` gates cleanup instead of `armed`, and the record carries a "never acknowledged, position not established" caveat. |
+| 3 | A real failure was recorded in the stage `workflow`, and the stage/observation/cleanup captured so far were dropped from the record. | medium | `_attach_lifecycle` attaches the true stage, observation and cleanup to any propagating exception; the suite's generic handler records them. |
+| 4 | An absent or empty flag document was reported as a verified clean baseline. | medium | raised as `LiveBaselineUnavailable` (see above). |
+| 5 | The Payment corroboration signal was not differential, so a checkout container broken for an unrelated reason could satisfy the premise. | medium-low | `wait_for_fault(..., corroborating_before=)` requires the caller's share to be **above the bound and higher than its own pre-arm baseline**, sampled by `_corroborating_baseline` before arming. |
+| 6 | An in-progress scenario's evidence said `INTERRUPTED` while it was still running. | low | `active_snapshot(status=RUNNING)` is the default; only a real interrupt writes `INTERRUPTED`. |
+| 7 | `scripts/run_live_scenarios.sh` had no competing-driver guard of its own. | low | the same `assert_no_competing_driver` as `validate.sh`, run at preflight **and** immediately before the driver. |
+| 8 | Ctrl+C combined with a cleanup failure lost the interrupt: the suite exited 1 instead of 130. | low | the `KeyboardInterrupt` is re-raised (`raise ... from exc`), the run is recorded `INTERRUPTED`, and the CLI exits 130. |
+| 9 | Labelling gaps: `run.completed` counted records rather than measurements, no `measured` field, a silent no-fault plan, a hardcoded `pinned_revision`, an over-stated budget comment, and a provenance defect that never reached the exit code. | low | `run.measured` added; the suite fails closed on an unknown `fault_flag`; `pinned_revision` comes from `LiveEnvironment.revision`; the budget comment says a timeout does not cancel an in-flight operation; the CLI exits non-zero on a provenance defect or simulator evidence. |
+
+Two further gaps were found and fixed by the implementation agent itself, before the review: Ctrl+C
+during the suite's startup baseline left the evidence file saying `RUNNING`, and `scripts/validate.sh`
+printed its `logs:` line only at the end. The first now writes `INTERRUPTED`/`STOPPED` before
+re-raising; the second prints the log directory before the first stage.
+
+The lifecycle is now explicit and ordered: **baseline -> arm -> visibility -> workflow -> verification
+-> cleanup -> outcome**, with cleanup keyed to what this scenario actually attempted, and the suite's
+failure policy documented in `run_live_suite`'s docstring:
+
+- a fault premise that never appears is recorded as **not measured** and the suite continues - an absent
+  premise is scenario-specific;
+- a scenario that could not restore the baseline, or whose baseline was already contaminated, **stops
+  the suite**, because every later scenario would be measured against a demo that is not in its starting
+  state;
+- an unexpected exception is recorded and stops the suite rather than repeating a broken run once per
+  scenario;
+- Ctrl+C records the completed results plus an explicit interrupted record for the active scenario and is
+  **re-raised, never converted into a result**.
+
+Forced termination or host failure still cannot guarantee cleanup; that limitation is now documented in
+the code and in `docs/development.md`, and the next startup detects residual scenario faults before
+proceeding.
+
+### The Payment evidence contract
+
+`docs/astronomy-shop.md` measures `paymentUnreachable=on` as a fault that *checkout* observes: Charge
+error share ~0.33, PlaceOrder error share ~0.75, and a Charge call rate of ~0.042/s - roughly four calls
+a minute, bursty, with windows that legitimately contain none. Waiting only for the Payment target's own
+error share can therefore wait for an observation the fault makes intermittent.
+
+`wait_for_fault` now accepts `corroborating_target` and `corroborating_before`. The premise is satisfied
+by either series, the returned probe always says which one carried it (`attribution`), and the caller's
+series must be differential - above the telemetry bound **and** higher than the baseline sampled before
+this scenario armed anything. The measurement contract is unchanged in the two places that matter: an
+absent series is never read as a zero, and zero traffic is never read as a fault **or** as a recovery,
+on either target. A quiet demo keeps waiting, and the failure mode is an honest setup failure rather
+than a fabricated one. The one contract change - accepting a caller-side failure signal as
+corroboration - is recorded here with its rationale, and it preserves service attribution.
+
+### Progress and partial evidence
+
+`src/opsaccord/scenarios/live_evidence.py` is new and owns both. Each `LiveProgress` line is flushed,
+timestamped, and names the scenario and its position in the suite, the current stage, elapsed scenario
+time, remaining stage budget, and the latest observation while polling; the stream and clocks are
+injected so tests pin them. Reporting can no longer break a run that has a fault armed: a closed pipe or
+a failed evidence rewrite is recorded once and echoed to stderr, and the command turns it into a
+non-zero exit at the end instead of a silent gap.
+
+Evidence is now an **object** (`{"format": "opsaccord.live-evidence", "format_version": 2, "run": {...},
+"active": {...}, "records": [...], "notes": [...]}`) rewritten atomically after every event, so whatever
+is on disk is a complete, well-formed document. An interrupted run leaves the completed records plus an
+explicit record for the active scenario - never a half-written array a reader could mistake for a
+finished run. Note the divergence: the committed `docs/reports/phase1-live-scenarios.json` is a legacy
+**bare array** (`format_version` 1, no run status). It is preserved as a record, not rewritten.
+
+### Tests, falsification, and what was verified in this session
+
+New focused tests cover the cases the handoff named: failure before injection, failure after injection
+but before workflow creation, a workflow exception, Ctrl+C during polling, a cleanup failure stopping
+subsequent scenarios, preservation of unrelated flags, progress appearing before suite completion,
+partial evidence surviving interruption, and unreachable Payment without Payment-server traffic. They use
+injected clocks and fakes, so the unit suite stays at ~5 s and never waits through a real stage budget.
+
+| Check | Exact command | Result | Evidence path | Simulated or live |
+| --- | --- | --- | --- | --- |
+| Lint | `uv run ruff check .` | clean | - | offline |
+| Format | `uv run ruff format --check .` | 80 files already formatted | - | offline |
+| Types | `uv run mypy src/opsaccord` | success, 41 source files | - | offline |
+| Offline suite | `uv run pytest -q -m "not integration"` | **125 passed, 7 skipped, 78 deselected** (99 passed before this pass; +26 new) | - | offline |
+| Validation runner | `scripts/validate.sh --offline-only` | exit 0, both offline stages identical at 125 passed | `reports/local/validation-20260924T080233/` | offline |
+| Guard | `scripts/validate.sh --scenario P1-01 --offline-only` | exit 2, "refusing to run: --scenario needs --live" | - | offline |
+| Shell syntax | `bash -n scripts/validate.sh scripts/run_live_scenarios.sh` | clean | - | offline |
+| Falsification | flip one fix, run the named tests, restore | 5 failed / 17 passed in round 1; 2 failed / 24 passed in round 2; no other test moved | `reports/local/live-recovery-falsification.log` (untracked) | offline |
+| Integration suite, pre-fix sensitivity harness, nine simulated scenarios, seven live paths | `scripts/validate.sh --live` | **not run** - socket creation denied in the sandbox; the interrupted user run above is the only live evidence on this revision | `reports/local/validation-20260924T071253/` (interrupted) | live/blocked |
+
+The falsification log records the exact one-line flips and the pre- and post-experiment hashes verified
+with `md5sum -c`. It shows each new check pins the fix named for it and nothing else, which is the
+property that distinguishes a regression test from a test that happens to pass.
+
+### Independent agent review of the live-run-recovery pass
+
+A fresh-context reviewer sub-agent ran read-only, on the harness default model, briefed to falsify the
+pass rather than to read it, and it changed no files. It reported **9 findings with reproductions** -
+the two high-severity ones being the skipped fault restore on an evidence-write failure and the
+unacknowledged arm write - and the implementation agent confirmed each in the code before fixing it. All
+nine are fixed and pinned, as the table above records, and the falsification log shows the pins failing
+when the fixes are removed and passing when they are restored.
+
+This is a second agent instance with an independent brief, **not** the optional external review, and it
+is not presented as one. The external review still does not exist for any revision on this branch: the
+GPT-6 Luna reviewer was retired in `1296b23` (recorded in the untracked vault, D14), the provider advertises only
+`deepseek-flash` and `deepseek-v4-pro`, and a bounded Claude Code probe returns no output because the
+sandbox denies its socket. See `docs/reports/phase1-review.md` for the honest record.
+
+### Open questions from this pass
+
+- **The live behaviour of the Payment corroboration is argued, not observed.** The calibration table is
+  the reason to expect a caller-side signal to appear; no run has yet measured it. If `P1-01` fails to
+  see the premise live, the honest outcome is a not-measured record, not a weakened assertion.
+- **Whether the six verified scenario flags are the right ownership set.** The reset only ever writes
+  those, which preserves the user's own experiments but means a fault armed on a seventh flag would not
+  be reset. It would, however, still be visible in `detect_residual_faults` only if it is one of the six.
+- **Whether the evidence format change should be versioned into the committed evidence file.** The
+  legacy array is preserved deliberately; migrating it would make the reader's job easier and would also
+  assert that the old run's status can be reconstructed, which it cannot.
 
 ## Remaining work and discussion
 
