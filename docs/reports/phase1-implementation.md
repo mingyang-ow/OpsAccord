@@ -8,7 +8,7 @@
 | Branch | `phase1/baseline` |
 | Base commit | `3168bcf` (branch point: design baseline and Phase 1 foundation) |
 | Implementation commit | `5102dbe` (the commit immediately preceding this report) |
-| Branch commits | `1296b23`, `821414a`, `b4b75aa`, `5102dbe`, `5cbcce2`, `b508a0f`, `cb60242`, then the deadlock-correction commits `ed0d132` (committed user guidance), `7b66f11` (the fix), `7becf98` (review fixes) and this report's own commit as the tip - per-revision totals are reproducible with `git diff --shortstat 3168bcf <rev>`; for the branch tip as it stood at `b508a0f` that reports 87 files changed, 18404 insertions(+), 42 deletions(-) |
+| Branch commits | `1296b23`, `821414a`, `b4b75aa`, `5102dbe`, `5cbcce2`, `b508a0f`, `cb60242`, the deadlock-correction commits `ed0d132` (committed user guidance), `7b66f11` (the fix), `7becf98` (review fixes), `e8a8e76` (records, which is what the user ran), and the configuration-isolation commits `fe16796` (tests) and `843b34d` (validation runner), then this report's own commit as the tip - per-revision totals are reproducible with `git diff --shortstat 3168bcf <rev>`; for the branch tip as it stood at `b508a0f` that reports 87 files changed, 18404 insertions(+), 42 deletions(-) |
 | Dirty state | Clean apart from this report and the two evidence files it commits; only gitignored local state (`.local/`, `reports/local/`, `.venv/`) otherwise remains |
 | Host | WSL 2, kernel `6.18.33.2-microsoft-standard-WSL2`, Ubuntu 26.04 LTS, 16 CPU, 15.5 GB RAM |
 | Toolchain | `uv` 0.12.5, Python 3.12.14 (`.python-version`), project-local PostgreSQL 18.6 on `127.0.0.1:55432`, Docker 29.7.2 (client and server), Docker Compose v5.4.0 |
@@ -19,6 +19,7 @@
 | Safety-pass status (branch tip) | **PARTIAL** - both follow-up defects are implemented with regression tests and every offline check passes, but the PostgreSQL concurrency, recovery, scenario and live checks could not run and no optional review ran. See "Safety pass after `5cbcce2`". |
 | Validation-pass status | **PARTIAL** - the environment was diagnosed precisely (host services up, sandbox networking denied) and a runnable pre-fix sensitivity harness was added, but no database-backed check has still executed. See "Validation attempt after `b508a0f`". |
 | **Deadlock-correction status (branch tip with this report)** | **PARTIAL** - the deadlock the user's integration run found is fixed, an independent review found and this pass fixed two further defects in the new tests, and every offline check passes; the corrected test, the pre-fix harness, the nine scenarios and the seven live paths remain unrun because this sandbox denies socket creation. See "Deadlock correction after the integration suite". |
+| **Configuration-isolation status** | **PARTIAL** - the offline failure is fixed and the offline suite is now independent of the operator's shell; the user's integration results were measured on `e8a8e76`, and the pre-fix harness, the nine scenarios and the seven live paths have not run on these test-only changes. See "Configuration-test isolation". |
 
 `READY_FOR_DISCUSSION` means every executable technical gate in `docs/phase1.md`
 passed on this commit, including the four primary paths against the real isolated
@@ -603,6 +604,150 @@ the per-incident row lock. It also named the residual limit: nothing prevents a 
 raw `session.get(..., with_for_update=True)` from bypassing the helper, and no test can
 stop that.
 
+## Configuration-test isolation (`fe16796`, `843b34d`)
+
+### What the user's run found
+
+Run from the user's own terminal, on `e8a8e76` — **the user's measurements, not this session's**:
+
+| Check | Result |
+| --- | --- |
+| The corrected deadlock test | passed |
+| Ten additional repetitions of it | all passed |
+| `test_dispatch_safety.py` | 14 passed |
+| Control/recovery tests | 24 passed |
+| Full integration suite | 78 passed |
+| Offline suite | **1 failed**, then passed once `OPSACCORD_DEMO_MODE` was removed from the subprocess environment: **91 passed, 7 skipped, 78 deselected** (`reports/local/offline-clean-env-20260924T062719.log`) |
+
+The block was fail-fast, so it stopped at the offline failure and its later stages did not run. This
+is also the point at which the concurrency guarantee moved from *argued* to *observed*: the corrected
+control-ordering test and its ten repetitions are the first executions of that test anywhere.
+
+### Root cause: configuration leaked from the shell into a defaults test
+
+The failing test was
+`tests/unit/test_domain_contracts.py::test_demo_mode_selects_the_adapter_and_never_falls_back`, which
+asserted `Settings().demo_mode == "simulated"`. `Settings` reads `OPSACCORD_*` variables and the
+`.env` file beside the working directory — that is the runtime override mechanism, and it is working
+as designed. `scripts/demo.sh endpoints` writes `OPSACCORD_DEMO_MODE=live` into
+`.local/demo-endpoints.env`, and the documented live command exports it with
+`set -a; . .local/demo-endpoints.env; set +a`. The export outlives the run that created it, so the
+test observed the developer's shell instead of the defaults.
+
+The defect was in the test, not in the runtime: a test that asserts a *default* has to say which
+environment it is observing.
+
+### Scope: the leak was not specific to demo mode
+
+Reproduced in this session before any edit, by exporting one variable at a time and running the
+offline suite:
+
+| Inherited variable | Test that failed |
+| --- | --- |
+| `OPSACCORD_DEMO_MODE=live` | `test_demo_mode_selects_the_adapter_and_never_falls_back` |
+| `OPSACCORD_MODEL_PROVIDER=openai_compatible` | `test_application_runtime_model_is_explicit_and_not_inherited` |
+| `OPSACCORD_ALLOW_PAID_MODEL_CALLS=true` | same test |
+| `OPSACCORD_GRAPH_CHECKPOINT_URL=...` | `test_test_environment_keeps_state_and_checkpoints_in_one_database` |
+
+All four produce `1 failed, 90 passed, 7 skipped, 78 deselected` — one failure each, no other
+symptom. Budget overrides (`OPSACCORD_SOFT_STEP_BUDGET`, `OPSACCORD_HARD_STEP_CAP`) broke nothing
+because no test asserts those defaults; that was checked rather than assumed.
+
+### The correction
+
+`tests/conftest.py` gained an **opt-in** `isolated_config` fixture. It removes the inherited
+`OPSACCORD_*` variables and moves the working directory to an empty temporary one, for the duration
+of the test that requests it. The three default-value tests now request it.
+
+The design choices that matter:
+
+- **Opt-in and never autouse.** A global fixture that stripped the environment would make the
+  override tests meaningless and could break the integration fixtures, which take connectivity from
+  `OPSACCORD_TEST_DATABASE_URL`. Only the three defaults tests are isolated.
+- **No value is passed to the thing under test.** Each isolated test still constructs `Settings()`
+  with no arguments; what is controlled is the ambient environment, not the asserted value.
+- **Nothing global or user-owned changes.** The environment is restored by `monkeypatch`, the
+  directory is a temporary one, and no `.env`, shell profile, credential or runtime default was
+  touched.
+- **The mechanism is unchanged.** `Settings` still reads the environment and `.env`; only the tests
+  changed.
+
+`tests/unit/test_config_isolation.py` pins both halves, so neither is bought with the other:
+
+| Check | What it proves |
+| --- | --- |
+| `test_defaults_hold_in_an_isolated_configuration_context` | the defaults are observable as defaults |
+| `test_an_explicit_environment_override_selects_live_mode` | an exported setting still selects the live adapter |
+| `test_a_temporary_dotenv_is_read_and_the_process_environment_wins` | a `.env` file is read, and the environment outranks it |
+| `test_live_mode_never_resolves_to_the_simulator` | live builds `LiveEnvironment` with `is_simulated is False`, simulated builds `DemoEnvironment`; no fallback either way |
+| `test_the_default_tests_pass_while_the_shell_exports_live_mode` | a real pytest subprocess of the previously failing file passes while four overrides are exported |
+| `test_the_live_session_variable_list_covers_what_demo_sh_exports` | the documented leak list cannot drift from what `scripts/demo.sh` writes |
+
+The fifth check spawns a subprocess deliberately: the property is about a *process environment*, and
+no fixture can prove a module is independent of the shell it is launched from while running inside
+that same shell.
+
+### The validation runner
+
+`scripts/validate.sh` (new) runs the sequence in one pass, fail-fast, with per-stage logs under
+`reports/local/validation-<timestamp>/`:
+
+- `--offline-only` — offline suites, lint, formatting, types (no PostgreSQL);
+- default — the above plus the PostgreSQL integration suite, the pre-fix sensitivity harness and the
+  nine simulated scenarios;
+- `--live` — the above plus the seven live paths.
+
+Configuration is scoped per stage and documented in the script. The offline, integration and
+simulated stages run through `without_live_session`, which removes exactly five variables
+(`OPSACCORD_DEMO_MODE`, the three demo endpoint URLs, `OPSACCORD_LIVE_DEMO`). Connectivity settings
+such as `OPSACCORD_TEST_DATABASE_URL` are deliberately kept, as are model, budget and any other
+operator setting. `.local/demo-endpoints.env` is loaded **only** in the live stage, inside a nested
+subshell, so no earlier stage can inherit it.
+
+Two behaviours worth naming:
+
+- The offline suite runs **twice**: normally, and with `OPSACCORD_DEMO_MODE=live` force-exported. If
+  the suite ever regains a dependency on the operator's shell, the two stages diverge and the run
+  fails.
+- The live stage **refuses to start** while another live scenario driver is running (`pgrep`, exit
+  3). Merely listing processes was explicitly rejected by the handoff, and a competing driver shares
+  the demo stack's feature flags.
+
+`OPSACCORD_LIVE_DEMO` is the one variable that cannot simply be left to the tests: it is the opt-in
+switch for `tests/integration/test_live_demo.py`, which is deliberately *not* marked `integration`,
+so leaving it exported makes `pytest -m "not integration"` select four tests that need the live
+stack (they error without it, and would write real feature flags with it). The runner removes it for
+the offline stages. Whether that module should carry the `integration` mark is a discussion item
+below rather than a change made here, because it would redefine an already-validated suite.
+
+### Results from this session
+
+In-sandbox, on the working tree that became `fe16796` and `843b34d`:
+
+| Check | Result |
+| --- | --- |
+| Offline suite, clean environment | **97 passed, 7 skipped, 78 deselected** (was 91 passed; the six new isolation checks) |
+| Offline suite, `OPSACCORD_DEMO_MODE=live` exported | **97 passed, 7 skipped, 78 deselected** — identical, which is the correction |
+| Offline suite, live + model + paid-call + checkpoint overrides exported | same result for the offline tests |
+| Focused files with live exported | `test_config_isolation.py` + `test_domain_contracts.py` → 18 passed |
+| Lint / format / types | clean; 76 files formatted; 40 source files typed |
+| `scripts/validate.sh --offline-only` with live exported | exit 0, both offline stages identical |
+
+### What could not run here
+
+The same environmental blocker as the previous two passes, re-measured rather than inherited:
+`socket.socket(AF_INET)` raises `PermissionError [Errno 1] Operation not permitted` **at
+construction**, so no client can reach the host cluster (still up: `.local/pg/data/postmaster.pid`).
+
+The escalation route was attempted once for the integration suite, as the handoff directs, and was
+rejected by the harness before the command ran: *"The supported API model names are deepseek-flash,
+deepseek-v4-pro, but you passed codex-auto-review."* Per the handoff that route is not retried. So
+the PostgreSQL integration suite, the pre-fix sensitivity harness, the nine simulated scenarios and
+the seven live paths are all **unrun in this session**. The user's integration results above stand on
+`e8a8e76`; the changes in this pass touch tests, one documentation file and one new script, and no
+`src/` file, which is why the integration suite and the scenarios are not expected to move — but
+that is an expectation, not a measurement, and `scripts/validate.sh` is what settles it.
+
 ## Remaining work and discussion
 
 **Blockers (environment, not code):**
@@ -621,10 +766,13 @@ stop that.
   config permission, then
   `git -C /home/brentiburo/projects/OpsAccord push -u origin phase1/baseline`.
 - **No PostgreSQL and no network in this session**, which is what leaves the
-  concurrency, recovery, scenario and live checks outstanding (see the safety-pass
-  section above). `socket.socket(AF_INET)` raises `PermissionError [Errno 1]`, and
-  `AF_UNIX` `bind()`/`connect()` raise the same, so no local cluster can be
-  reached by any client.
+  concurrency, recovery, scenario and live checks outstanding. Re-measured in the
+  configuration-isolation pass: `socket.socket(AF_INET)` raises
+  `PermissionError [Errno 1]` at construction, and `AF_UNIX` `bind()`/`connect()`
+  raise the same, so no local cluster can be reached by any client. The escalation
+  route was attempted once for the integration suite in that pass, as the handoff
+  directs, and was rejected before the command ran by the same
+  `codex-auto-review` misconfiguration; it was not retried.
 - **The optional Claude harness cannot be reached.** It is installed and
   subscription-configured; in the earlier pass three bounded non-interactive attempts
   hung with no output, and in this pass the invocation was denied before it ran by the
@@ -664,6 +812,12 @@ stop that.
   authorization transaction. Not added now: the gate is held only for a short
   in-database transaction, and a timeout would introduce a new failure path this
   environment cannot exercise.
+- Whether `tests/integration/test_live_demo.py` should carry the `integration` mark. It is opt-in
+  through `OPSACCORD_LIVE_DEMO=1` and deliberately outside the integration mark, which is why the
+  runner has to remove that variable: with it exported, `pytest -m "not integration"` selects four
+  tests that need the live stack. Adding the mark would fix that at the source, but it would also
+  grow the integration suite from 78 tests to 85 with seven skips, and that suite has just been
+  validated at 78.
 - Whether the corrected control-ordering test should keep its `pg_locks` observation
   now that it is the only thing that proves the writer contended for the gate. It reads
   a system view (`pg_locks` is world-readable, so no grant is needed) and it is what
