@@ -9,7 +9,7 @@
 | Base commit | `3168bcf` (branch point: design baseline and Phase 1 foundation) |
 | Implementation commit | `5102dbe` (the commit immediately preceding this report) |
 | Branch commits | `1296b23`, `821414a`, `b4b75aa`, `5102dbe`, `5cbcce2`, `b508a0f`, `cb60242`, the deadlock-correction commits `ed0d132` (committed user guidance), `7b66f11` (the fix), `7becf98` (review fixes), `e8a8e76` (records, which is what the user ran), the configuration-isolation commits `fe16796` (tests), `843b34d` (validation runner), `a60cecb` (records), `5294575` (corrected a test-selection count) and `7f8c71e` (review fixes), the live-run-recovery commits `74ac1f2` and `2286565`, the dependency-attribution commits `8165c3b`, `fe1a0ea` and `d873dae` (the live edge read pinned offline), the verification-reason commit `4ccca4d`, then this report's own commit as the tip - per-revision totals are reproducible with `git diff --shortstat 3168bcf <rev>`; for the branch tip as it stood at `b508a0f` that reports 87 files changed, 18404 insertions(+), 42 deletions(-) |
-| Dirty state | Clean apart from this report and the two evidence files it commits; only gitignored local state (`.local/`, `reports/local/`, `.venv/`) otherwise remains |
+| Dirty state | Clean except the user's own uncommitted `AGENTS.md` reviewer-policy change (`M AGENTS.md`, preserved and never staged); only gitignored local state (`.local/`, `reports/local/`, `.venv/`) otherwise remains |
 | Host | WSL 2, kernel `6.18.33.2-microsoft-standard-WSL2`, Ubuntu 26.04 LTS, 16 CPU, 15.5 GB RAM |
 | Toolchain | `uv` 0.12.5, Python 3.12.14 (`.python-version`), project-local PostgreSQL 18.6 on `127.0.0.1:55432`, Docker 29.7.2 (client and server), Docker Compose v5.4.0 |
 | Coding agent | Codex CLI agent on the user's configured DeepSeek provider; the environment reports `deepseek-flash` / `deepseek-v4-pro` as its supported models |
@@ -1419,8 +1419,12 @@ including the four unattributable-path checks and the quiet-edge check - with th
 The acceptance check for the cap was strengthened as instructed: it now asserts that
 `read_service_health` and both `read_metrics` reads were recorded under the cap and that no
 `read_dependency` call was recorded, so the refused read is the dependency-path read specifically
-rather than whichever read happens to be named in the message. **It is unexecuted here** - it needs
-PostgreSQL, which this sandbox cannot reach.
+rather than whichever read happens to be named in the message. **The strengthened assertions are
+unexecuted here** - they need PostgreSQL, which this sandbox cannot reach. The arithmetic they assert
+on *is* measured: the pre-strengthening `+ 4` version of this check is one of the 85 integration tests
+the user's `104258` run passed (`pytest -m integration` selects exactly 85), so "the dependency-path
+read is the refused one" is an observation rather than a deduction. What this pass added on top of it
+has not run.
 
 ### What this pass did not establish
 
