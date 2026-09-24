@@ -8,20 +8,20 @@
 | Branch | `phase1/baseline` |
 | Base commit | `3168bcf` (branch point: design baseline and Phase 1 foundation) |
 | Implementation commit | `5102dbe` (the commit immediately preceding this report) |
-| Branch commits | `1296b23`, `821414a`, `b4b75aa`, `5102dbe`, `5cbcce2`, `b508a0f`, `cb60242`, the deadlock-correction commits `ed0d132` (committed user guidance), `7b66f11` (the fix), `7becf98` (review fixes), `e8a8e76` (records, which is what the user ran), the configuration-isolation commits `fe16796` (tests), `843b34d` (validation runner), `a60cecb` (records), `5294575` (corrected a test-selection count) and `7f8c71e` (review fixes), the live-run-recovery commits `74ac1f2` and `2286565`, the dependency-attribution commits `8165c3b`, `fe1a0ea` and `d873dae` (the live edge read pinned offline), the verification-reason commit `4ccca4d`, then this pass's own commits: `952b045` (the code tip - the braced series selector, the error body, the strict fake, the shape assertions) then this report's record commits, then this pass's test-scope correction and its record commit, which is the tip (`git log --oneline -1`) - per-revision totals are reproducible with `git diff --shortstat 3168bcf <rev>`; for the branch tip as it stood at `b508a0f` that reports 87 files changed, 18404 insertions(+), 42 deletions(-) Everything after `952b045` is documentation: `git diff --stat 952b045..HEAD` lists only `docs/reports/phase1-implementation.md` |
+| Branch commits | `1296b23`, `821414a`, `b4b75aa`, `5102dbe`, `5cbcce2`, `b508a0f`, `cb60242`, the deadlock-correction commits `ed0d132` (committed user guidance), `7b66f11` (the fix), `7becf98` (review fixes), `e8a8e76` (records, which is what the user ran), the configuration-isolation commits `fe16796` (tests), `843b34d` (validation runner), `a60cecb` (records), `5294575` (corrected a test-selection count) and `7f8c71e` (review fixes), the live-run-recovery commits `74ac1f2` and `2286565`, the dependency-attribution commits `8165c3b`, `fe1a0ea` and `d873dae` (the live edge read pinned offline), the verification-reason commit `4ccca4d`, then this pass's own commits: `952b045` (the braced series selector, the error body, the strict fake, the shape assertions) and `b4d80e7` (the test-scope correction), then the live-premise correction `79d733e` - the current code tip, which holds the differential fault premise, the armed-only fake and the read-only incident export - followed by this report's record commit, which is the tip (`git log --oneline -1`) - per-revision totals are reproducible with `git diff --shortstat 3168bcf <rev>`; for the branch tip as it stood at `b508a0f` that reports 87 files changed, 18404 insertions(+), 42 deletions(-). The commits after `4ccca4d` split cleanly: `952b045`, `b4d80e7` and `79d733e` are code and tests, and everything else is documentation. |
 | Dirty state | Clean except the user's own uncommitted `AGENTS.md` reviewer-policy change (`M AGENTS.md`, preserved and never staged); only gitignored local state (`.local/`, `reports/local/`, `.venv/`) otherwise remains |
 | Host | WSL 2, kernel `6.18.33.2-microsoft-standard-WSL2`, Ubuntu 26.04 LTS, 16 CPU, 15.5 GB RAM |
 | Toolchain | `uv` 0.12.5, Python 3.12.14 (`.python-version`), project-local PostgreSQL 18.6 on `127.0.0.1:55432`, Docker 29.7.2 (client and server), Docker Compose v5.4.0 |
 | Coding agent | Codex CLI agent on the user's configured DeepSeek provider; the environment reports `deepseek-flash` / `deepseek-v4-pro` as its supported models |
 | Application runtime model | `deterministic` / `deterministic-v1` - no paid application-model calls were made |
-| Optional second review | **Not run, and not available on any revision.** Claude Code 2.1.267 is installed and subscription-backed, but it is blocked before it runs: one bounded probe returned no output with exit 124 because the sandbox denies its socket, and an earlier invocation was denied by the harness's broken automatic approval review. A GPT-6 Luna reviewer does not exist to run - it was retired in `1296b23` (recorded in `.local/obsidian/OpsAccord/decisions/D14-development-workflow-and-retired-reviewer.md`, untracked) and the provider accepts only `deepseek-flash` and `deepseek-v4-pro` (`gpt-6-sol` was rejected identically when re-tested in the configuration-isolation pass). Fresh-context agent reviews did run in three passes - see `docs/reports/phase1-review.md` and the three "Independent agent review" sections |
 | **Overall status at `5102dbe`** | **READY_FOR_DISCUSSION** |
 | Safety-pass status (branch tip) | **PARTIAL** - both follow-up defects are implemented with regression tests and every offline check passes, but the PostgreSQL concurrency, recovery, scenario and live checks could not run and no optional review ran. See "Safety pass after `5cbcce2`". |
 | Validation-pass status | **PARTIAL** - the environment was diagnosed precisely (host services up, sandbox networking denied) and a runnable pre-fix sensitivity harness was added, but no database-backed check has still executed. See "Validation attempt after `b508a0f`". |
 | **Deadlock-correction status (branch tip with this report)** | **PARTIAL** - the deadlock the user's integration run found is fixed, an independent review found and this pass fixed two further defects in the new tests, and every offline check passes; the corrected test, the pre-fix harness, the nine scenarios and the seven live paths remain unrun because this sandbox denies socket creation. See "Deadlock correction after the integration suite". |
 | **Configuration-isolation status** | **PARTIAL** - the offline failure is fixed and the offline suite is independent of the operator's shell in either spelling of an override (99 passed, 7 skipped, 78 deselected); a fresh-context review falsified two guarantees in the first version of the fix and both are closed at `7f8c71e`. The user's integration results were measured on `e8a8e76`, and the pre-fix harness, the nine scenarios and the seven live paths have not run on these test-only changes. See "Configuration-test isolation". |
 | **Live-run-recovery status (branch tip with this report)** | **PARTIAL** - a live run is now observable while it happens and safe to interrupt, cleanup runs on every exit path, and the Payment fault premise is differential instead of a wait for an observation the fault prevents; the new behaviour is pinned by 26 new tests and every offline check passes, but no live path, simulated scenario or database-backed check has run against this revision, and the only live evidence is the user's interrupted run. See "Live-run recovery". |
-| **Test-scope / live-Payment status (branch tip with this report)** | **PARTIAL** - at `2812871` the user's run cleared every stage except one acceptance check, so the harness stopped at integration and the live Payment path did not run. The failure was the check's own observation scope: it asked the whole incident history for the absence of a dependency read, and the P1-01 *diagnosis* plan reads the edge on purpose. The check is now scoped by persisted tool-call id and additionally asserts the persisted verdict; the offline suite, static checks and collection are green here, but the corrected test needs PostgreSQL, which this sandbox denies. The live schema question is now measured: the braced selector answers `200` with 160 series exposing `service_name` and `span_kind`, so request syntax and label presence are settled while attributable caller evidence and recovery stay unmeasured. P1-01 has still never reached `RESOLVED`. See "The test-scope correction (`114517`)". |
+| **Test-scope / live-Payment status** | **PARTIAL** - at `2812871` the user's run cleared every stage except one acceptance check, so the harness stopped at integration and the live Payment path did not run. The failure was the check's own observation scope: it asked the whole incident history for the absence of a dependency read, and the P1-01 *diagnosis* plan reads the edge on purpose. The check is now scoped by persisted tool-call id and additionally asserts the persisted verdict; the user's `131320` run then verified it live. The live schema question is measured: the braced selector answers `200` with 160 series exposing `service_name` and `span_kind`. See "The test-scope correction (`114517`)". |
+| **Live-premise status (branch tip with this report)** | **PARTIAL** - the user's `131320` run is the first live run with attributable caller-side evidence (`checkout-service -> payment-service`, `Charge`, `span_kind=client`) and a verification that reports a *measured* continuing failure, but the premise of that run is not attributable: visibility was accepted 0.0s after the write from a 120s window that predates it, and both pre-injection readings already carried a 100% error share. The predicate is now a rise over pre-injection readings taken *before* the write, committed at `79d733e` and pinned by three new tests and a falsification log; the integration suite, the sensitivity harness, the simulated scenarios and the live path have not been re-run here. P1-01 has still never reached `RESOLVED`. See "The live Payment premise (`b4d80e7` measured, corrected at `79d733e`)". |
 
 `READY_FOR_DISCUSSION` means every executable technical gate in `docs/phase1.md`
 passed on this commit, including the four primary paths against the real isolated
@@ -1516,6 +1516,176 @@ receives attributable caller-side evidence, nor that recovery verification succe
 whether `span_kind` holds a client-side value, and whether the caller's Charge series carries traffic
 in the window after remediation.
 
+## The live Payment premise (`b4d80e7` measured, corrected at `79d733e`) - the visibility check accepted telemetry the write had not caused
+
+### The user's measured run
+
+Revision `b4d80e7`, logs `reports/local/validation-20260924T131320/`, live evidence
+`reports/local/live-scenarios-20260924T131320.json`, user log directory
+`.local/user-live-checks-20260924T131309/`. Every measurement below is the
+**user's**, taken in a normal WSL terminal; nothing in this pass ran the stack.
+
+- Offline `194 passed, 7 skipped` in both environment variants; lint, formatting, `mypy`
+  and the sensitivity harness clean; simulated scenarios `9/9`.
+- Integration `85 passed` - the test-observation-scope correction from `b4d80e7` is now
+  verified in a real run.
+- Live P1-01: `SAFE_ESCALATION` / `ESCALATED_INCOMPLETE`, one approval, one action,
+  30 evidence records, 151.9s, incident `inc_01M39RV5QE944KHF48MXKAXPKE`, cleanup
+  `paymentUnreachable` `off -> off` with `off` read back.
+
+### What the run finally established, and what it did not
+
+The dependency read now works live. The verification verdict is **`VERIFICATION_FAILURE`**
+(not a collection error and not a refusal), and its recorded reason names the attributed
+edge and the measurement:
+
+> the affected dependency path is still failing after the action: checkout-service ->
+> payment-service failed on 100.00% of 0.033 calls/second in the window, above the 5%
+> telemetry bound; target probe health=NOT_SERVING error_rate=1.0
+
+That is A14's fix confirmed against the pinned stack: `read_dependency` resolved the
+schema, attributed `caller=checkout-service`, `destination=payment-service`,
+`operation=Charge` and read the caller's own client spans. The stop cause is a **measured
+continuing failure** after six honest settle rounds (5 x 30s of the 151.9s), not a budget,
+policy, human-control or collection refusal. **Payment recovery is still unverified on this
+revision; the outcome is not a pass.**
+
+### The setup-timing concern is confirmed as a defect
+
+| Stage | Window | Read | Result | Attribution | Measurement |
+| --- | --- | --- | --- | --- | --- |
+| baseline | n/a | flag document | ok | - | all six verified flags at their safe variant |
+| traffic-wait | 120s | `read_service_health(payment-service)` | ok, first poll | - | `calls_per_second` 0.0167 |
+| fault-injection | n/a | `set_flag_variant(paymentUnreachable=on)` | acknowledged | - | - |
+| fault-visibility | 120s, ending at the write | `read_service_health(payment-service)` | **accepted** | target | `NOT_SERVING`, `error_rate` 1.0, `calls_per_second` 0.0167, **elapsed 0.0s** |
+| diagnosis | 120s | health, metrics, traces, dependency, changes, runbook | ok | controller read | "payment-service is refusing connections" |
+| approval | n/a | exact approval | granted | - | one approval, one action |
+| action | n/a | `disable_feature_flag(paymentUnreachable)` | acknowledged | - | no duplicate, no forbidden action |
+| verification, 6 rounds | 120s each | 4 reads per round, including `read_dependency` | ok | checkout -> payment, `span_kind=client` | 100% of 0.033 calls/s, above the 5% bound; target probe `NOT_SERVING` 1.0 |
+| cleanup | n/a | `restore_owned_fault` | ok | - | `off` written, `off` read back |
+
+The per-round rows (every tool call, every evidence record, every verification reason)
+exist only in the operational database, not in the JSON or the teed log: the file carries
+the aggregate "30 evidence" and one final verdict string. `scripts/diagnose-live-incident.py`
+was added for exactly that export and is described under "Next action" below.
+
+**What "baseline clean" verifies is the flag document, and only that.**
+`_establish_scenario_baseline` calls `detect_residual_faults`, which reads the six verified
+flags; the note it writes says so in as many words ("every scenario fault flag is at its
+safe variant"). No telemetry-health baseline was ever taken, so a demo whose *services*
+were already failing passed the baseline check cleanly.
+
+**The accepted observation cannot have been produced by the write.** The probe averages a
+120s window, and the pinned stack's span metrics publish on a ~60s cadence (measured: no
+span-derived window shorter than 120s ever reads as anything but empty). A reading accepted
+0.0s after the write therefore averages two minutes of samples that predate it. It was
+accepted because the predicate was a *level* (`error_rate > 0.05`) with no comparison to
+anything - and the pre-injection state it silently inherited was already a total failure:
+`corroborating_before` (`checkout-service`, read *after* the write) shows `NOT_SERVING`
+with `error_rate` 1.0 and `calls_per_second` 0.0333. The run recorded "fault visible after
+arming" for a fault it never showed.
+
+Two further facts are visible in the code, and both are the same defect:
+
+- `_corroborating_baseline` was called **after** `arm_fault`, while its own docstring says
+  it carries the reading "from *before* this scenario armed anything"; the differential it
+  feeds therefore compared the armed state with itself.
+- The target branch returned before the corroborating branch was ever read, so the
+  differential was structurally unreachable and `corroborating` is `null` in the record.
+- Where a baseline was absent, `(corroborating_before or {}).get("error_rate")` read it as
+  `0.0`, so any caller-side failure counted as a rise - an absent reading treated as a
+  clean one.
+
+**A second occurrence had not been recorded.** `reports/local/live-scenarios-20260924T121118.json`
+(user directory `.local/user-live-checks-20260924T121110/`) is the same shape on the same
+revision: `SAFE_ESCALATION` / `ESCALATED_INCOMPLETE`, `attribution: target`,
+`elapsed_seconds: 0.0`, pre-injection `error_rate` 1.0, 172.2s, incident
+`inc_01M39NA4SPRDPF8KWJPZVBPMAW`. Its log also shows the traffic wait reading payment at
+`calls_per_second=0.0` before the injection, so Charge traffic is intermittent and a single
+window proves nothing on its own.
+
+Across the five formatted runs:
+
+| Run | Attribution | Pre-injection (payment) | Accepted probe | Fault visible after | Total |
+| --- | --- | --- | --- | --- | --- |
+| `081025` | caller | SERVING 0.0, 0.083/s | NOT_SERVING, `error_rate` none, 0.0/s | 240.8s | 362.0s |
+| `082533` | caller | SERVING 0.0, 0.033/s | SERVING 0.0, 0.133/s | 120.4s | 161.0s |
+| `104258` | target | SERVING 0.0, 0.0397/s | NOT_SERVING 1.0001, 0.0301/s | 240.8s | 432.4s |
+| `121118` | target | **NOT_SERVING 1.0, 0.0667/s** | NOT_SERVING 1.0, 0.0333/s | **0.0s** | 172.2s |
+| `131320` | target | **NOT_SERVING 1.0, 0.0333/s** | NOT_SERVING 1.0, 0.0167/s | **0.0s** | 151.9s |
+
+### What remains unknown, and why it is not guessed
+
+*Why* the Charge series carried a 100% error share **before** the write is not established
+from the files. Three explanations fit the same numbers and no offline read separates them:
+a genuinely failing payment path; a fault left armed somewhere other than the flag
+document; or the health probe's own identity. That last one is a measured property, not a
+guess: `read_service_health` for a target builds
+`sum(rate(<calls>{span_name='oteldemo.PaymentService/Charge'}[120s]))` with **no service and
+no span-kind filter**, so payment's server spans and checkout's *client* spans for the same
+operation are one series set - the blind spot D22/A15 records for diagnosis. "Payment is at
+100% errors" can therefore be a caller-side reading.
+
+Nothing here claims the payment path recovered, and nothing re-runs the scenario to
+harvest information the database already holds.
+
+### The correction
+
+Implemented at `79d733e` (engine, tests and the shared fake) plus the read-only export
+`scripts/diagnose-live-incident.py`.
+
+- **Both pre-injection readings are taken before the write**, adjacent to it, and passed
+  into `wait_for_fault` as required keyword arguments (`target_before`,
+  `corroborating_before`). The signature has no defaults, because there is no premise
+  without a baseline.
+- `_fault_is_new` makes the predicate a **transition**: the reading must be above the
+  telemetry bound *and* strictly higher than its own pre-injection reading. A missing
+  baseline is not a baseline of zero, so an unreadable one keeps the harness waiting and
+  ends in an honest `NOT_MEASURED` at the `fault-visibility` stage rather than in an
+  invented premise. The rule the corroborating branch already used is now the rule for the
+  fault target too.
+- The record carries the claim: `fault_visible.target_before` alongside
+  `corroborating_before`, `window_seconds` on every health snapshot, and a `_fault_reason`
+  that names both sides of the rise.
+
+**What the correction does not claim.** It is not a clock gate, and it deliberately does
+not add one. The accepted reading still averages a 120s window that overlaps the write;
+what makes it attributable is the transition, which is the strongest statement a single
+120s average supports. Requiring an observation whose window begins *after* the write would
+cost at least one full span-metric window per scenario for a guarantee the differential
+already provides, so the limit is recorded here instead of hidden behind a sleep.
+
+### Tests, falsification, and what was executed
+
+Three tests were added and one was corrected (`tests/unit/test_live_lifecycle.py`), and the
+shared fake now models the real shape - a demo shows a fault only while its flag is armed
+(`fault_only_when_armed`), and `cleared()` is what a safe flag position reads:
+
+- `test_the_pre_injection_readings_are_taken_before_the_fault_is_armed` pins the ordering
+  through a full scenario: the caller's baseline must read 0.0 and the accepted probe 1.0,
+  and the reason must name the pre-injection reading.
+- `test_a_target_that_was_already_failing_is_not_the_armed_fault` pins the `131320` shape:
+  a demo already at 100% errors is never accepted as the fault this run armed.
+- `test_an_unreadable_baseline_is_not_a_baseline_of_zero` pins the hole where an absent
+  baseline read as `0.0`.
+- `test_a_caller_that_was_already_erroring_is_not_the_fault` keeps its meaning and now
+  supplies both baselines, as the driver does.
+
+**Falsification** (`reports/local/setup-timing-falsification.log`, untracked): with only the
+engine reverted to `HEAD`, the ordering test fails - the old code records
+`corroborating_before` *after* the write, reads 1.0 against 1.0 and never fires - and
+`reports/local/setup-timing-defect-repro.py` accepts a pre-existing failure as the armed
+fault with `attribution: target`, `elapsed_seconds: 0.0`, `error_rate: 1.0` and
+`calls_per_second: 0.0167`: the live record's own numbers.
+
+Executed in this session: offline `197 passed, 7 skipped` in both variants (three more tests
+than the user's 194), `ruff check`, `ruff format --check`, `mypy` (41 source files). Not
+run: the integration suite, the sensitivity harness and the simulated scenarios (all need
+PostgreSQL, and this sandbox denies every socket - `psycopg.OperationalError: connection is
+bad`, recorded and not escalated again), and the live path (no demo access from here). The
+new diagnostic script was exercised only far enough to prove it degrades honestly when both
+channels are unreachable; it has not yet read a real incident.
+
 ## Remaining work and discussion
 
 **Blockers (environment, not code):**
@@ -1541,13 +1711,6 @@ in the window after remediation.
   route was attempted once for the integration suite in that pass, as the handoff
   directs, and was rejected before the command ran by the same
   `codex-auto-review` misconfiguration; it was not retried.
-- **The optional Claude harness cannot be reached.** It is installed and
-  subscription-configured; in the earlier pass three bounded non-interactive attempts
-  hung with no output, and in this pass the invocation was denied before it ran by the
-  harness's own broken approval review (`codex-auto-review`). Recorded rather than
-  worked around, and not retried; no external review is claimed. A GPT-6 Luna reviewer
-  was also rejected by the provider for the same class of reason (see the review
-  section above).
 - `/snap/bin/codex` does not run here: `snap-confine is packaged without necessary
   permissions ... required permitted capability cap_dac_override not found`. The
   working path is the project's `uv` environment (`uv run ...`). Nothing was
@@ -1607,14 +1770,17 @@ in the window after remediation.
 - Whether Phase 1's live scope should include a paid reasoning provider at all,
   or stay deterministic with live tools.
 
-**One command block for the remaining checks.** This is the whole of what is left to run: the harness
-(the offline suite, the static checks, the PostgreSQL-backed integration suite that holds the corrected
-acceptance check, the sensitivity harness and the nine simulated scenarios) and then the focused live
-Payment path, because the remaining scenarios must not start until Payment's result has been assessed.
-It runs in a subshell so the operator's interactive shell is neither closed by a failing stage nor left
-in another directory, activates the project's own environment explicitly, keeps live settings inside the
-live subprocess, refuses to start beside another driver, prints the revision it is testing, and stops on
-the first failure. The selector question is answered, so it does not repeat the probe.
+**One command block for the next run.** It does two things, in this order: it exports the
+persisted per-attempt records of the last Payment incident (the tool calls, evidence and
+verification rows that exist only in the operational database, plus the caller-side Charge
+series as it stands now, plus the six flags' current positions), and it then runs the
+focused live Payment path against the corrected premise. It runs in a subshell so the
+operator's interactive shell is neither closed by a failing stage nor left in another
+directory, activates the project's own environment explicitly, prints the interpreter and
+the revision it is testing, keeps live settings inside the subprocess, writes timestamped
+logs, preserves the live stage's failure status through `tee`, and stops on the first
+failure - except that the export after the live stage always runs, so a failing scenario
+still leaves its own persisted records exported next to the failure.
 
 ```bash
 (
@@ -1630,39 +1796,54 @@ the first failure. The selector question is answered, so it does not repeat the 
   LOGDIR=".local/user-live-checks-$(date -u +%Y%m%dT%H%M%S)"
   mkdir -p "$LOGDIR"
   printf 'log directory: %s\n' "$LOGDIR"
+  scripts/pg.sh start
+  scripts/pg.sh ensure-dbs
   scripts/demo.sh health >/dev/null 2>&1 || scripts/demo.sh start
   scripts/demo.sh endpoints >/dev/null
   set -a
   . .local/demo-endpoints.env
   set +a
   printf 'prometheus: %s\n' "$OPSACCORD_PROMETHEUS_BASE_URL"
-  scripts/validate.sh --live --scenario P1-01 2>&1 | tee "$LOGDIR/validate-live.log"
+  python scripts/diagnose-live-incident.py 2>&1 | tee "$LOGDIR/diagnose-before.log"
+  rc=0
+  scripts/validate.sh --live --scenario P1-01 2>&1 | tee "$LOGDIR/validate-live.log" || rc=$?
+  python scripts/diagnose-live-incident.py 2>&1 | tee "$LOGDIR/diagnose-after.log" || true
+  printf 'live stage exit status: %s\n' "$rc"
+  exit "$rc"
 )
 ```
 
-Expected: the unbraced selector answers `http 400 ... bad_data`, the braced one answers `http 200`
-with the label names the stack exposes. If the braced selector comes back with no `service_name` or no
-client-side span-kind value, the run will report an unattributable edge and escalate - read that as
-the instrumentation gap it names, not as a failure to work around.
+Expected, in `$LOGDIR`:
 
-`scripts/validate.sh` is what supplies the rest: it starts and verifies the project-local PostgreSQL
-cluster, runs the offline suite, the linter, the formatter and `mypy`, then the PostgreSQL-backed
-integration suite (which holds the acceptance checks, including the now shape-asserting cap check), the
-sensitivity harness and the simulated scenarios, refuses to run if another live driver holds the demo
-flags, and only then runs the one live path with `PYTHONUNBUFFERED=1` so its per-event lines appear
-while it works. Every stage writes `reports/local/validation-<timestamp>/<stage>.log`.
+- `diagnose-before.log`: the previous incident's per-round records (tool calls with their
+  selectors and errors, evidence with its windows and values, verifications with their
+  reasons), the grouped `Charge` / `PlaceOrder` series by `service_name`, `span_kind` and
+  `status_code`, and the six flags' current positions. A collection failure is printed as
+  one and the script exits `3` if nothing at all could be read.
+- `validate-live.log`: the harness stages and then the one live path. The new premise shows
+  up as a `pre-injection reading` line before the write. On this demo the run now either
+  (a) observes a **rise** and proceeds to the controller, or (b) refuses the premise as
+  `NOT_MEASURED` at the fault-visibility stage because the pre-injection reading already
+  carried the error share - which is the honest reading of a demo whose Charge path was
+  already failing, not a harness regression. Do not weaken the check to get past it.
+- `diagnose-after.log`: the new incident's own rounds, so the verification attempts and the
+  caller-side series can be read without a second run.
 
-Read three things in that directory: `07-integration-suite.log` (the corrected cap check runs there,
-and it is what stopped the last run), `13-live-paths.log` plus the `live-scenarios-*.json` it names, and
-the persisted diagnosis.
-On a good run the evidence holds a `read_dependency` item with `caller=checkout-service`,
-`destination=payment-service`, `operation=Charge`, `span_kind=client` and `attributable: true`, and the
-verification succeeds on fresh caller-side evidence. A run that escalates again is a measurement, not
-a failure of this command: read the reason, which will name the instrumentation gap
-(`attributable: false` with the label names the stack actually exposes) if the client-side Charge series
-is not there. The schema itself is now measured to expose `service_name` and `span_kind`, so an
-unattributable read can only be about the client-kind value or the window's traffic - and its reason
-says which.
+`scripts/validate.sh` is what supplies the rest: it starts and verifies the project-local
+PostgreSQL cluster, runs the offline suite, the linter, the formatter and `mypy`, then the
+PostgreSQL-backed integration suite (which holds the acceptance checks, including the
+shape-asserting cap check), the sensitivity harness and the simulated scenarios, refuses to
+run if another live driver holds the demo flags, and only then runs the one live path with
+`PYTHONUNBUFFERED=1` so its per-event lines appear while it works. Every stage writes
+`reports/local/validation-<timestamp>/<stage>.log`.
+
+Read `13-live-paths.log` plus the `live-scenarios-*.json` it names, and the two diagnosis
+logs. On a good run the evidence holds a `read_dependency` item with
+`caller=checkout-service`, `destination=payment-service`, `operation=Charge`,
+`span_kind=client` and `attributable: true`, and verification succeeds on fresh caller-side
+evidence. A run that escalates again is a measurement, not a failure of this command: read
+the reason, which names the instrumentation gap (`attributable: false` with the label names
+the stack actually exposes) when the client-side Charge series is not there.
 
 **Startup, demonstration, verification, teardown:**
 
