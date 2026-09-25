@@ -50,9 +50,22 @@ scripts/demo.sh start       # core + observability layers, with the local overri
 scripts/demo.sh health      # probe every published port and API
 scripts/demo.sh endpoints   # resolve the ephemeral ports into .local/demo-endpoints.env
 scripts/demo.sh status
+scripts/demo.sh inspect      # health, restarts, exit/OOM state, limits, effective GOMEMLIMIT
+scripts/demo.sh stats        # two CPU/memory samples for the Go services
 scripts/demo.sh logs checkout
 scripts/demo.sh stop
 ```
+
+`status` prints one status word per container. `inspect` adds what a diagnosis needs and `status`
+cannot show - restart count, exit code, `OOMKilled`, configured limits, the effective `GOMEMLIMIT` and
+the health probe's own message - and both it and `stats` report every command's exit status instead of
+hiding a failure behind a pipeline.
+
+**An empty `logs` capture is not evidence that a service was silent.** This revision sends the Go
+services' `slog` output over OTLP and its `otel-config.yml` declares no stdout exporter, so their
+container logs are normally empty; the collector's own output is where those records are
+([D28](../.local/obsidian/OpsAccord/decisions/D28-the-demo-s-go-services-log-over-otlp.md)). Pass
+`OPSACCORD_DEMO_LOG_SINCE=20m` to bound the window by time as well as by line count.
 
 Only `frontend-proxy` (8080) and `prometheus` (9090) are stable host ports; every
 other port is ephemeral, so always load the resolved endpoints before a live

@@ -130,8 +130,11 @@ Docker Desktop on Windows, driven from WSL through the integration:
 `DC=/mnt/c/Users/admin/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe`,
 Compose v5.4.0, 29.7.2 client and server. The demo is the pinned upstream checkout
 (`/mnt/c/Users/admin/opsaccord-demo/opentelemetry-demo`, tag `3.1.0`, commit
-`dedc0178`); `scripts/demo.sh status` reports 25 containers with the stack
-healthy. Only `frontend-proxy` (8080) and `prometheus` (9090) hold stable host
+`dedc0178`); `scripts/demo.sh status` originally reported 25 containers with the
+stack healthy - **no artifact for that dump is retained**, and the only retained
+status dump (11:28:31) shows every container up with `product-catalog` unhealthy, so
+the earlier wording is kept as a historical measurement and is not restated as a
+current property (see the baseline diagnosis pass below). Only `frontend-proxy` (8080) and `prometheus` (9090) hold stable host
 ports - every other service publishes an ephemeral port, so endpoints are
 discovered, written to gitignored `.local/demo-endpoints.env`, and never assumed.
 PostgreSQL is project-local on `127.0.0.1:55432`; three databases are used
@@ -2476,6 +2479,16 @@ This is a stack-readiness question, not a trace question, and it is the precondi
 the trace half of P1-01 cannot be attempted until `checkout` registers in the store. Phase 1 remains
 PARTIAL.
 
+**Correction (baseline diagnosis pass): what the missing `checkout` spans do not prove, and the scope of
+"gone".** Reading `checkout`'s absence from the 11:23 store as evidence that `checkout` was the root cause
+was an overstatement: those reads landed while a **replacement Jaeger was still registering services**
+(3, then 10, then 11 between 11:23:23 and 11:23:44, and five services still missing at 11:26:54), so the
+store's coverage, not the service's health, was what changed. The distinction is the difference between
+"the service has not exported yet" and "the service is faulty", and only the first is measured. Second,
+the two traces are unrecoverable **from the current store** - the evidence supports a volatile in-memory
+store on a replaced instance, and does not support the stronger claim that they exist nowhere. The
+historical observations above are kept as they were made.
+
 ### The first live trace through the new classifier (11:28:33) - a corrected defect, and a confounded stack
 
 The stack-recovery run found `checkout` registered: 13 services, **4 operations** advertised for it,
@@ -2516,6 +2529,199 @@ Checks on this tree: offline `263 passed, 7 skipped, 85 deselected` in both vari
 `ruff format --check` (89 files) and `mypy src/opsaccord` (42 files) clean - logs
 `reports/local/validation-20260925T113048`. Reading of the live run: `.local/user-live-checks-20260925T112831/`
 (`demo-status.log`, `trace-readiness.log`) and `reports/local/payment-trace-readiness-20260925T112831.json`.
+
+**Corrections (baseline diagnosis pass).** `checkout.log` is empty in that run, and emptiness is not
+evidence that the service was silent: the pinned revision sends the Go services' `slog` output over OTLP
+and its `otel-config.yml` declares no stdout exporter, so their container logs are normally empty and the
+collector's `debug` exporter holds what they emitted. Where an earlier note called this unexplained, the
+cause is now measured from the pinned configuration. Separately, `query_completed: true` is not
+application readiness - it says a read returned, `evidence sufficiency: not_sufficient` says the answer
+cannot support a conclusion, and `docker ps` says what Docker's probe last saw. The three are different
+claims and this report treats them as different.
+
+## The baseline diagnosis pass (`5984cfc` code, this commit's records) - the catalog is the failing service, four records were corrected, and the diagnosis is bounded to one block
+
+This pass did not inject a fault and did not run a scenario. It verified the retained evidence, corrected
+four overstatements that evidence does not support, diagnosed the failing service from the pinned source,
+fixed the demo helper's own defects, and wrote the single bounded evidence block that decides the repair.
+
+**Whose measurements these are.** The starting evidence - the 11:28:31 `docker ps` dump, the 11:23-11:26
+readiness reads, and the 73-span trace `290d12a9429910cab4800d4a44b79e43` - is the **user's own run in
+their WSL terminal**; it is read here, not re-measured. Everything under "Checks executed in this pass" is
+this session's, in a sandbox with no Docker engine and no network, and says so where it is not live
+evidence. Nothing in this pass changed a fault, a budget, a selector, a wait or a scenario.
+
+No repair was made, because the evidence needed to justify one has not been measured yet; the block is
+what measures it, and it is deliberately repair-free.
+
+### Corrections to the record (marked, not deleted)
+
+1. **Missing Checkout traces did not prove Checkout was the root cause.** The 11:23 observations were
+   taken while a **replacement Jaeger was booting** - the store advertised 3, then 10, then 11 services
+   between 11:23:23 and 11:23:44, and five services were missing from the 02:54 list at 11:26:54. That
+   is a store-registration fact about the instance, not a statement that `checkout` was faulty. The
+   corrected reading is in the new note under "The recovery read against the restarted stack".
+2. **The two historical traces are unrecoverable *from the current store*.** The evidence supports a
+   volatile in-memory store on a replaced instance; it does not support "these traces exist nowhere".
+3. **An empty log capture is not evidence that a service emitted no logs.** Measured cause, found this
+   pass: the pinned revision routes the Go services' `slog` output over OTLP and `otel-config.yml`
+   declares **no stdout exporter**, so their container logs are empty by design. `checkout.log` being
+   0 bytes at 11:28:31 is therefore expected, and what those services emitted is in the **collector**,
+   whose logs pipeline exports to the `debug` exporter. The E26 "Also odd" row and the vault copies of
+   it now say this instead of "unexplained".
+4. **Query completion is not application readiness.** New explicit rule, stated in the readiness section:
+   `query_completed: true` says a read returned, `evidence sufficiency: not_sufficient` says what it
+   returned cannot support a conclusion, and neither says the application is serving.
+5. One claim is now qualified rather than repeated: "`scripts/demo.sh status` reports 25 containers with
+   the stack healthy" (Environment arrangement, above) has **no retained artifact**. The only retained
+   `docker ps` dump is 11:28:31, and it shows all containers up with **`product-catalog` unhealthy**, so
+   the phrase is kept as a historical measurement and is not restated as a current property.
+
+### What the pinned source says about `product-catalog`
+
+Established by reading the checkout rather than by guessing, and separated by what each fact does and
+does not prove:
+
+| Fact | Source | What it supports |
+| --- | --- | --- |
+| `memory: 20M` with `GOMEMLIMIT=16MiB`, healthcheck `grpc_health_probe -addr=:3550`, `restart: unless-stopped` | `compose.yaml`, product-catalog | The identical limit pair the local override was written to fix for `checkout`, where it was measured as a Go GC loop (~700% CPU, 18.1MiB of 20MiB held, gRPC never accepting, 118 consecutive probe failures) |
+| `initDatabase()` runs **before** `net.Listen`, and any DB error is `logger.Error` + `os.Exit(1)` | `src/product-catalog/main.go:130-134` | A database failure would exit the process and produce a restart loop, not a container that stays `Up (unhealthy)` for five minutes. `astronomy-db` is reported healthy |
+| `triggerLockContentionLoop` ticks every 10s and only touches the database when the flag is on | `main.go:446-465` | No by-design busy loop; the ticker is inert with the flag off |
+| `productCatalogFailure`'s targeting returns `"off"` for **every** product id, and all 18 flags default `off` | `src/flagd/demo.flagd.json` | The failure is not an armed flag, and that flag's targeting rule could not have armed it for the failing product either. It also fails pre-trace, inside the catalog's own flag client, which is consistent with the observed trace |
+| `logger_provider` exports only to `otlp_grpc`; the collector's logs pipeline exports to `debug` | `otel-config.yml`, `otelcol-config.yaml` | Why the container log is empty and where the service's own log records actually are |
+
+**The leading reading is therefore the same resource wedge the override already documents for `checkout`:**
+a process that is alive and listening at the kernel level but never completes a gRPC handshake. The
+retained trace is consistent with it - `error reading server preface ... use of closed network connection`
+on `checkout -> product-catalog:3550` is a TCP connection that was accepted and then closed without a
+server preface, which is not what a refused connection looks like.
+
+It is recorded as the **leading reading, not a conclusion**, because one competing reading is not excluded
+by anything measured so far: a startup or dependency delay that never clears. The measurement that decides
+it is small and is in the block below:
+
+- `restarts=0` and `oom_killed=false` with a health probe that reports "failed to connect ... within 1s"
+  excludes an OOM loop and a crash loop;
+- CPU near the core count with RSS held at the 20MiB limit over two samples is the documented signature
+  of the GC loop, and would justify the same deviation for `product-catalog` that `checkout` already has;
+- CPU near idle with RSS well below the limit would instead point at a dependency or listener problem,
+  and would forbid the memory change - no selector, limit, wait or health check was changed this pass.
+
+### The demo helper's defects, fixed
+
+`scripts/demo.sh logs` could not be trusted to say what it appeared to say:
+
+- `compose logs --tail N "${@:-}"` expands to **one empty service name** when no service is named, which
+  compose rejects, so the documented bare `demo.sh logs` could not have worked;
+- the same call inside a caller's `$( ... )` hides its exit status, so an empty capture and a failed
+  capture were indistinguishable - and an empty capture is *not* silence (see correction 3);
+- it is a snapshot, not a follow: no `-f` is passed and none is wanted, but that was undocumented.
+
+Also fixed or added, each because this diagnosis needs it: `inspect` (per-container health, restart
+count, exit code, OOM flag, configured limits, effective `GOMEMLIMIT`, and the probe's own output for a
+container that is not healthy - `docker ps` shows none of those); `stats` (two CPU/memory samples, because
+a single non-streaming sample can report 0.00% for a spinning process); `logs --since` as an opt-in window;
+`PRODUCT_CATALOG` added to the health probe surface, which did not cover the failing service at all; and
+`endpoints` now repeats the raw `compose port` call when resolution fails, so it reports the real cause
+instead of always blaming a stopped stack. Nothing in the fault, budget, verification or scenario code
+changed.
+
+### Checks executed in this pass
+
+- Focused tests `tests/unit/test_demo_script.py` (new, 8 tests) and `tests/unit/test_config_isolation.py`:
+  **16 passed**. The new tests run the script against a stub docker binary; they pin the empty-argument
+  bug, status propagation, the opt-in window, the two samples, the health-probe surface, and that a failed
+  endpoint resolution names its cause.
+- Offline suite `-m "not integration"`: **271 passed, 7 skipped, 85 deselected** in both environment
+  variants (`263` before this pass's 8 new tests); `ruff check` clean, `ruff format --check` (90 files)
+  clean, `mypy src/opsaccord` (42 files) clean, `bash -n scripts/demo.sh` clean - logs
+  `reports/local/validation-20260925T114111` and `.../validation-20260925T114254`.
+- The block itself: syntax-checked, then executed here twice - once with no reachable engine, where it
+  stops at the endpoint refresh with the real `compose port` error, and once against a stub docker binary,
+  where every step runs, each command reports its own status, and a failing flag read and trace leave the
+  run intact (`reports/local/validation-20260925T114254/09-block-stop-path.log` and `.../10-block-full-stub-run.log`).
+  These are **sandbox structure checks, not live evidence**.
+- Not run, and not reported as results: any live scenario, the integration suite (no PostgreSQL/Docker in
+  this session), and any measurement of `product-catalog` - the block below is the only thing that can
+  produce that.
+
+### The one next action
+
+Paste the block below from the host. It refreshes the endpoints, moves a stale endpoints file aside
+instead of trusting it, and collects in one run: per-container state (health, restarts, exit, OOM, limits,
+effective `GOMEMLIMIT`), the health probe surface including `PRODUCT_CATALOG`, two CPU/memory samples,
+bounded logs for the catalog, checkout and the collector, the live fault flags, and the current trace
+evidence. It performs **no repair**: the reading above decides between the memory deviation and a
+dependency investigation, and that decision needs these numbers first.
+
+```bash
+( set -euo pipefail
+  cd /home/brentiburo/projects/OpsAccord
+  if declare -F deactivate >/dev/null; then deactivate; fi
+  source .venv/bin/activate
+  export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+  PYTHON="$PWD/.venv/bin/python"
+  printf 'interpreter: %s\n' "$("$PYTHON" -c 'import sys; print(sys.executable)')"
+  printf 'tested revision: %s on %s\n' "$(git rev-parse --short HEAD)" "$(git rev-parse --abbrev-ref HEAD)"
+
+  TS="$(date -u +%Y%m%dT%H%M%S)"; LOGDIR=".local/user-catalog-diagnostics-$TS"; mkdir -p "$LOGDIR"
+  printf 'evidence dir: %s\n' "$LOGDIR"
+
+  run() { local name="$1"; shift
+    set +e; { "$@"; } 2>&1 | tee "$LOGDIR/$name.log"; rc="${PIPESTATUS[0]}"; set -e
+    printf '==== %s exited %s (log %s) ====\n' "$name" "$rc" "$LOGDIR/$name.log"; }
+
+  # A stale endpoints file names ports that a replaced stack owned, and querying
+  # those answers "connection refused" - which reads like a fault in the stack
+  # rather than a stale file. It is moved aside, never deleted, and only a file
+  # resolved by this run is used below.
+  if [ -f .local/demo-endpoints.env ]; then mv .local/demo-endpoints.env ".local/demo-endpoints.env.pre-$TS"; fi
+  run endpoints bash scripts/demo.sh endpoints
+  if [ ! -f .local/demo-endpoints.env ]; then
+    printf '\nSTOP: scripts/demo.sh endpoints could not resolve the stack; nothing further was run.\n'
+    exit 1
+  fi
+  # The file is generated by the command above, so a wrong shape means something
+  # other than a port lookup went wrong; sourcing it would then run the rest of the
+  # block against nonsense or abort it with a confusing shell error.
+  if [ "$(grep -c '^OPSACCORD_[A-Z_]*=' .local/demo-endpoints.env)" -ne 4 ]; then
+    printf '\nSTOP: the refreshed endpoints file does not hold exactly the four expected settings; not sourcing it.\n'
+    exit 1
+  fi
+  set -a; . .local/demo-endpoints.env; set +a
+
+  run containers bash scripts/demo.sh inspect
+  run health bash scripts/demo.sh health
+  run stats bash scripts/demo.sh stats
+  export OPSACCORD_DEMO_LOG_SINCE=20m
+  run logs-catalog bash scripts/demo.sh logs product-catalog
+  run logs-checkout bash scripts/demo.sh logs checkout
+  run logs-collector bash scripts/demo.sh logs otel-collector
+  unset OPSACCORD_DEMO_LOG_SINCE
+
+  set +e
+  curl -fsS --max-time 10 "$OPSACCORD_FLAG_CONTROL_BASE_URL/api/read" >"$LOGDIR/flags.json" 2>"$LOGDIR/flags.err"
+  printf '==== flag read exited %s ====\n' "$?"
+  set -e
+  "$PYTHON" - "$LOGDIR/flags.json" <<'PY'
+import json, sys
+try:
+    flags = json.load(open(sys.argv[1]))["flags"]
+except Exception as exc:
+    print(f"flags document unreadable: {exc}")
+    raise SystemExit(0)
+for name in sorted(flags):
+    print(f"{name}: defaultVariant={flags[name].get('defaultVariant')}")
+PY
+
+  run trace "$PYTHON" scripts/diagnose-payment-trace-path.py --lookback-minutes 15 --recent-minutes 15 --out "reports/local/payment-trace-readiness-$TS.json"
+
+  printf '\nDone. Evidence: %s/\n' "$LOGDIR"
+  printf 'Also: reports/local/payment-trace-readiness-%s.json\n' "$TS"
+  printf 'Send back: the product-catalog line from containers, the PRODUCT_CATALOG line from health,\n'
+  printf 'the two stats samples, and logs-catalog.\n'
+)
+```
 
 ## Remaining work and discussion
 
