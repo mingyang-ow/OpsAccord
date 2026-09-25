@@ -330,13 +330,34 @@ sequence: the services visible, the operations advertised *for the caller servic
 bounded recent query with no operation filter, a query for an operation a returned trace
 actually showed, a bounded retrieval check that re-queries one returned trace inside its
 own timestamp window, and only then the historical interval. It classifies each retained
-trace as `edge_span_present_and_failing`, `edge_span_absent_with_a_failure_recorded`,
-`edge_span_absent_no_failure_recorded`, `edge_span_present_and_ok` or `no_root_span`, and
-records each stage's requested window, observed range, count, trace IDs, cap and failure.
-Exit codes: `0` every query completed, `1` at least one query failed to complete, `2` bad
-arguments, `3` refused to start - and `evidence.sufficiency` separately reports whether the
-result is usable, so a successful exit is never read as a sufficient answer. It issues HTTP
-GETs only, arms no flag, runs no scenario, and so has nothing to restore.
+trace as `no_attempt_span`, `edge_span_absent_with_a_failure_recorded`,
+`edge_span_absent_no_failure_recorded`, `edge_span_present_and_failing`,
+`edge_span_present_without_a_status`, `edge_span_present_with_its_ancestry_unresolved`,
+`edge_span_present_on_an_unrelated_branch`, `edge_span_present_and_ok_with_failures_elsewhere`
+or `edge_span_present_and_ok`, and records each stage's requested window, observed range
+(`max(start + duration)` per span), count, trace IDs, cap and failure. Exit codes: `0` every
+query completed, `1` at least one query failed to complete, `2` bad arguments, `3` refused to
+start - and `evidence` separately reports whether the query completed, how many traces came
+back, whether the request path was reconstructed, and what that evidence is sufficient for
+(`request_path_review`, `dependency_attribution`, `recovery`), so a successful exit is never
+read as a sufficient answer and two retrieved traces are never read as a statement about the
+dependency. It issues HTTP GETs only, arms no flag, runs no scenario, and so has nothing to
+restore.
+
+Three things are resolved from the payload's own `CHILD_OF` references rather than assumed,
+because an operation name is not a span identity: a caller's *client* span and the callee's
+*server* span for one operation carry the same name, and `frontend` and `checkout` both export
+`oteldemo.CheckoutService/PlaceOrder`. The **root** is a span whose parent is absent from the
+payload (for the Payment path, the load generator's HTTP span), the **attempt** is the measured
+operation's own server span, and the edge's **relationship** to it is a walk over parent
+references - `direct_child`, `descendant` at *n* hops, `ancestor`, `unrelated_branch`, or
+`missing_parent` when a named parent is not in the payload. Span status is three-valued:
+`ERROR` or `OK` with the signal that decided it (`otel.status_code`, legacy `status.code`, an
+`error` tag, `error.type`/`exception.type`, `rpc.grpc.status_code`, `http.response.status_code`,
+or an exception event), and `UNSET` when the service wrote nothing - which is never reported as
+a success. Every reported span also carries its position relative to the window asked for
+(`before_window`, `starts_before_window`, `during_window`, `crosses_window_end`,
+`after_window`, `unpositionable`), so a call that outlasted the interval is visible as that.
 
 ### Health probes are scoped to one service
 

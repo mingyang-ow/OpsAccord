@@ -25,6 +25,7 @@
 | **Payment-evidence status (branch tip with this report)** | **PARTIAL** - at `9058671` the user's run cleared every stage (offline 197/7 in both variants, integration 85, static checks, sensitivity harness, 9/9 simulated scenarios) and the live P1-01 ended `SAFE_ESCALATION` / `READY_FOR_HUMAN` with zero approvals and zero actions, 541.9s, cleanup `on -> off` read back `off`. Its premise was accepted on a *generic* caller-side failure (checkout `PlaceOrder` 17.66%) while the attributed Charge edge read `error_rate` 0.0, so the controller had no attributable Payment evidence and handed off - correctly, on the evidence it had. Two corrections are committed at `e6232c2`: service-health reads are now scoped to the target's own spans, and the premise requires the attributed caller-side reading (`LivePlan.corroborating_dependency`) instead of a generic parent-span rise. P1-01 remains unverified on this revision, and Payment recovery has still never been demonstrated. See "The Payment fault's behaviour and a scoped premise (`9058671` measured, corrected at `e6232c2`)". |
 | **Payment fault-evidence status (branch tip with this report)** | **PARTIAL** - at `723fe7b` the user's diagnostic capture (30 polls, 00:56:03-01:05:48 UTC, flag armed and restored with a read-back) measured the mismatch decisively: at 00:58:04 checkout's `PlaceOrder` read a **0.3333** error share while the attributed Charge series read 0.0334 calls/s on `checkout`'s client spans and 0.0167 calls/s on `payment`'s, both at **0.0** error share, and the closing polls read a **1.0** caller error share with no Charge traffic at all. The pinned source confirms the injected failure *should* appear on the selected client span (same RPC, same operation name, same `otelgrpc` handler), so the inconsistency is real rather than a selector artefact. The traces that would settle it are unavailable: `_jaeger_traces` sends no `start`/`end`, so the capture's six distinct payloads were unbounded newest-N sets with no trace IDs, and Jaeger's store is bounded by `max_traces` rather than by age *(a bounded store is not a demonstrated eviction - corrected in the trace-query pass below)*. This pass corrected the diagnostic's reporting - four disjoint evidence classes, the *strongest* reading instead of the commonest one (which reported the least informative class by construction), `recovery: assessed: false`, and an exit status that is recorded and printed - and added a bounded read-only trace exporter so the missing evidence can be collected in one shot; both are committed as `56fab5a`. Offline `218 passed, 7 skipped` in both variants; lint, format and `mypy` clean. P1-01 remains unverified and Payment recovery has still never been demonstrated. See "The payment fault-evidence pass (`723fe7b` measured)". |
 | **Trace-query status (branch tip with this report)** | **PARTIAL** - the user's `022150` run (revision `6b7fe61`) is the first to reach the trace exporter: 18 armed observations resolved to 6 `generic_caller_failure_only`, 6 `traffic_without_failure`, 6 `no_usable_observation`, 0 `attributable_failure`, with the strongest-class aggregation working live, and `paymentUnreachable` restored with a read-back. The exporter exited `0` and returned **0 PlaceOrder traces**, and suggested eviction. Auditing the request showed it was well-formed - correct base path, real service names, microsecond UTC bounds, percent-encoded operation, no credentials - while the *entry filter* was an assumption: the pinned collector rewrites span names with `set_semconv_span_name`, the registry already carries two different naming forms, and no run has ever returned this operation. The **read** was the confirmed defect: `read_traces` reported an `observation_window_start/end` it never asked for, since the request carried `lookback` and `limit=20` and no bounds, and the same capture's `charge_traces` payload changed only twice in 18 polls. This pass bounds the read, retains trace IDs and cap/out-of-window provenance, makes an API error raise instead of reading as empty, and rebuilds the exporter as a progressive read-only sequence with an explicit "cause unknown" empty-result explanation; `a686617`. Offline `242 passed, 7 skipped` in both variants; lint, format and `mypy` clean. The historical interval has still not been read, P1-01 is unverified, and Payment recovery has still never been demonstrated. See "The trace-query pass (`6b7fe61` measured)". |
+| **Recovered-trace analysis status (branch tip with this report)** | **PARTIAL** - the user's `025435` run (revision `504fbd0`) is the first to retrieve traces from the fault interval: 17 services, 8 advertised Checkout operations, 40 recent unfiltered Checkout traces, `oteldemo.CheckoutService/PlaceOrder` confirmed in a returned trace, the bounded retrieval check succeeded, and **two** historical traces came back (`ce5e79a180be61a3c87ac161b474ef1d`, `798301119dc69ac06ecc4704cf100bcc`) with the exporter exiting `0`. The extract holds **summaries only**, so the requested ancestry reconstruction cannot be completed from it, and the run's own `evidence.sufficiency: sufficient` was a statement about retrieval presented as a statement about the subject - a claim this report retracts. Reading the summaries against the code shows the confirmed classification defects: the span called the "root" was a `frontend` client span (the load generator's HTTP span above it is the actual root), `child_of_root=False` was an artefact of that selection, both frontend durations (563.9 s, 826.6 s) outlast the 344 s fault interval, and `failed: 0` was computed from one span's direct children while six and nine spans in the same traces recorded errors. This pass resolves root, attempt and edge relationship from `CHILD_OF` references, makes span status three-valued with the deciding signal named, counts errors across the whole trace, fixes the observed-range arithmetic, replaces the single "sufficiency" with a five-level ladder, and corrects the same status defect in the runtime `read_traces` adapter. Offline `256 passed, 7 skipped` in both variants; lint, format and `mypy` clean. The two traces have **not** been positioned against injection and restoration, Payment is neither shown to have served nor to have failed, recovery remains undemonstrated, and P1-01 remains unverified on this revision. See "The recovered-trace analysis pass (`504fbd0` measured)". |
 
 `READY_FOR_DISCUSSION` means every executable technical gate in `docs/phase1.md`
 passed on this commit, including the four primary paths against the real isolated
@@ -1989,6 +1990,12 @@ was asked for, and classifies each retained trace as
 with the failing span's sanitized attributes and error message. It issues HTTP GETs
 only, arms no flag and runs no scenario.
 
+*(This paragraph describes the exporter as the fault-evidence pass left it, including the
+finding vocabulary of that commit. The recovered-trace analysis pass replaced the vocabulary:
+an unqualified `edge_span_present_and_ok` no longer exists, because an OK edge span beside
+failing spans elsewhere is now named as such, and the window asked for is reported beside an
+observed range built from each span's own end.)*
+
 **What is unavailable, precisely:** any trace-level evidence about the 00:56-01:05
 window, because the capture's stored trace payloads are unbounded newest-N sets with
 no trace IDs and the window's traces may already have been evicted by count. The
@@ -2272,6 +2279,116 @@ actually open, in this order:
   retention fact (a working query that cannot find that window) or an unproven query.
 
 Payment recovery remains undemonstrated and P1-01 remains unverified on this revision.
+
+## The recovered-trace analysis pass (`504fbd0` measured) - two traces were summarized by the wrong span and called sufficient
+
+This pass was asked to reconstruct the two recovered traces from their raw spans. The saved
+extract contains **no raw spans** - only the exporter's summaries - and this sandbox cannot
+reach the Jaeger query API to fetch them (`AF_INET 127.0.0.1:51984` -> `[Errno 1] Operation
+not permitted`, re-measured this pass). What follows is therefore what the *summary* plus the
+pinned source and the exporter's own code establish, separated from what remains unknown, and
+the code corrections the summary demonstrated.
+
+### The user's measured run (attributed to the user)
+
+Revision `504fbd0`; log directory `.local/user-live-checks-20260925T025435/`; extract
+`reports/local/payment-trace-path-20260925T025436.json`; fault interval armed 02:21:59 and
+restored 02:27:43 UTC. The read-only exporter exited `0`: 17 services visible, 8 operations
+advertised for `checkout`, 40 recent unfiltered `checkout` traces, `oteldemo.CheckoutService/
+PlaceOrder` confirmed inside a returned trace, the bounded retrieval check around
+`c528d29a914bf9604512e4b4ce3fa21f` succeeding, and two historical traces retained for the
+requested interval. Time unit check: the payload's `startTime` and `duration` are both
+microseconds in the Jaeger v1 query API, and the run's own printed start instants
+(02:24:41 and 02:24:50) match that reading of `started_at_us`, so the durations are
+microseconds too - a 563873173 and an 826600400.
+
+### What the summaries show, and what they do not
+
+| Observation (reported by the run) | What it establishes |
+| --- | --- |
+| The span the exporter called the "root" is `oteldemo.CheckoutService/PlaceOrder` on **`frontend`** | Both `frontend` (client) and `checkout` (server) export that operation name; the exporter picked the longest span carrying the name, and the real root is above it. The `frontend` span's own parent is a span the run did not follow. |
+| `checkout`'s server span appeared as the only "child" | Consistent with the same selection: children were computed for the frontend client span, so the trace was described from the caller's span instead of the measured attempt. |
+| `child_of_root=False` for the Charge span | An artefact of that selection, not a statement about relatedness. A Charge client span is a direct child of the `checkout` server span, which is one hop below the frontend span. |
+| Frontend durations 563873.2 ms and 826600.4 ms | Both exceed the 344 s armed interval by minutes, so a request that began at 02:24:41 cannot have been held by that fault for its whole duration: the spans must end after restoration, or the field is not the one the exporter assumed. Only the raw payload settles which. |
+| Six and nine spans "reported failing", `failed: 0`, `ok: 2`, finding `edge_span_present_and_ok` | The failure count came from one span's direct children only. The traces are neither "successful" nor positioned against injection and restoration. |
+
+Not established by these traces: whether Payment served a request while the fault was armed,
+whether the Charge calls belong to the failing request branch, whether the two retained traces
+are the failing requests at all, and anything about recovery. Two retained traces are not a
+census of the interval, and a successful client span is not a served request - when the callee
+is unreachable its own server span is never created.
+
+### The claim this report retracts
+
+The extract recorded `evidence.sufficiency: sufficient` with the reason "2 retained trace(s)
+were summarized for the requested interval". That sentence is true about *retrieval* and was
+read as a statement about *the subject*: the run had already summarised a trace whose own
+failing-span list contradicted the word "successful" in its own log line. The earlier claim is
+retracted here, and the field is now a ladder rather than a word (below).
+
+### Confirmed defects corrected in this pass
+
+1. **Root, attempt and ancestry were chosen by operation name and duration.** `summarize_trace`
+   took every span whose `operationName` matched, kept the longest, called it the root, and
+   reported a boolean for "is the edge its direct child". It now resolves the **root** as a span
+   whose `CHILD_OF` parent is absent from the payload, the **attempt** as the measured
+   operation's own `SPAN_KIND_SERVER` span, and the edge's **relationship** - `direct_child`,
+   `descendant` at *n* hops, `ancestor`, `unrelated_branch`, or `missing_parent` - by walking
+   parent references. Span and parent IDs are reported for every row, and a parent named but
+   absent is recorded rather than silently treated as a root.
+2. **A trace was called successful from one span.** `trace_failed` inspected the direct children
+   of the chosen span, which is how "`failed: 0`, `ok: 2`" appeared beside nine failing spans.
+   The counts are now `with_error_spans` / `without_error_spans` over the whole trace, and the
+   finding vocabulary says when a successful edge span sits beside failures elsewhere.
+3. **Status ignored every signal but `otel.status_code` and `error`.** A span whose framework
+   wrote `rpc.grpc.status_code = 14`, an HTTP 5xx, an `error.type`/`exception.type` attribute or
+   an exception event was reported `OK`. Status is now three-valued (`ERROR`/`OK`/`UNSET`) and
+   carries the signal that decided it; `UNSET` is never a success. The runtime `read_traces`
+   adapter had the same defect in its own `_span_failed` and now shares the classifier, keeping
+   its requested-window contract and gaining `unset_status_spans` beside `error_spans`.
+4. **The observed range mixed two spans' fields.** `trace_bounds` took the latest *start* and
+   added the longest *duration* in the trace, which can name an instant at which nothing
+   happened; the stage range is now `max(start + duration)` per span. Every reported span also
+   carries its position relative to the window asked for - `before_window`, `starts_before_window`,
+   `during_window`, `crosses_window_end`, `after_window`, `unpositionable` - so a call that ran
+   past restoration is visible as that instead of as a duration to interpret.
+5. **One word conflated five questions.** `evidence` now reports `query_completed`,
+   `traces_retrieved`, `request_path_reconstructed` and a `sufficient_for` block for
+   `request_path_review`, `dependency_attribution` and `recovery`, with the two a trace cannot
+   reach fixed at `false` and their reasons stated. `sufficiency` is `sufficient_for_path_review`
+   or `not_sufficient`; "sufficient" alone is no longer a value.
+
+Nothing in the Payment fault, the scenario objective, the approval requirements, the budgets,
+the retry limits or the recovery thresholds changed, and no selector, limit or wait was
+loosened. The thresholds and scenario remain as `docs/phase1.md` defines them.
+
+### Tests, falsification, and what was executed
+
+New and updated coverage, using a reconstruction of the shape the extract reported rather than
+captured raw spans (which are unavailable): frontend client and checkout server share one
+operation name; the Charge call is a descendant rather than a child of the span chosen by name;
+a successful branch beside failing spans elsewhere; a span crossing the restoration edge; an
+`UNSET` status that is not a success; a gRPC status and an exception event as failure signals;
+a named parent missing from the payload leaving the ancestry unresolved; a stage's observed end
+built per span; and the evidence ladder never claiming attribution or recovery.
+
+| Check | Exact command | Result |
+| --- | --- | --- |
+| Offline suite, operator shell stripped | `scripts/validate.sh --offline-only` stage 02 | **256 passed, 7 skipped, 85 deselected** |
+| Offline suite, live settings force-exported | stage 03 | **256 passed, 7 skipped, 85 deselected** |
+| Lint / format / types | stages 04-06 | `ruff check` clean; `ruff format --check` 89 files; `mypy src/opsaccord` clean, 42 files |
+| Exit-code contract | `scripts/diagnose-payment-trace-path.py` without an endpoint, and with `--limit 0` | `3` refused to start; `2` bad arguments - unchanged |
+| Failure path end to end | the same script against the blocked socket, endpoint file sourced | four failed stages, `query_completed=False`, `sufficiency: not_sufficient`, exit `1`; artifact `.local/sandbox-trace-path-check-20260925T040648/` - **a sandbox run, not a user run** |
+| Integration suite | `pytest -q -m integration` | **not run** - no PostgreSQL in this sandbox |
+
+### What the next read decides
+
+One read-only request per trace ID, saving the sanitized spans, is what turns the table above
+into the ancestry-and-timeline reconstruction the pass was asked for: which span is the root,
+which is the attempt, which branch the Charge calls belong to, where each span's start and end
+sit relative to 02:21:59 and 02:27:43, and which status signal each failing span actually
+carried. No fault is injected, no flag is armed or cleared, and P1-01 is not re-run to obtain
+it. Payment recovery remains undemonstrated and P1-01 remains unverified on this revision.
 
 ## Remaining work and discussion
 
