@@ -2420,13 +2420,49 @@ fault, the scenario, the budgets, the thresholds or the approval path.
 
 Checks executed on this tree: offline `262 passed, 7 skipped, 85 deselected` in both environment
 variants, `ruff check` clean, `ruff format --check` (89 files) clean, `mypy src/opsaccord`
-(42 files) clean - log directory `reports/local/validation-20260925T041505`. Six new tests cover
+(42 files) clean - log directory `reports/local/validation-20260925T041844`. Six new tests cover
 the filter, the missing-name report, the unfiltered historical query and the whole-payload table.
 The new exit path was exercised end to end against this sandbox's blocked socket: four stages
 failed, both named ids were listed as not returned, and the run exited `1`
 (`.local/user-live-checks-20260925T041552/` - **a sandbox run, not a user run**). The integration
 suite is still not executable here: `psycopg.OperationalError: connection is bad` against
 `127.0.0.1:55432`, so it is reported as not run.
+
+### The recovery read against the restarted stack (11:23 UTC) - the two traces are gone
+
+The narrowed read has now run, four times within two minutes, from your terminal. The first
+(11:22:31) used the endpoint file written at 02:54 and hit `[Errno 111] Connection refused` on
+every Jaeger route - that file named port **51984**, and `scripts/demo.sh endpoints` reported
+"the stack is not up", so the endpoint it carried was dead rather than the query being wrong.
+The three runs after it (11:23:23, 11:23:33, 11:23:44) all answered, against a **new** port,
+**65238**, written by `scripts/demo.sh endpoints` at 11:23:25.
+
+That is a replaced Jaeger, not a rotated store. Between 11:23:23 and 11:23:44 the store
+advertised **3, then 10, then 11 services** - a stack registering its services as it boots - and
+at 11:23:44 `checkout` was not among them, with `0` operations advertised for it. Every stage
+answered (`query_completed: true`, `failures: {}`) and every trace query returned `0`: no trace
+in the 02:24:30-02:25:10 interval, and none in the whole two-hour recent window either. Jaeger's
+in-memory store is volatile, so the instance that held `ce5e79a180be61a3c87ac161b474ef1d` and
+`798301119dc69ac06ecc4704cf100bcc` no longer exists.
+
+What that settles and what it costs:
+
+- **The raw spans are permanently unavailable.** This was not retention inside a live store, so
+  no read-only retry will bring them back, and the ancestry/timeline reconstruction of those two
+  traces cannot be completed at all. The 563.9 s and 826.6 s spans' real end times are now
+  unknowable; the report keeps them as reported values with unknown ends rather than guessing.
+- **The miss was reported as a miss.** The 11:23:44 run exercised `--trace-id` live for the first
+  time: two requested, none returned, both listed as not returned with the three causes named,
+  and exit `1`. A run that had answered every query is precisely the run that would previously
+  have been written up as "nothing was retained".
+- **A capture now has to be fresh.** `checkout` was not yet registered in the store at 11:23:44
+  and no `PlaceOrder` traffic had been exported, so a capture started then would have had no
+  Payment path to observe. Any live answer to P1-01 has to wait for the restarted stack to
+  register `checkout` and export `PlaceOrder` traffic, and then run with the fault armed.
+
+Artifacts (this session's reading of your run, not a run by this session):
+`.local/user-live-checks-20260925T112231/`, `.../112323/`, `.../112332/`, `.../112344/` and their
+`reports/local/payment-trace-path-20260925T1122*.json` extracts.
 
 ## Remaining work and discussion
 
