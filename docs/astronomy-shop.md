@@ -230,6 +230,16 @@ both are recorded rather than averaged:
   lies inside the armed period and shows the same thing: Charge has an `UNSET`
   series at 0.050/s from each side and **no** `STATUS_CODE_ERROR` series, while
   PlaceOrder shows `ERROR` at 0.0109/s on both sides.
+* the 2026-09-25 capture (`reports/local/payment-fault-diagnostic-1790297762.json`,
+  revision `723fe7b`, user-run, 30 polls over 00:56:03-01:05:48 UTC with
+  `paymentUnreachable` armed at 00:56:03 and restored to `off` at 01:05:48): the same
+  contradiction, caught in one poll. At 00:58:04 the caller's `PlaceOrder` series read
+  0.0500 calls/s with an **error share of 0.3333**, while the attributed Charge series
+  read 0.0334 calls/s on `checkout`'s client spans and 0.0167 calls/s on `payment`'s
+  server spans - **both at error share 0.0**. Across the whole capture the Charge
+  client series never exceeded 0.0334 calls/s and never reported a non-zero error
+  share, the caller's share reached 1.0 in the closing polls (0.0167 calls/s, every
+  call failing), and not one retained Charge trace carried an error span.
 
 What those two runs do not settle is *why* the 17.66% of PlaceOrder calls failed
 without a failing Charge attempt: whether the running service evaluated the flag as
@@ -237,6 +247,12 @@ false for them, whether they failed before the Charge call for a reason unrelate
 payment, or whether a failing Charge attempt produced no exported client span. The
 `233003` log also carries a four-minute hole in the span-metric series for both
 operations, which is recorded as an observation and not explained.
+
+The 2026-09-25 capture narrows that question to a *trace* question and cannot answer
+it from the metrics it took: the failures are real and simultaneous with successful
+Charge traffic, so the next discriminating fact is which child span the failing
+`PlaceOrder` request actually had. See "Trace reads are not time-bounded" for why the
+trace read as it stands cannot supply it.
 
 The observation that can attribute this class of fault is the **caller's client
 span for the same operation**, which the table above already records as existing:
@@ -258,7 +274,7 @@ If the exposed schema cannot supply those two label names, the read reports
 `attributable: false` with the reason: an instrumentation gap is reported as a
 gap, never as a healthy edge and never as a zero.
 
-Two limits are recorded rather than papered over:
+Three limits are recorded rather than papered over:
 
 * the **client-side error share for this edge is intermittent on the pinned
   stack**: it has been measured at 100% in one run and at 0.0 in another, with the
@@ -272,7 +288,39 @@ Two limits are recorded rather than papered over:
   caller is unhappy, not which dependency is why;
 * a window with no Charge calls proves nothing in either direction, and the
   span-metric cadence means any window shorter than 120s reads as "no data"
-  (see "Two telemetry pipelines, two cadences").
+  (see "Two telemetry pipelines, two cadences"). The **trace** read has a third
+  limit, and it is a defect rather than a calibration - see the next section.
+
+### Trace reads are not time-bounded, so their window is whatever Jaeger still holds
+
+`LiveEnvironment.read_traces` (`src/opsaccord/tools/live_environment.py:598-627`)
+sends `service`, `operation`, `lookback` and `limit=20`, but no `start`/`end`.
+Jaeger's `/api/traces` answers with the newest matching traces, so the reply means
+"the 20 most recent traces for this operation", not "the traces in this window":
+two polls seconds apart return the *same payload* whenever no new matching trace
+completed in between, and the `lookback` only bounds the search, not the result.
+
+The 2026-09-25 capture measures exactly that. Its 30 polls produced only **6 distinct
+payloads**, and 12 consecutive polls shared one payload verbatim; every payload had
+`error_spans: 0` and every span in every payload was `status: OK`. So a trace reading
+here is evidence about *recent* Charge traffic, never about an interval, and it cannot
+reconstruct one that has passed.
+
+Retention makes the second half of that worse. Jaeger runs the in-memory store with
+`max_traces: ${env:MEMORY_MAX_TRACES}` and compose sets `MEMORY_MAX_TRACES=25000`
+(`src/jaeger/config.yml:43`, `compose.observability.yaml:29`), so traces are evicted
+**by count, not by age**. Whether an earlier interval still exists is therefore a
+function of how much traffic has been through the collector since - and the stored
+capture keeps only `name`, `status` and `duration_ms` per span, no trace ID, so that
+question is not answerable from the record either.
+
+`scripts/diagnose-payment-trace-path.py` is the read-only exporter for it. It takes an
+explicit `--start`/`--end` pair (UTC ISO) or `--lookback-minutes`, reports the window
+it could *actually* see rather than the one it was asked for, and classifies each
+retained trace as `edge_span_present_and_failing`,
+`edge_span_absent_with_a_failure_recorded`, `edge_span_absent_no_failure_recorded`,
+`edge_span_present_and_ok` or `no_root_span`. It issues HTTP GETs only, arms no flag,
+runs no scenario, and so has nothing to restore.
 
 ### Health probes are scoped to one service
 
