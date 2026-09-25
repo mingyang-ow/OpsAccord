@@ -166,7 +166,7 @@ sample.
 
 | Fault | Signal | Fault off | Fault armed |
 | --- | --- | --- | --- |
-| `paymentUnreachable=on` | Charge error share (120s window) | 0.0 | ~0.33 |
+| `paymentUnreachable=on` | Charge error share (120s window) | 0.0 | ~0.33 (marginal 2026-09-24 measurement; not reproduced in every run - see "Dependency attribution") |
 | `paymentUnreachable=on` | PlaceOrder error share (90s window) | 0.0 | ~0.75 |
 | `paymentUnreachable=on` | Charge call rate | ~0.075-0.13/s | ~0.042/s |
 | `adHighCpu=on` | ad CPU in cores (120s window) | ~0.010 | ~1.06 |
@@ -179,15 +179,64 @@ predicate may treat "no calls" as "faulted" or as "recovered".
 
 ### Dependency attribution
 
-`paymentUnreachable` is not a payment-side fault. Checkout reads the flag
-(`src/checkout/main.go` at the pinned revision) and fails the call locally, so the
-Charge never arrives: payment serves whatever else reaches it, emits no error span
-for this call, and its own probes stay healthy. The 2026-09-24 live run is the
-measurement of exactly that shape (recorded in
-`docs/reports/phase1-implementation.md`): payment-server `error_rate` 0.0 with
-`calls_per_second` 0.133, checkout `error_rate` rising to 0.333, and no payment-side
-error span, so a diagnosis built only from the target's own telemetry concluded
-"payment-service is serving normally".
+`paymentUnreachable` is not a payment-side fault, and the pinned source says
+exactly what it does. At tag `3.1.0` (commit `dedc0178`) checkout evaluates the flag
+with an empty evaluation context and a `false` default
+(`src/checkout/flags/flags_gen.go:73-91`; the manifest is `src/checkout/flags.json`,
+and the flag itself is an `off`/`on` boolean with no targeting in
+`src/flagd/demo.flagd.json`). When it reads true, `chargeCard` does **not** skip the
+call: it swaps the client for one pointed at an unresolvable address and then issues
+the same Charge against it (`src/checkout/main.go:573-589`):
+
+```go
+func (cs *checkout) chargeCard(ctx context.Context, amount *pb.Money, paymentInfo *pb.CreditCardInfo) (string, error) {
+	paymentService := cs.paymentSvcClient
+	if flags.PaymentUnreachable.Value(ctx, openfeature.EvaluationContext{}) {
+		badAddress := "badAddress:50051"
+		c := mustCreateClient(badAddress)
+		paymentService = pb.NewPaymentServiceClient(c)
+	}
+
+	paymentResp, err := paymentService.Charge(ctx, &pb.ChargeRequest{ ... })
+```
+
+`mustCreateClient` is `grpc.NewClient` with `otelgrpc.NewClientHandler()`
+(`src/checkout/main.go:473-483`), a lazy client, so the failure surfaces on the RPC
+rather than at construction. Source-derived expectations, therefore:
+
+* the caller's own client span for `oteldemo.PaymentService/Charge` is the failing
+  operation, and it is what can attribute the fault;
+* **no** Charge reaches payment while every evaluation returns the armed variant, so
+  payment's own server span carries no error and a successful Charge cannot coexist
+  with a redirected one *for the same request*;
+* the flag document is not the evaluation: a document that reads `on` does not prove
+  the running service evaluated it as true.
+
+Measured behaviour has agreed with that shape in one run and not in another, and
+both are recorded rather than averaged:
+
+* `reports/local/live-scenarios-20260924T131320.json` (revision `b4d80e7`): the
+  attributed edge read 100.00% of 0.033 calls/s on the caller's own client spans, and
+  the payment probe read `NOT_SERVING`, `error_rate` 1.0, because an unscoped
+  operation selector was summing the caller's client spans with the callee's server
+  spans;
+* the 2026-09-24 `233003` run (revision `9058671`): the attributed edge read
+  `attributable: true`, `error_rate` 0.0, `calls_per_second` 0.0125 while checkout's
+  PlaceOrder spans carried a 17.66% failure share, payment served the Charge path
+  normally, and the diagnosis - correctly, on the evidence it had - concluded
+  "payment-service is serving normally and the checkout-service to payment-service
+  path is carrying successful calls". The post-run capture in
+  `.local/user-live-checks-20260924T232852/diagnose-after.log` groups a window that
+  lies inside the armed period and shows the same thing: Charge has an `UNSET`
+  series at 0.050/s from each side and **no** `STATUS_CODE_ERROR` series, while
+  PlaceOrder shows `ERROR` at 0.0109/s on both sides.
+
+What those two runs do not settle is *why* the 17.66% of PlaceOrder calls failed
+without a failing Charge attempt: whether the running service evaluated the flag as
+false for them, whether they failed before the Charge call for a reason unrelated to
+payment, or whether a failing Charge attempt produced no exported client span. The
+`233003` log also carries a four-minute hole in the span-metric series for both
+operations, which is recorded as an observation and not explained.
 
 The observation that can attribute this class of fault is the **caller's client
 span for the same operation**, which the table above already records as existing:
@@ -211,13 +260,38 @@ gap, never as a healthy edge and never as a zero.
 
 Two limits are recorded rather than papered over:
 
-* the **client-side error share for this edge has not yet been measured on the
-  pinned stack** (the run above measured the checkout service probe, not the
-  client-side span series), so the live percentage for the edge is an open item
-  for the next Payment run;
+* the **client-side error share for this edge is intermittent on the pinned
+  stack**: it has been measured at 100% in one run and at 0.0 in another, with the
+  parent-span failure present in both. `scripts/diagnose-payment-fault.py` captures
+  both readings side by side, while the flag is armed, so the next Payment decision
+  is made from a measurement;
+* a scenario's fault premise is established from that attributed caller-side
+  reading, never from the caller's generic parent span: `LivePlan.corroborating_dependency`
+  names the caller whose own client call must show the fault, and a rising
+  `corroborating_target` reading is recorded as context only. A parent span says the
+  caller is unhappy, not which dependency is why;
 * a window with no Charge calls proves nothing in either direction, and the
   span-metric cadence means any window shorter than 120s reads as "no data"
   (see "Two telemetry pipelines, two cadences").
+
+### Health probes are scoped to one service
+
+An operation name is not a service: `oteldemo.PaymentService/Charge` is exported by
+`payment` (`SPAN_KIND_SERVER`) *and* by `checkout` (`SPAN_KIND_CLIENT`), and
+`oteldemo.CheckoutService/PlaceOrder` by `checkout` and `frontend`. Measured label
+names on the pinned stack include `service_name` and `span_kind`
+(`.local/user-live-checks-20260924T232852/diagnose-after.log`), and an unscoped
+`sum(rate(...{span_name='<op>'}[Ws]))` therefore sums both sides.
+
+`read_service_health` and `read_metrics(error_rate)` resolve that label from the
+exposed schema, cache the answer per operation, and scope the selector to the
+target's own spans. The value records `service` and `service_scope` (for example
+`service_name='payment'`), and where the server exposes no service label the read
+says it is *unscoped* rather than presenting an aggregate as one service. The
+semantic consequence, stated because it is a change: a health verdict is now a
+statement about the target's own spans only, so it can no longer be decided by a
+caller's failures (or credited with a caller's successes). "Can the caller reach it"
+is `read_dependency`'s question, and recovery still requires both.
 
 ### Calibrated run parameters
 
