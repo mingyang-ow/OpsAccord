@@ -2289,6 +2289,9 @@ not permitted`, re-measured this pass). What follows is therefore what the *summ
 pinned source and the exporter's own code establish, separated from what remains unknown, and
 the code corrections the summary demonstrated.
 
+Committed as `0a898b8` (the corrections above and their tests) and the records commit on top
+of it, which is this section; `504fbd0` remains the revision the user's run measured.
+
 ### The user's measured run (attributed to the user)
 
 Revision `504fbd0`; log directory `.local/user-live-checks-20260925T025435/`; extract
