@@ -28,6 +28,7 @@ from opsaccord.tools.fault_evidence import (
     classify_reading,
     position_in_window,
     sanitize_span,
+    span_kind_of,
     summarize,
     summarize_trace,
     trace_finding,
@@ -275,7 +276,7 @@ def test_a_failing_edge_span_names_the_service_that_emitted_it() -> None:
         edge_operation=CHARGE,
     )
     assert summary["edge_span"]["service"] == "checkout"
-    assert summary["edge_span"]["span_kind"] == "SPAN_KIND_CLIENT"
+    assert summary["edge_span"]["span_kind"] == "client"
     # The failing call is a *direct child of the measured attempt*, which is what
     # the summary has to say: "is it a child of whichever span was picked" was a
     # different, and misleading, question.
@@ -645,3 +646,104 @@ def test_positions_separate_the_four_sides_of_the_window() -> None:
         position_in_window(None, 1, window_start_us=window_start, window_end_us=window_end)
         == "unpositionable"
     )
+
+
+def test_a_measured_attempt_is_the_operation_s_own_server_span_in_the_live_spelling() -> None:
+    """The live payload writes ``span.kind = "server"``, not ``SPAN_KIND_SERVER``.
+
+    Captured structure, from the 2026-09-25 11:28:33 extract of trace
+    ``290d12a9429910cab4800d4a44b79e43``: the load generator's scenario span is the
+    only parentless span, the frontend's *client* span and checkout's *server* span
+    share one operation name, and the measured edge is absent because the request
+    failed earlier. Reading only the enum spelling found no server span and fell back
+    to the longest span carrying the name - the caller's client span - which reported
+    the measured attempt as its own child and the whole ancestry one level too high.
+    """
+    assert span_kind_of({"span.kind": "server"}) == "server"
+    assert span_kind_of({"span.kind": "SPAN_KIND_SERVER"}) == "server"
+    assert span_kind_of({"span.kind": "Client"}) == "client"
+    assert span_kind_of({"span.kind": "SPAN_KIND_UNSPECIFIED"}) == "unspecified"
+    assert span_kind_of({}) is None
+
+    summary = summarize_trace(
+        {
+            "traceID": TRACE_ID,
+            "spans": [
+                span("lg-root", "user_checkout_multi", "load-generator", kind="internal"),
+                span(
+                    "lg-post",
+                    "POST",
+                    "load-generator",
+                    parent="lg-root",
+                    kind="client",
+                    status="ERROR",
+                ),
+                span(
+                    "fpx-server",
+                    "POST",
+                    "frontend-proxy",
+                    parent="lg-post",
+                    kind="server",
+                    status="ERROR",
+                ),
+                span(
+                    "fe-server",
+                    "POST /api/checkout",
+                    "frontend",
+                    parent="fpx-server",
+                    kind="server",
+                    status="ERROR",
+                ),
+                span(
+                    "fe-client",
+                    PLACE_ORDER,
+                    "frontend",
+                    parent="fe-server",
+                    kind="client",
+                    status="ERROR",
+                ),
+                span(
+                    "ck-server",
+                    PLACE_ORDER,
+                    "checkout",
+                    parent="fe-client",
+                    kind="server",
+                    status="ERROR",
+                    description='failed to prepare order: failed to get product #"L9ECAV7KIM"',
+                ),
+                span(
+                    "ck-getproduct",
+                    "oteldemo.ProductCatalogService/GetProduct",
+                    "checkout",
+                    parent="ck-server",
+                    kind="client",
+                    status="ERROR",
+                ),
+            ],
+            "processes": {
+                "load-generator": {"serviceName": "load-generator"},
+                "frontend-proxy": {"serviceName": "frontend-proxy"},
+                "frontend": {"serviceName": "frontend"},
+                "checkout": {"serviceName": "checkout"},
+            },
+        },
+        root_operation=PLACE_ORDER,
+        edge_operation=CHARGE,
+    )
+
+    assert summary["attempt"]["span_id"] == "ck-server"
+    assert summary["attempt"]["service"] == "checkout"
+    assert summary["attempt"]["span_kind"] == "server"
+    assert summary["attempt_basis"] == "the measured operation's own server span"
+    assert [item["span_id"] for item in summary["ancestors_of_attempt"]] == [
+        "fe-client",
+        "fe-server",
+        "fpx-server",
+        "lg-post",
+        "lg-root",
+    ]
+    assert summary["trace_root"]["span_id"] == "lg-root"
+    assert [item["span_id"] for item in summary["child_spans"]] == ["ck-getproduct"]
+    assert summary["edge_span"] is None
+    # The request failed before the measured edge, so the finding says exactly that.
+    assert trace_finding(summary) == "edge_span_absent_with_a_failure_recorded"

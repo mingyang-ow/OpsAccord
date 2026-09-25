@@ -376,6 +376,35 @@ def span_status_of(span: Mapping[str, Any]) -> tuple[str, str]:
     return span_status(record["attributes"], record["events"])
 
 
+#: The OTLP enum name a kind is written with in the repo's fixtures and in the demo's
+#: metric path (``SPAN_KIND_SERVER``). The live query API's payload writes the
+#: semantic-convention attribute value instead (``server``), so comparisons are made
+#: on the word rather than on either spelling.
+SPAN_KIND_ENUM_PREFIX = "span_kind_"
+
+
+def span_kind_of(attributes: Mapping[str, Any]) -> str | None:
+    """One span's kind as a word - ``server``, ``client``, ``internal`` - or ``None``.
+
+    Two spellings reach this code and they are not interchangeable. The demo's
+    fixtures and its metric path write the OTLP enum name; the spans the live query
+    API returns carry ``span.kind = "server"``, the semantic-convention value. Reading
+    only the enum name is how the attempt of a real trace came to be the caller's
+    identically named *client* span: no span matched ``SPAN_KIND_SERVER``, so the
+    search fell back to the longest span carrying the operation name, which sits one
+    level above the measured attempt and makes its children look like the attempt's
+    children. The raw attribute is still reported verbatim in ``attributes``; this
+    only decides what the comparison sees.
+    """
+    value = attributes.get("span.kind")
+    if value is None:
+        return None
+    word = str(value).strip().lower()
+    if not word:
+        return None
+    return word.removeprefix(SPAN_KIND_ENUM_PREFIX)
+
+
 def position_in_window(
     started_us: Any, duration_us: Any, *, window_start_us: int | None, window_end_us: int | None
 ) -> str:
@@ -503,7 +532,7 @@ def summarize_trace(
             "parent_span_id": parents.get(span_id),
             "operation": record["operation"],
             "service": record["service"],
-            "span_kind": record["attributes"].get("span.kind"),
+            "span_kind": span_kind_of(record["attributes"]),
             "status": record["status"],
             "status_source": record["status_source"],
             "message": record["message"],
@@ -553,7 +582,7 @@ def summarize_trace(
     servers = [
         span_id
         for span_id in candidates
-        if records[span_id]["attributes"].get("span.kind") == "SPAN_KIND_SERVER"
+        if span_kind_of(records[span_id]["attributes"]) == "server"
     ]
     if servers:
         attempt_id = max(
@@ -721,6 +750,7 @@ __all__ = [
     "classify_reading",
     "position_in_window",
     "sanitize_span",
+    "span_kind_of",
     "span_status",
     "span_status_of",
     "summarize",
