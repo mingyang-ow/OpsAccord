@@ -2393,6 +2393,41 @@ sit relative to 02:21:59 and 02:27:43, and which status signal each failing span
 carried. No fault is injected, no flag is armed or cleared, and P1-01 is not re-run to obtain
 it. Payment recovery remains undemonstrated and P1-01 remains unverified on this revision.
 
+### Narrowing that read to the two named traces (`6ebbe48`)
+
+That read has to be about those two ids and nothing else, because the previous page *was* one
+interval's worth of traces and was read as though it were the answer. Two changes were made to
+`scripts/diagnose-payment-trace-path.py` and the classifier it uses, and neither touches the
+fault, the scenario, the budgets, the thresholds or the approval path.
+
+- **`--trace-id` (repeatable) restricts the report to the named traces.** The interval is still
+  queried with explicit microsecond bounds - the store is in memory and the query API has no
+  id-only route this project uses, so a bounded window query is what "fetch this trace id" means
+  here - but the historical query **drops the operation filter**, because a named trace is what
+  the caller wants and an unverified operation name could only exclude it. The stage still
+  records the whole page, so a narrowed report is never mistaken for a smaller page.
+- **A named id the page did not hold is a reported miss, not an absence.** The three causes -
+  rotation, an interval that does not cover the trace's start, and collector loss - are named as
+  the run's own limit rather than resolved by it, and the run exits `1`, so a partial hand-off
+  cannot read as a complete one. A run that answers every query but returns one of two named
+  traces is not a successful run.
+- **`summarize_trace` now returns the whole payload as a table, and the log prints it.** Each row
+  carries both span ids, the service, operation and kind, both timestamps as UTC instants and raw
+  microseconds, the duration, the status *and the signal that decided it*, the position in the
+  window, and the relationship to the measured attempt. The named rows still answer the question;
+  the table is what lets a reader disagree with the answer, because a retry, a sibling branch or
+  the load generator's own span was otherwise absent from the extract entirely.
+
+Checks executed on this tree: offline `262 passed, 7 skipped, 85 deselected` in both environment
+variants, `ruff check` clean, `ruff format --check` (89 files) clean, `mypy src/opsaccord`
+(42 files) clean - log directory `reports/local/validation-20260925T041505`. Six new tests cover
+the filter, the missing-name report, the unfiltered historical query and the whole-payload table.
+The new exit path was exercised end to end against this sandbox's blocked socket: four stages
+failed, both named ids were listed as not returned, and the run exited `1`
+(`.local/user-live-checks-20260925T041552/` - **a sandbox run, not a user run**). The integration
+suite is still not executable here: `psycopg.OperationalError: connection is bad` against
+`127.0.0.1:55432`, so it is reported as not run.
+
 ## Remaining work and discussion
 
 **Blockers (environment, not code):**
