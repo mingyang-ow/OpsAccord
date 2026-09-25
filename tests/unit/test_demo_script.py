@@ -1,0 +1,219 @@
+"""The demo helper's own failure modes, exercised without Docker or a live stack.
+
+``scripts/demo.sh`` is the only path by which live evidence reaches a report, and two
+of its commands were able to make their output *unreadable* rather than obviously
+wrong:
+
+* ``logs`` passed ``"${@:-}"`` to compose, which expands to one **empty** service
+  name when no service was named - compose rejects that, so the documented bare
+  ``demo.sh logs`` could not work;
+* the same command ran inside a caller's ``$( ... )``, where its exit status is
+  invisible, so an empty capture and a failed capture looked identical.
+
+A stub docker binary is enough to pin both, and to pin that a failing ``inspect``
+reports itself instead of printing nothing. No container is started, and the real
+demo checkout is never touched.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+
+from opsaccord.config import REPO_ROOT
+
+DEMO_SCRIPT = REPO_ROOT / "scripts" / "demo.sh"
+SEPARATOR = "\x1f"
+
+STUB = """#!/usr/bin/env bash
+# Records every invocation's argv, one invocation per line, then answers the few
+# subcommands scripts/demo.sh needs. Nothing here touches Docker.
+argv0="$1"
+{
+  printf '%s' "$argv0"
+  shift
+  for arg in "$@"; do printf '%s%s' "$(printf '\\x1f')" "$arg"; done
+  printf '\\n'
+} >>"$STUB_ARGV_LOG"
+case "$argv0" in
+  version) printf '29.7.2\\n' ;;
+  ps) printf '/product-catalog\\n/checkout\\n' ;;
+  inspect)
+    if [ -n "${STUB_INSPECT_RC:-}" ]; then exit "$STUB_INSPECT_RC"; fi
+    case "$*" in
+      *HostConfig*)
+        printf '/product-catalog state=running health=unhealthy restarts=0 exit=0 '
+        printf 'oom_killed=false memory_limit=20971520 nano_cpus=0 '
+        printf 'started=2026-09-25T11:23:30Z healthcheck=[]\\n' ;;
+      *Health.Log*)
+        printf '[{"ExitCode":1,"Output":"failed to connect service :3550 '
+        printf 'within 1s"}]\\n' ;;
+      *GOMEMLIMIT*) printf 'GOMEMLIMIT=16MiB\\n' ;;
+    esac ;;
+  compose)
+    case " $* " in
+      *" port "*)
+        if [ -n "${STUB_COMPOSE_RC:-}" ]; then
+          printf 'compose: port lookup failed\\n' >&2
+          exit "$STUB_COMPOSE_RC"
+        fi
+        printf '0.0.0.0:65235\\n'
+        exit 0 ;;
+    esac
+    printf 'product-catalog stdout line\\n'; exit "${STUB_COMPOSE_RC:-0}" ;;
+  stats)
+    if [ -n "${STUB_STATS_RC:-}" ]; then exit "$STUB_STATS_RC"; fi
+    last=""
+    for arg in "$@"; do last="$arg"; done
+    printf '%s cpu=0.00%% mem=1MiB / 20MiB mem_pct=5.00%% pids=9\\n' "$last" ;;
+esac
+"""
+
+
+def _stub_environment(tmp_path: Path, **extra: str) -> dict[str, str]:
+    """A shell environment that cannot inherit another project's live settings."""
+    stub = tmp_path / "docker-stub"
+    stub.write_text(STUB, encoding="utf-8")
+    stub.chmod(0o755)
+    demo_dir = tmp_path / "demo"
+    demo_dir.mkdir(exist_ok=True)
+    (demo_dir / "compose.yaml").write_text("", encoding="utf-8")
+    (demo_dir / ".env").write_text("", encoding="utf-8")
+
+    inherited = {
+        key: value for key, value in os.environ.items() if not key.startswith("OPSACCORD_")
+    }
+    inherited.update(
+        {
+            "OPSACCORD_DOCKER_BIN": str(stub),
+            "OPSACCORD_DEMO_DIR": str(demo_dir),
+            "OPSACCORD_DEMO_PROJECT": "opsaccord-demo-script-test",
+            "OPSACCORD_DEMO_ENDPOINT_FILE": str(tmp_path / "demo-endpoints.env"),
+            "STUB_ARGV_LOG": str(tmp_path / "argv.log"),
+            **extra,
+        }
+    )
+    return inherited
+
+
+def _invocations(tmp_path: Path, subcommand: str) -> list[list[str]]:
+    log = tmp_path / "argv.log"
+    return [
+        line.split(SEPARATOR)
+        for line in log.read_text(encoding="utf-8").splitlines()
+        if line.startswith(f"{subcommand}{SEPARATOR}")
+    ]
+
+
+def _run(tmp_path: Path, *args: str, **extra: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(DEMO_SCRIPT), *args],
+        cwd=REPO_ROOT,
+        env=_stub_environment(tmp_path, **extra),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def test_logs_forwards_a_named_service_and_no_empty_argument(tmp_path: Path) -> None:
+    result = _run(tmp_path, "logs", "checkout")
+
+    assert result.returncode == 0, result.stderr
+    compose_calls = [argv for argv in _invocations(tmp_path, "compose") if "--tail" in argv]
+    assert len(compose_calls) == 1, compose_calls
+    assert compose_calls[0][-1] == "checkout"
+    assert "" not in compose_calls[0]
+
+
+def test_logs_without_a_service_named_passes_no_empty_name(tmp_path: Path) -> None:
+    result = _run(tmp_path, "logs")
+
+    assert result.returncode == 0, result.stderr
+    compose_calls = [argv for argv in _invocations(tmp_path, "compose") if "--tail" in argv]
+    assert len(compose_calls) == 1, compose_calls
+    # The whole point: the tail bound is the last argument, not an empty service.
+    assert compose_calls[0][-1] == "80"
+    assert "" not in compose_calls[0]
+
+
+def test_a_failed_log_capture_reports_its_status_instead_of_looking_empty(tmp_path: Path) -> None:
+    result = _run(tmp_path, "logs", "checkout", STUB_COMPOSE_RC="7")
+
+    assert result.returncode == 7
+    assert "exited 7" in result.stderr
+
+
+def test_inspect_reports_per_container_state_and_its_own_failures(tmp_path: Path) -> None:
+    ok = _run(tmp_path, "inspect")
+
+    assert ok.returncode == 0, ok.stderr
+    assert "listing project containers exited 0" in ok.stdout
+    assert "state=running health=unhealthy" in ok.stdout
+    assert "restarts=0 exit=0 oom_killed=false" in ok.stdout
+    assert "GOMEMLIMIT=16MiB" in ok.stdout
+
+    failed = _run(tmp_path, "inspect", STUB_INSPECT_RC="1")
+
+    assert failed.returncode == 1
+    assert "failed" in failed.stderr
+
+
+def test_logs_bounds_its_window_only_when_asked(tmp_path: Path) -> None:
+    """A line bound alone can span hours on the collector; the window is opt-in."""
+    unbounded = _run(tmp_path, "logs", "otel-collector")
+    assert unbounded.returncode == 0, unbounded.stderr
+    assert "--since" not in unbounded.stdout
+
+    bounded = _run(tmp_path, "logs", "otel-collector", OPSACCORD_DEMO_LOG_SINCE="20m")
+    assert bounded.returncode == 0, bounded.stderr
+    compose_calls = [argv for argv in _invocations(tmp_path, "compose") if "--tail" in argv]
+    assert len(compose_calls) == 2, compose_calls
+    assert "--since" not in compose_calls[0]
+    assert compose_calls[1][-3:] == ["--since", "20m", "otel-collector"]
+
+
+def test_stats_samples_twice_and_reports_a_failure(tmp_path: Path) -> None:
+    ok = _run(tmp_path, "stats", OPSACCORD_DEMO_STATS_SLEEP="0")
+
+    assert ok.returncode == 0, ok.stderr
+    samples = _invocations(tmp_path, "stats")
+    assert len(samples) == 2, samples
+    assert samples[0][:3] == ["stats", "--no-stream", "--format"]
+    assert samples[0][-3:] == ["product-catalog", "checkout", "payment"]
+    assert "cpu=" in ok.stdout
+
+    failed = _run(tmp_path, "stats", OPSACCORD_DEMO_STATS_SLEEP="0", STUB_STATS_RC="1")
+    assert failed.returncode == 1
+
+
+def test_the_health_probe_surface_covers_the_measured_path() -> None:
+    """A keep-the-list-honest guard, because the gap was real.
+
+    ``demo.sh health`` probes the ports listed in ``ENDPOINTS`` and nothing else, and
+    ``PRODUCT_CATALOG`` was missing from that list while the catalog was the failing
+    service - so the health command that is meant to show the stack's surface could
+    not show it. This asserts the list, not the probe behaviour, which needs Docker.
+    """
+    script = DEMO_SCRIPT.read_text(encoding="utf-8")
+
+    for name in ("CHECKOUT", "PRODUCT_CATALOG", "PAYMENT"):
+        assert f'"{name} ' in script, f"{name} is not on the health probe surface"
+
+
+def test_endpoints_names_the_real_cause_when_it_cannot_resolve(tmp_path: Path) -> None:
+    """`endpoints` must not blame a stopped stack for a Docker failure.
+
+    The script's port lookup discards the compose error inside its command
+    substitution, so the old message always said "the stack is not up". That is the
+    wrong instruction when the engine never answered, and the pasted evidence block
+    treats this command as its stop condition.
+    """
+    result = _run(tmp_path, "endpoints", STUB_COMPOSE_RC="3")
+
+    assert result.returncode == 1
+    assert "cannot resolve the stack" in result.stderr
+    assert "exited 3" in result.stderr
+    assert not (tmp_path / "demo-endpoints.env").exists()
