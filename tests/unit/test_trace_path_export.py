@@ -432,8 +432,13 @@ def test_a_summarised_trace_keeps_its_identifier_and_finding(export: Any) -> Non
 
     summary = result["traces"][0]
     assert summary["trace_id"] == "t1"
-    assert summary["root_found"] is True
-    assert summary["finding"] == "edge_span_present_and_ok"
+    assert summary["attempt_found"] is True
+    # The fixture's own root span records ERROR and its Charge span records OK:
+    # both facts are reported, and the finding says so instead of calling the
+    # trace successful on the strength of one child span.
+    assert summary["finding"] == "edge_span_present_and_ok_with_failures_elsewhere"
+    assert summary["has_error_spans"] is True
+    assert summary["edge_span"]["relationship"] == "direct_child"
     assert summary["edge_span"]["operation"] == CHARGE
 
 
@@ -544,7 +549,122 @@ def test_the_extract_is_written_with_its_stages_and_evidence(
     extract = json.loads(out.read_text())
     assert extract["exit_status"] == 0
     assert extract["failures"] == {}
-    assert extract["counts"] == {"traces": 1, "failed": 1, "ok": 0}
+    assert extract["counts"] == {"traces": 1, "with_error_spans": 1, "without_error_spans": 0}
     assert extract["services_visible"] == sorted(SERVICES)
-    assert extract["evidence"]["sufficiency"] == "sufficient"
+    assert extract["evidence"]["query_completed"] is True
+    assert extract["evidence"]["traces_retrieved"] == 1
+    assert extract["evidence"]["request_path_reconstructed"] is True
+    assert extract["evidence"]["sufficiency"] == "sufficient_for_path_review"
+    # Retrieving a trace never licenses a claim about the dependency or recovery.
+    assert extract["evidence"]["sufficient_for"]["dependency_attribution"]["sufficient"] is False
+    assert extract["evidence"]["sufficient_for"]["recovery"]["sufficient"] is False
     assert extract["stages"]["services"]["caller_service_visible"] is True
+
+
+# --- the bounds, the counts and the ladder ----------------------------------
+
+
+def test_a_stage_reports_the_latest_span_end_its_traces_reached(export: Any) -> None:
+    """One span's start plus another span's duration is not an instant in the trace.
+
+    The interval a stage reports has to be built per span: the previous version
+    paired the latest *start* with the longest *duration*, which for a trace with a
+    long early span and a short late one reported an end well past either.
+    """
+    start = HISTORICAL[0]
+    trace_ = place_order_trace("t1", start_us=start)
+    trace_["spans"][0]["duration"] = 600 * SECOND  # ends exactly on the window's end
+    trace_["spans"][1]["startTime"] = start + 300 * SECOND
+    trace_["spans"][1]["duration"] = 1
+
+    result = probe(export, FakeJaeger(traces=[trace_]))
+
+    stage = result["stages"]["historical"]
+    assert stage["observed_start"] == iso_of(start)
+    assert stage["observed_end"] == iso_of(start + 600 * SECOND)
+    # The mixed-up arithmetic would have reported start + 900 s, outside the window.
+    assert stage["observed_end"] != iso_of(start + 900 * SECOND)
+
+
+def test_a_trace_counts_as_error_bearing_when_any_span_failed(export: Any) -> None:
+    trace_ = place_order_trace("t1", start_us=HISTORICAL[0], charge_status="OK", root_status="OK")
+    trace_["spans"].append(
+        {
+            "traceID": "t1",
+            "spanID": "t1-lg",
+            "operationName": "POST",
+            "processID": "load-generator",
+            "startTime": HISTORICAL[0] + 10,
+            "duration": 20,
+            "tags": [{"key": "otel.status_code", "value": "ERROR"}],
+        }
+    )
+    trace_["processes"]["load-generator"] = {"serviceName": "load-generator"}
+
+    result = probe(export, FakeJaeger(traces=[trace_]))
+
+    summary = result["traces"][0]
+    assert summary["edge_span"]["status"] == "OK"
+    assert summary["has_error_spans"] is True
+    assert summary["finding"] == "edge_span_present_and_ok_with_failures_elsewhere"
+
+
+def test_spans_that_cross_the_restoration_edge_are_positioned_in_the_extract(
+    export: Any,
+) -> None:
+    """The window asked for is the fault interval, so its edges are injection and restoration."""
+    start = HISTORICAL[0]
+    trace_ = place_order_trace("t1", start_us=start)
+    trace_["spans"][0]["duration"] = 900 * SECOND  # runs past the window's end
+
+    result = probe(export, FakeJaeger(traces=[trace_]))
+
+    summary = result["traces"][0]
+    assert summary["attempt"]["position"] == "crosses_window_end"
+    assert summary["span_position_counts"]["crosses_window_end"] == 1
+    described = export.describe(summary, summary["finding"])
+    assert "position=crosses_window_end" in described
+    assert "(otel.status_code)" in described
+    assert "relationship=direct_child" in described
+
+
+def test_evidence_says_the_path_was_not_reconstructed(export: Any) -> None:
+    """A retrieved trace that misses the edge is not a reconstructed request path."""
+    fake = FakeJaeger(
+        traces=[place_order_trace("t1", start_us=HISTORICAL[0], charge_present=False)]
+    )
+
+    result = probe(export, fake)
+    evidence = export.evidence_ladder(
+        stages=result["stages"],
+        failures=result["failures"],
+        summaries=result["traces"],
+        empty_reason="",
+    )
+
+    assert evidence["traces_retrieved"] == 1
+    assert evidence["request_path_reconstructed"] is False
+    assert evidence["sufficiency"] == "not_sufficient"
+    assert evidence["sufficient_for"]["request_path_review"]["sufficient"] is False
+    assert "not reconstructed" in evidence["sufficient_for"]["request_path_review"]["reason"]
+
+
+def test_a_capped_page_is_reported_beside_every_claim_it_limits(export: Any) -> None:
+    fake = FakeJaeger(
+        traces=[
+            place_order_trace(f"t{index}", start_us=HISTORICAL[0] + index * 100)
+            for index in range(3)
+        ]
+    )
+
+    result = probe(export, fake, limit=2)
+    evidence = export.evidence_ladder(
+        stages=result["stages"],
+        failures=result["failures"],
+        summaries=result["traces"],
+        empty_reason="",
+    )
+
+    assert evidence["capped"] is True
+    assert "capped" in evidence["reason"]
+    assert "capped" in evidence["sufficient_for"]["request_path_review"]["reason"]

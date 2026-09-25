@@ -315,6 +315,46 @@ def test_traces_read_counts_error_spans_from_jaeger_tags() -> None:
     assert result.value["error_spans"] == 1
 
 
+def test_traces_read_shares_the_classifiers_status_signals() -> None:
+    """A protocol status counts, and a span with no status is not counted as healthy.
+
+    The adapter's own check used to read only ``otel.status_code`` and ``error``,
+    so a span whose framework wrote ``rpc.grpc.status_code = 14`` was reported
+    healthy in the very reading the controller keeps as a second, independent
+    signal about the dependency.
+    """
+    stack = FakeStack(
+        traces=[
+            {
+                "traceID": "abc123",
+                "spans": [
+                    {
+                        "operationName": "oteldemo.PaymentService/Charge",
+                        "duration": 2_500,
+                        "tags": [{"key": "rpc.grpc.status_code", "value": "14"}],
+                    },
+                    {
+                        "operationName": "oteldemo.PaymentService/Charge",
+                        "duration": 1_500,
+                        "tags": [],
+                    },
+                ],
+            }
+        ]
+    )
+    environment = build(stack)
+
+    result = environment.read_traces(
+        target="payment-service", operation="Charge", window_seconds=300, timeout_seconds=2.0
+    )
+
+    assert result.value["error_spans"] == 1
+    assert result.value["unset_status_spans"] == 1
+    assert [span["status"] for span in result.value["spans"]] == ["ERROR", "UNSET"]
+    assert result.value["spans"][0]["status_source"] == "rpc.grpc.status_code"
+    assert result.value["spans"][1]["status_source"] == "no status signal"
+
+
 def test_traces_read_refuses_an_operation_the_revision_does_not_export() -> None:
     """An unverified span name must fail closed rather than query blind."""
     stack = FakeStack()

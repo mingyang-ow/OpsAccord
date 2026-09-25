@@ -43,6 +43,11 @@ from opsaccord.tools.contracts import (
     dependency_operation,
 )
 from opsaccord.tools.demo_environment import DEFAULT_RUNBOOKS, REVISION, REVISION_SOURCE
+from opsaccord.tools.fault_evidence import (
+    SPAN_STATUS_ERROR,
+    SPAN_STATUS_UNSET,
+    span_status_of,
+)
 
 # Metric and span series names come from the OTLP -> Prometheus pipeline and the
 # spanmetrics connector of the pinned collector config. More than one name is
@@ -645,6 +650,18 @@ class LiveEnvironment:
     def read_traces(
         self, *, target: str, operation: str, window_seconds: int, timeout_seconds: float
     ) -> ToolResult:
+        """One bounded trace read for the target's verified span, and its provenance.
+
+        The window is *requested* with explicit microsecond bounds and reported
+        back unchanged, so a reading is never described by a window it did not ask
+        for. A returned trace may reach outside that window, because the store
+        matches on a trace's start and hands back whole traces: those spans are
+        still counted and described, and ``spans_outside_window`` says how many
+        start outside the bounds so they cannot be read as in-window evidence.
+        Status is three-valued (``ERROR``/``OK``/``UNSET``) and carries the signal
+        that decided it, because a span whose service recorded no status is not a
+        success.
+        """
         live = self._target(target)
         span_name = self._span_name(live, operation)
         if span_name is None:
@@ -672,20 +689,27 @@ class LiveEnvironment:
         )
         spans: list[dict[str, Any]] = []
         error_spans = 0
+        unset_status_spans = 0
         outside_window = 0
         for trace in traces:
             for span in trace.get("spans", []):
                 if span.get("operationName") != span_name:
                     continue
-                failed = _span_failed(span)
-                error_spans += 1 if failed else 0
+                status, status_source = span_status_of(span)
+                error_spans += 1 if status == SPAN_STATUS_ERROR else 0
+                unset_status_spans += 1 if status == SPAN_STATUS_UNSET else 0
                 started_us = span.get("startTime")
                 if isinstance(started_us, (int, float)) and not start_us <= started_us <= end_us:
                     outside_window += 1
                 spans.append(
                     {
                         "name": span.get("operationName"),
-                        "status": "ERROR" if failed else "OK",
+                        # Three-valued: a span whose service wrote no status is
+                        # ``UNSET``, not a success. The signal that decided it is
+                        # reported beside it so a caller can weigh "an explicit
+                        # error", "an explicit OK", and "nothing recorded".
+                        "status": status,
+                        "status_source": status_source,
                         "duration_ms": round(float(span.get("duration", 0)) / 1000.0, 3),
                     }
                 )
@@ -701,6 +725,7 @@ class LiveEnvironment:
                 "spans": spans[:20],
                 "span_count": len(spans),
                 "error_spans": error_spans,
+                "unset_status_spans": unset_status_spans,
                 # Provenance, so a caller can weigh the reading instead of
                 # trusting it: which traces answered, whether the page was
                 # capped, and whether any span fell outside the bounds asked for.
@@ -1145,20 +1170,6 @@ class LiveEnvironment:
         if current == applied["variant"]:
             return ActionOutcome.CONFIRMED_APPLIED
         return ActionOutcome.UNKNOWN
-
-
-def _span_failed(span: dict[str, Any]) -> bool:
-    for tag in span.get("tags") or []:
-        key = str(tag.get("key", ""))
-        value = tag.get("value")
-        if key in {"otel.status_code", "status.code"} and str(value).upper() in {
-            "ERROR",
-            "STATUS_CODE_ERROR",
-        }:
-            return True
-        if key == "error" and str(value).lower() in {"true", "1"}:
-            return True
-    return False
 
 
 __all__ = [

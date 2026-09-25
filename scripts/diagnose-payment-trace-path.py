@@ -38,9 +38,23 @@ mean the dependency was healthy - when the callee is unreachable its server span
 is never created, so its absence is expected. A capped page is a lower bound on
 matching traffic, never a census.
 
-The ``evidence`` block separates command completion from evidence sufficiency:
-the command can complete (``exit_status`` 0) and still return nothing usable, in
-which case ``evidence.sufficiency`` is ``not_sufficient`` and says why.
+The ``evidence`` block separates five things that are not the same: the query
+completed, traces came back, the relevant request path was reconstructed from the
+payload's own parent references, the evidence is sufficient for a particular
+diagnosis, and the evidence is sufficient for recovery. Retrieving two traces
+answers the first two and never, by itself, the last one.
+
+Three things are read from the payload's references instead of assumed, because
+assuming them is how a run comes to describe a trace by the wrong span: the
+**root** is a span whose parent is not in the payload (a load generator's HTTP
+span, not the frontend's client span the operation name also matches), the
+**attempt** is the measured operation's own server span, and the edge's
+**relationship** to the attempt is a walk over parent references - direct child,
+descendant, ancestor, unrelated branch, or unresolved because a named parent is
+missing. Each reported span carries both timestamps, its duration, its status
+*and the signal that decided that status*, and its position relative to the
+window asked for, so a call that ended minutes after the window is visible as
+such rather than as a duration to interpret.
 
 Usage (after ``scripts/demo.sh endpoints`` has written the endpoint file):
 
@@ -61,7 +75,7 @@ import os
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -73,6 +87,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 import httpx  # noqa: E402
 
 from opsaccord.tools.fault_evidence import (  # noqa: E402
+    SPAN_STATUS_ERROR,
     summarize_trace,
     trace_finding,
 )
@@ -120,17 +135,33 @@ def iso_to_micros(value: str) -> int:
 
 
 def trace_bounds(trace: dict[str, Any]) -> tuple[float, float]:
+    """The earliest span start and the latest span end in one trace, in seconds.
+
+    Each end is that span's own ``start + duration``. The previous version took
+    the latest *start* and added the longest *duration* in the trace, which can
+    pair one span's start with another span's duration and report an instant at
+    which nothing in the trace happened; both are microsecond fields of the same
+    payload, so the arithmetic is only meaningful per span.
+    """
     starts = [float(span.get("startTime") or 0) for span in trace.get("spans") or []]
-    durs = [float(span.get("duration") or 0) for span in trace.get("spans") or []]
+    ends = [
+        float(span.get("startTime") or 0) + float(span.get("duration") or 0)
+        for span in trace.get("spans") or []
+    ]
     if not starts:
         return 0.0, 0.0
-    return min(starts) / 1e6, (max(starts) + max(durs)) / 1e6
+    return min(starts) / 1e6, max(ends) / 1e6
 
 
-def trace_failed(trace: dict[str, Any], summary: dict[str, Any]) -> bool:
-    if (summary.get("root") or {}).get("status") == "ERROR":
-        return True
-    return any(span.get("status") == "ERROR" for span in summary.get("child_spans") or [])
+def trace_has_error_spans(summary: dict[str, Any]) -> bool:
+    """Whether *any* span in the trace was reported failing.
+
+    Asking only about the direct children of one chosen span reported a trace as
+    successful while nine spans in it recorded errors, which is how a retained
+    trace came to be logged as a "successful trace" beside its own list of failing
+    spans.
+    """
+    return bool((summary.get("span_status_counts") or {}).get(SPAN_STATUS_ERROR))
 
 
 def trace_ids(traces: list[dict[str, Any]]) -> list[str]:
@@ -272,60 +303,98 @@ class ProbeRequest:
         return {"start": iso(self.recent_start_us / 1e6), "end": iso(self.recent_end_us / 1e6)}
 
 
+def span_row(record: Mapping[str, Any]) -> str:
+    """One span as one row: identity, ancestry, timing, status and position.
+
+    Both timestamps are printed as UTC instants *and* as the raw microsecond
+    fields they came from, so the units can be checked rather than trusted: the
+    query API reports ``startTime`` and ``duration`` in microseconds, and a row
+    whose end lands minutes after the interval's end is a fact about the trace,
+    not a formatting artefact.
+    """
+    started = record.get("started_at_us")
+    ended = record.get("ends_at_us")
+    started_at = int(started) if started is not None else None
+    ends_at = int(ended) if ended is not None else None
+    row = (
+        f"{record.get('span_id')} <- {record.get('parent_span_id') or '(none)'} "
+        f"{record.get('service')}/{record.get('operation')} "
+        f"kind={record.get('span_kind')} status={record.get('status')}"
+        f"({record.get('status_source')}) "
+        f"start={iso(started_at / 1e6) if started_at else '?'}@{started_at} "
+        f"end={iso(ends_at / 1e6) if ends_at else '?'}@{ends_at} "
+        f"duration_ms={(record.get('duration_us') or 0) / 1000.0:.1f} "
+        f"position={record.get('position')}"
+    )
+    if record.get("relationship"):
+        row += (
+            f" relationship={record['relationship']}"
+            f" hops_from_attempt={record.get('hops_from_attempt')}"
+        )
+    if record.get("message"):
+        row += f" message={record['message']!r}"
+    return row
+
+
 def describe(summary: dict[str, Any], finding: str) -> str:
-    root = summary.get("root") or {}
-    lines = [
-        f"  root: {root.get('operation')} service={root.get('service')} "
-        f"status={root.get('status')} duration_ms="
-        f"{(root.get('duration_us') or 0) / 1000.0:.1f} message={root.get('message')!r}",
-        "  children: "
-        + (
-            " | ".join(
-                f"{child['operation']}({child.get('service')},{child.get('span_kind')},"
-                f"{child['status']})"
-                for child in summary.get("child_spans") or []
-            )
-            or "(none)"
-        ),
-    ]
+    """The spans that answer the question, as a table, plus what was unresolved."""
+    attempt = summary.get("attempt") or {}
+    root = summary.get("trace_root") or {}
     edge = summary.get("edge_span")
+    lines = [
+        f"  spans in the payload: {summary.get('spans_seen')}",
+        f"  attempt ({summary.get('attempt_basis')}): {span_row(attempt) if attempt else '(none)'}",
+        f"  trace root ({summary.get('root_basis')}): "
+        f"{span_row(root) if root else '(unresolved)'} "
+        f"root candidates={summary.get('root_count')}",
+        "  ancestors of the attempt, nearest first:",
+        *[f"    {span_row(item)}" for item in summary.get("ancestors_of_attempt") or []],
+        "  children of the attempt:",
+        *[f"    {span_row(item)}" for item in summary.get("child_spans") or []],
+        "  edge: " + (span_row(edge) if edge else "absent from the whole trace"),
+    ]
+    if summary.get("other_edge_spans"):
+        lines.append("  other spans carrying the edge operation:")
+        lines.extend(f"    {span_row(item)}" for item in summary["other_edge_spans"])
+    lines.append("  spans reported failing:")
+    lines.extend(f"    {span_row(item)}" for item in summary.get("failed_spans") or [])
+    if not summary.get("failed_spans"):
+        lines.append("    (none)")
     lines.append(
-        "  edge: "
-        + (
-            f"{edge['operation']} service={edge.get('service')} kind={edge.get('span_kind')} "
-            f"status={edge['status']} child_of_root={edge.get('child_of_root')} "
-            f"message={edge.get('message')!r}"
-            if edge
-            else "absent from the whole trace"
-        )
+        f"  status counts: {summary.get('span_status_counts')} "
+        f"positions: {summary.get('span_position_counts')}"
     )
-    failed = summary.get("failed_spans") or []
-    lines.append(
-        "  failing spans: "
-        + (
-            " | ".join(
-                f"{span['operation']}({span.get('service')},{span.get('span_kind')}) "
-                f"message={span.get('message')!r}"
-                for span in failed
-            )
-            or "(none)"
+    if summary.get("missing_parent_ids"):
+        lines.append(
+            f"  parents named but absent from the payload: {summary['missing_parent_ids']}"
         )
-    )
+    if summary.get("ancestry_truncated"):
+        lines.append("  the attempt's own ancestry is unresolved: a named parent is missing")
     lines.append(f"  finding: {finding}")
     return "\n".join(lines)
 
 
-def summarize_traces(traces: list[dict[str, Any]], *, root_operation: str) -> list[dict[str, Any]]:
-    """One reportable summary per retained trace, newest last."""
+def summarize_traces(
+    traces: list[dict[str, Any]],
+    *,
+    root_operation: str,
+    window: tuple[int, int] | None = None,
+) -> list[dict[str, Any]]:
+    """One reportable summary per retained trace, earliest first."""
     summaries: list[dict[str, Any]] = []
     for trace in traces:
         summary = summarize_trace(
-            trace, root_operation=root_operation, edge_operation=EDGE_OPERATION
+            trace,
+            root_operation=root_operation,
+            edge_operation=EDGE_OPERATION,
+            window_start_us=window[0] if window else None,
+            window_end_us=window[1] if window else None,
         )
-        summary["failed"] = trace_failed(trace, summary)
+        summary["has_error_spans"] = trace_has_error_spans(summary)
         summary["finding"] = trace_finding(summary)
         bounds = trace_bounds(trace)
         summary["started_at"] = iso(bounds[0]) if bounds[0] else None
+        summary["ended_at"] = iso(bounds[1]) if bounds[1] else None
         summaries.append(summary)
     summaries.sort(key=lambda item: item.get("started_at") or "")
     return summaries
@@ -511,7 +580,87 @@ def run_probe(client: JaegerClient, request: ProbeRequest) -> dict[str, Any]:
         "failures": failures,
         "services_visible": sorted(str(name) for name in services),
         "operation_analysed": chosen,
-        "traces": summarize_traces(historical, root_operation=chosen),
+        "traces": summarize_traces(
+            historical,
+            root_operation=chosen,
+            window=(request.window_start_us, request.window_end_us),
+        ),
+    }
+
+
+def evidence_ladder(
+    *,
+    stages: dict[str, Any],
+    failures: dict[str, str],
+    summaries: list[dict[str, Any]],
+    empty_reason: str,
+) -> dict[str, Any]:
+    """What this run established, level by level, and what it did not.
+
+    Two retained traces are enough to look at a request path and nowhere near
+    enough to conclude that a dependency served requests or that a service
+    recovered. Collapsing those into one word - "sufficient" - is what let a run
+    that had merely retrieved two traces be read as a statement about the fault.
+    The levels are therefore separate, and the two a trace cannot reach say why.
+    """
+    retrieved = len(summaries)
+    capped = bool((stages.get("historical") or {}).get("truncated"))
+    reconstructed = any(
+        item.get("attempt_found")
+        and (item.get("edge_span") or {}).get("relationship")
+        in {"direct_child", "descendant", "same_span", "ancestor"}
+        for item in summaries
+    )
+    cap_note = "; the page was capped, so the counts are a lower bound" if capped else ""
+    claims = {
+        "request_path_review": {
+            "sufficient": bool(summaries) and reconstructed,
+            "reason": (
+                f"{retrieved} retained trace(s) were reconstructed from their own parent "
+                "references, so which span is which and which span hangs from which can be "
+                "read off the extract" + cap_note
+                if reconstructed
+                else "a trace carries the measured operation, but no edge span could be tied "
+                "to the measured attempt through parent references, so the relevant request "
+                "path was not reconstructed" + cap_note
+            ),
+        },
+        "dependency_attribution": {
+            "sufficient": False,
+            "reason": (
+                "a retained span says what its own service recorded and nothing more: a client "
+                "span with no error is not proof that the dependency served the call (when the "
+                "callee is unreachable its own server span is never created), and no span here "
+                "measures the dependency's side of the edge"
+            ),
+        },
+        "recovery": {
+            "sufficient": False,
+            "reason": (
+                "recovery is a fresh post-restoration health question; a retained trace "
+                "describes what happened inside an interval and cannot show that a service is "
+                "serving now"
+            ),
+        },
+    }
+    if summaries:
+        reason = f"{retrieved} retained trace(s) were summarized for the requested interval"
+        if capped:
+            reason += "; the page was capped, so the counts are a lower bound"
+    else:
+        reason = empty_reason
+    return {
+        "query_completed": not failures,
+        "traces_retrieved": retrieved,
+        "request_path_reconstructed": reconstructed,
+        "sufficient_for": claims,
+        "capped": capped,
+        "sufficiency": (
+            "sufficient_for_path_review"
+            if claims["request_path_review"]["sufficient"]
+            else "not_sufficient"
+        ),
+        "reason": reason,
     }
 
 
@@ -535,7 +684,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--max-traces", type=int, default=DEFAULT_MAX_TRACES)
-    parser.add_argument("--max-success", type=int, default=DEFAULT_MAX_SUCCESS)
+    parser.add_argument(
+        "--max-success",
+        "--max-no-error-traces",
+        dest="max_success",
+        type=int,
+        default=DEFAULT_MAX_SUCCESS,
+        help="how many traces that recorded no error span to describe (default: 2)",
+    )
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)
 
@@ -581,7 +737,7 @@ def main(argv: list[str] | None = None) -> int:
         "failures": {},
         "services_visible": [],
         "traces": [],
-        "counts": {"traces": 0, "failed": 0, "ok": 0},
+        "counts": {"traces": 0, "with_error_spans": 0, "without_error_spans": 0},
         "finding_counts": {},
         "evidence": {},
         "exit_status": 0,
@@ -604,9 +760,13 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         client.close()
 
-    failing = [item for item in summaries if item.get("failed")]
-    successful = [item for item in summaries if not item.get("failed")]
-    extract["counts"] = {"traces": len(summaries), "failed": len(failing), "ok": len(successful)}
+    failing = [item for item in summaries if item.get("has_error_spans")]
+    without_errors = [item for item in summaries if not item.get("has_error_spans")]
+    extract["counts"] = {
+        "traces": len(summaries),
+        "with_error_spans": len(failing),
+        "without_error_spans": len(without_errors),
+    }
     extract["finding_counts"] = dict(Counter(item["finding"] for item in summaries))
     extract["traces"] = summaries
     if summaries:
@@ -619,30 +779,32 @@ def main(argv: list[str] | None = None) -> int:
             f"{extract['retained_window_seen']['latest']}"
         )
     for label, chosen_traces in (
-        ("failing", failing[: args.max_traces]),
-        ("successful", successful[: max(args.max_success, 0)]),
+        ("trace with error spans", failing[: args.max_traces]),
+        ("trace without error spans", without_errors[: max(args.max_success, 0)]),
     ):
         for item in chosen_traces:
-            log(f"[{label} trace] id={item.get('trace_id')} started={item.get('started_at')}")
+            log(
+                f"[{label}] id={item.get('trace_id')} started={item.get('started_at')} "
+                f"ended={item.get('ended_at')} finding={item['finding']}"
+            )
             for line in describe(item, item["finding"]).splitlines():
                 log(line)
     log(f"trace counts: {extract['counts']} findings: {extract['finding_counts']}")
 
-    if summaries:
-        capped = (extract["stages"].get("historical") or {}).get("truncated")
-        evidence = {
-            "sufficiency": "sufficient",
-            "reason": (
-                f"{len(summaries)} retained trace(s) were summarized for the requested interval"
-                f"{'; the page was capped, so the counts are a lower bound' if capped else ''}"
-            ),
-        }
-    else:
-        evidence = {
-            "sufficiency": "not_sufficient",
-            "reason": empty_result_reason(extract["stages"], extract["failures"]),
-        }
+    evidence = evidence_ladder(
+        stages=extract["stages"],
+        failures=extract["failures"],
+        summaries=summaries,
+        empty_reason=empty_result_reason(extract["stages"], extract["failures"]),
+    )
     extract["evidence"] = evidence
+    log(
+        f"evidence: query_completed={evidence['query_completed']} "
+        f"traces_retrieved={evidence['traces_retrieved']} "
+        f"request_path_reconstructed={evidence['request_path_reconstructed']}"
+    )
+    for name, claim in sorted(evidence["sufficient_for"].items()):
+        log(f"  sufficient for {name}: {claim['sufficient']} - {claim['reason']}")
     log(f"evidence sufficiency: {evidence['sufficiency']} - {evidence['reason']}")
     log(
         f"query completion: exit status {exit_status}"

@@ -26,6 +26,7 @@ from opsaccord.tools.fault_evidence import (
     NO_USABLE_OBSERVATION,
     TRAFFIC_WITHOUT_FAILURE,
     classify_reading,
+    position_in_window,
     sanitize_span,
     summarize,
     summarize_trace,
@@ -275,7 +276,13 @@ def test_a_failing_edge_span_names_the_service_that_emitted_it() -> None:
     )
     assert summary["edge_span"]["service"] == "checkout"
     assert summary["edge_span"]["span_kind"] == "SPAN_KIND_CLIENT"
-    assert summary["edge_span"]["child_of_root"] is True
+    # The failing call is a *direct child of the measured attempt*, which is what
+    # the summary has to say: "is it a child of whichever span was picked" was a
+    # different, and misleading, question.
+    assert summary["attempt"]["span_id"] == "root"
+    assert summary["edge_span"]["relationship"] == "direct_child"
+    assert summary["edge_span"]["hops_from_attempt"] == 1
+    assert summary["edge_span"]["direct_child_of_attempt"] is True
     assert trace_finding(summary) == "edge_span_present_and_failing"
 
 
@@ -289,14 +296,32 @@ def test_a_successful_trace_shows_the_edge_both_sides() -> None:
                 "checkout",
                 parent="root",
                 kind="SPAN_KIND_CLIENT",
+                status="OK",
                 duration=2_000,
             ),
-            span("charge-server", CHARGE, "payment", kind="SPAN_KIND_SERVER", duration=1_500),
+            span(
+                "charge-server",
+                CHARGE,
+                "payment",
+                kind="SPAN_KIND_SERVER",
+                status="OK",
+                duration=1_500,
+            ),
         ),
         root_operation=PLACE_ORDER,
         edge_operation=CHARGE,
     )
     assert trace_finding(summary) == "edge_span_present_and_ok"
+    # The attempt is the callee's own server span; the edge that is *tied to it*
+    # is the caller's client span, while the callee's separate server span (which
+    # names no parent in this payload) is reported as a branch of its own rather
+    # than silently dropped or preferred for being longer.
+    assert summary["attempt"]["service"] == "checkout"
+    assert summary["edge_span"]["span_id"] == "charge-client"
+    assert summary["edge_span"]["relationship"] == "direct_child"
+    assert [(item["span_id"], item["relationship"]) for item in summary["other_edge_spans"]] == [
+        ("charge-server", "unrelated_branch")
+    ]
     assert summary["edge_span"]["service"] == "checkout"
     assert {child["service"] for child in summary["child_spans"]} == {"checkout"}
 
@@ -332,5 +357,291 @@ def test_a_span_free_trace_is_reported_rather_than_summarized() -> None:
     summary = summarize_trace(
         {"traceID": TRACE_ID, "spans": []}, root_operation=PLACE_ORDER, edge_operation=CHARGE
     )
-    assert summary["root_found"] is False
-    assert trace_finding(summary) == "no_root_span"
+    assert summary["attempt_found"] is False
+    assert summary["spans_seen"] == 0
+    assert summary["trace_root"] is None
+    assert summary["root_count"] == 0
+    assert trace_finding(summary) == "no_attempt_span"
+
+
+def test_a_span_that_recorded_no_status_is_not_a_success() -> None:
+    """Absent is not healthy: an unset status is reported as unset.
+
+    The live extract called an edge span ``status=OK`` on the strength of there
+    being no error field, and a reading like that is how an unrecorded failure
+    becomes a healthy dependency.
+    """
+    summary = summarize_trace(
+        trace(
+            span("root", PLACE_ORDER, "checkout", kind="SPAN_KIND_SERVER"),
+            span("charge", CHARGE, "checkout", parent="root", kind="SPAN_KIND_CLIENT"),
+        ),
+        root_operation=PLACE_ORDER,
+        edge_operation=CHARGE,
+    )
+    assert summary["edge_span"]["status"] == "UNSET"
+    assert summary["edge_span"]["status_source"] == "no status signal"
+    assert summary["span_status_counts"]["UNSET"] == 2
+    assert trace_finding(summary) == "edge_span_present_without_a_status"
+
+
+def test_a_protocol_status_decides_the_status_when_no_status_code_was_written() -> None:
+    """A gRPC or HTTP status is a failure signal even without ``otel.status_code``."""
+    summary = summarize_trace(
+        trace(
+            span("root", PLACE_ORDER, "checkout", kind="SPAN_KIND_SERVER", status="OK"),
+            span(
+                "charge",
+                CHARGE,
+                "checkout",
+                parent="root",
+                kind="SPAN_KIND_CLIENT",
+                tags=(("rpc.grpc.status_code", "14"),),
+            ),
+        ),
+        root_operation=PLACE_ORDER,
+        edge_operation=CHARGE,
+    )
+    assert summary["edge_span"]["status"] == "ERROR"
+    assert summary["edge_span"]["status_source"] == "rpc.grpc.status_code"
+    assert trace_finding(summary) == "edge_span_present_and_failing"
+
+
+def test_an_exception_event_is_a_failure_signal() -> None:
+    summary = summarize_trace(
+        trace(
+            span("root", PLACE_ORDER, "checkout", kind="SPAN_KIND_SERVER", status="OK"),
+            span(
+                "charge",
+                CHARGE,
+                "checkout",
+                parent="root",
+                kind="SPAN_KIND_CLIENT",
+            )
+            | {
+                "logs": [
+                    {
+                        "timestamp": 1758762272000000,
+                        "fields": [
+                            {"key": "exception.type", "value": "Unavailable"},
+                            {"key": "exception.message", "value": "connection refused"},
+                        ],
+                    }
+                ]
+            },
+        ),
+        root_operation=PLACE_ORDER,
+        edge_operation=CHARGE,
+    )
+    assert summary["edge_span"]["status"] == "ERROR"
+    assert summary["edge_span"]["status_source"] == "exception event"
+
+
+def test_the_measured_shape_is_resolved_by_ancestry_not_by_operation_name() -> None:
+    """A reconstruction of the shape the 2026-09-25 extract reported.
+
+    ``oteldemo.CheckoutService/PlaceOrder`` is emitted twice with the same name -
+    once by ``frontend`` as a client span and once by ``checkout`` as a server
+    span - under a load generator's HTTP span that is the real root. The summary
+    has to name the load generator's span as the root, the checkout server span as
+    the attempt, the frontend client span as its ancestor, and the ``Charge`` call
+    as a direct child of the attempt rather than as a child of the frontend span.
+    """
+    summary = summarize_trace(
+        {
+            "traceID": TRACE_ID,
+            "spans": [
+                span("lg", "POST", "load-generator", kind="SPAN_KIND_CLIENT", status="ERROR"),
+                span(
+                    "fpx",
+                    "POST",
+                    "frontend-proxy",
+                    parent="lg",
+                    kind="SPAN_KIND_SERVER",
+                    status="ERROR",
+                ),
+                span(
+                    "fe-client",
+                    PLACE_ORDER,
+                    "frontend",
+                    parent="fpx",
+                    kind="SPAN_KIND_CLIENT",
+                    status="OK",
+                ),
+                span(
+                    "ck-server",
+                    PLACE_ORDER,
+                    "checkout",
+                    parent="fe-client",
+                    kind="SPAN_KIND_SERVER",
+                    status="OK",
+                ),
+                span(
+                    "ck-charge",
+                    CHARGE,
+                    "checkout",
+                    parent="ck-server",
+                    kind="SPAN_KIND_CLIENT",
+                    status="OK",
+                ),
+            ],
+            "processes": {
+                "load-generator": {"serviceName": "load-generator"},
+                "frontend-proxy": {"serviceName": "frontend-proxy"},
+                "frontend": {"serviceName": "frontend"},
+                "checkout": {"serviceName": "checkout"},
+            },
+        },
+        root_operation=PLACE_ORDER,
+        edge_operation=CHARGE,
+    )
+    assert summary["trace_root"]["span_id"] == "lg"
+    assert summary["attempt"]["span_id"] == "ck-server"
+    assert summary["attempt_basis"] == "the measured operation's own server span"
+    assert [item["span_id"] for item in summary["ancestors_of_attempt"]] == [
+        "fe-client",
+        "fpx",
+        "lg",
+    ]
+    assert summary["edge_span"]["span_id"] == "ck-charge"
+    assert summary["edge_span"]["relationship"] == "direct_child"
+    assert trace_finding(summary) == "edge_span_present_and_ok_with_failures_elsewhere"
+
+
+def test_a_named_parent_missing_from_the_payload_leaves_the_ancestry_unresolved() -> None:
+    summary = (
+        summarize_trace(
+            trace(
+                span("root", PLACE_ORDER, "checkout", kind="SPAN_KIND_SERVER", status="OK"),
+                span("charge", CHARGE, "checkout", parent="root", kind="SPAN_KIND_CLIENT"),
+            ),
+            root_operation=PLACE_ORDER,
+            edge_operation=CHARGE,
+        )
+        | {}
+    )
+    trimmed = summarize_trace(
+        {
+            "traceID": TRACE_ID,
+            "spans": [
+                span("charge", CHARGE, "checkout", parent="root", kind="SPAN_KIND_CLIENT"),
+            ],
+            "processes": {"checkout": {"serviceName": "checkout"}},
+        },
+        root_operation=PLACE_ORDER,
+        edge_operation=CHARGE,
+    )
+    assert summary["missing_parent_ids"] == []
+    assert trimmed["attempt_found"] is False
+    assert trimmed["missing_parent_ids"] == ["root"]
+    assert trace_finding(trimmed) == "no_attempt_span"
+
+    unresolved = summarize_trace(
+        {
+            "traceID": TRACE_ID,
+            "spans": [
+                span(
+                    "ck-server",
+                    PLACE_ORDER,
+                    "checkout",
+                    parent="missing",
+                    kind="SPAN_KIND_SERVER",
+                ),
+                span("charge", CHARGE, "checkout", parent="ck-server", kind="SPAN_KIND_CLIENT"),
+            ],
+            "processes": {"checkout": {"serviceName": "checkout"}},
+        },
+        root_operation=PLACE_ORDER,
+        edge_operation=CHARGE,
+    )
+    assert unresolved["ancestry_truncated"] is True
+    assert unresolved["missing_parent_ids"] == ["missing"]
+    assert unresolved["edge_span"]["relationship"] == "direct_child"
+
+
+def test_an_edge_span_whose_ancestry_is_unresolved_is_reported_as_unresolved() -> None:
+    summary = summarize_trace(
+        {
+            "traceID": TRACE_ID,
+            "spans": [
+                span("root", PLACE_ORDER, "checkout", kind="SPAN_KIND_SERVER", status="OK"),
+                span(
+                    "charge",
+                    CHARGE,
+                    "payment",
+                    parent="not-in-this-payload",
+                    kind="SPAN_KIND_SERVER",
+                ),
+            ],
+            "processes": {
+                "checkout": {"serviceName": "checkout"},
+                "payment": {"serviceName": "payment"},
+            },
+        },
+        root_operation=PLACE_ORDER,
+        edge_operation=CHARGE,
+    )
+    assert summary["edge_span"]["relationship"] == "missing_parent"
+    assert summary["edge_span"]["hops_from_attempt"] is None
+    assert trace_finding(summary) == "edge_span_present_with_its_ancestry_unresolved"
+
+
+def test_a_span_that_crossed_the_restoration_edge_is_positioned_as_crossing_it() -> None:
+    """The window is the interval asked for; its edges are injection and restoration."""
+    window_start, window_end = 1_790_303_000_000_000, 1_790_303_600_000_000
+    root = span(
+        "root",
+        PLACE_ORDER,
+        "checkout",
+        kind="SPAN_KIND_SERVER",
+        status="OK",
+        duration=600 * 1_000_000,
+    )
+    root["startTime"] = window_start + 100 * 1_000_000
+    summary = summarize_trace(
+        {
+            "traceID": TRACE_ID,
+            "spans": [root],
+            "processes": {"checkout": {"serviceName": "checkout"}},
+        },
+        root_operation=PLACE_ORDER,
+        edge_operation=CHARGE,
+        window_start_us=window_start,
+        window_end_us=window_end,
+    )
+    assert summary["attempt"]["position"] == "crosses_window_end"
+    assert summary["span_position_counts"]["crosses_window_end"] == 1
+
+
+def test_positions_separate_the_four_sides_of_the_window() -> None:
+    window_start, window_end = 1_000_000, 2_000_000
+    assert (
+        position_in_window(0, 500_000, window_start_us=window_start, window_end_us=window_end)
+        == "before_window"
+    )
+    assert (
+        position_in_window(
+            window_start - 1, 1_000, window_start_us=window_start, window_end_us=window_end
+        )
+        == "starts_before_window"
+    )
+    assert (
+        position_in_window(
+            window_start, 1_000, window_start_us=window_start, window_end_us=window_end
+        )
+        == "during_window"
+    )
+    assert (
+        position_in_window(
+            window_end - 1, 1, window_start_us=window_start, window_end_us=window_end
+        )
+        == "during_window"
+    )
+    assert (
+        position_in_window(window_end, 1, window_start_us=window_start, window_end_us=window_end)
+        == "after_window"
+    )
+    assert (
+        position_in_window(None, 1, window_start_us=window_start, window_end_us=window_end)
+        == "unpositionable"
+    )
