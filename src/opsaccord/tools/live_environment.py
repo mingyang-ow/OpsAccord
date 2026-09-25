@@ -308,6 +308,10 @@ class LiveEnvironment:
         self._client = http_client
         self._http_timeout = 5.0
         self._applied: dict[str, dict[str, Any]] = {}
+        #: Which label carries the emitting service, per operation. Resolved from
+        #: the schema on first use and cached for the run: the schema does not
+        #: change while a scenario is in flight, and the harness polls health.
+        self._service_label_cache: dict[str, str | None] = {}
         # Reconciling from external state is the honest default: it asks the flag
         # document whether the desired change is in place. Turning it off is a
         # documented harness fault injection for the "outcome cannot be
@@ -362,17 +366,63 @@ class LiveEnvironment:
         return name
 
     def _call_counts(
-        self, *, metric: str, operation: str, window_seconds: int, timeout_seconds: float
+        self,
+        *,
+        metric: str,
+        operation: str,
+        window_seconds: int,
+        timeout_seconds: float,
+        scope: dict[str, str] | None = None,
     ) -> tuple[float, float]:
-        """Return (calls_per_second, errors_per_second) for one operation."""
+        """Return (calls_per_second, errors_per_second) for one operation.
+
+        ``scope`` narrows the selector to the series that belong to the service
+        the reading is about. Without it the selector matches *every* span with
+        that operation name, and the same operation name is emitted by more than
+        one service -- the caller's client span and the callee's server span --
+        so an unscoped reading answers a question about a set of services.
+        """
+        labels = dict(scope or {})
         calls = self.prometheus.scalar(
-            _op_selector(metric, operation, window_seconds), timeout_seconds
+            _op_selector(metric, operation, window_seconds, **labels), timeout_seconds
         )
         errors = self.prometheus.scalar(
-            _op_selector(metric, operation, window_seconds, status_code="STATUS_CODE_ERROR"),
+            _op_selector(
+                metric,
+                operation,
+                window_seconds,
+                status_code="STATUS_CODE_ERROR",
+                **labels,
+            ),
             timeout_seconds,
         )
         return calls or 0.0, errors or 0.0
+
+    def _service_scope(
+        self, *, operation: str, service: str, timeout_seconds: float
+    ) -> tuple[dict[str, str] | None, str | None]:
+        """Resolve the label that scopes a query to one service's own spans.
+
+        Returns ``(scope, resolution)``. ``scope`` is ``None`` when the server
+        does not expose a service label for this operation, and ``resolution``
+        then says why -- a reading that could not be scoped is recorded as
+        unscoped rather than presented as if it were about one service.
+        """
+        if operation not in self._service_label_cache:
+            labels = self.prometheus.series_labels(
+                self._series_selector(span_name=operation), timeout_seconds
+            )
+            self._service_label_cache[operation] = next(
+                (name for name in SERVICE_LABEL_CANDIDATES if name in labels), None
+            )
+        label = self._service_label_cache[operation]
+        if label is None:
+            return None, (
+                f"the series for span_name={operation!r} expose no service label "
+                f"(looked for {list(SERVICE_LABEL_CANDIDATES)}), so this reading covers "
+                "every service that emits that operation, not only the target"
+            )
+        return {label: service}, f"{label}='{service}'"
 
     # --- read tools -------------------------------------------------------
 
@@ -384,13 +434,19 @@ class LiveEnvironment:
         queries: list[str] = []
         if metric == "error_rate":
             metric_name = self._calls_metric(timeout_seconds)
+            scope, _ = self._service_scope(
+                operation=live.operation,
+                service=live.service_name,
+                timeout_seconds=timeout_seconds,
+            )
             calls, errors = self._call_counts(
                 metric=metric_name,
                 operation=live.operation,
                 window_seconds=window_seconds,
                 timeout_seconds=timeout_seconds,
+                scope=scope,
             )
-            queries = [_op_selector(metric_name, live.operation, window_seconds)]
+            queries = [_op_selector(metric_name, live.operation, window_seconds, **(scope or {}))]
             value = (errors / calls) if calls > 0 else None
         elif metric in {"request_rate", "cpu_utilization", "memory_utilization"}:
             value, queries = self._resource_metric(live, metric, window_seconds, timeout_seconds)
@@ -573,16 +629,32 @@ class LiveEnvironment:
         CPU. That covers both directions of the demo faults -- a caller-visible
         connection failure and a server-side resource burn -- without inventing a
         health endpoint the pinned revision does not expose.
+
+        The reading is scoped to the target service's *own* spans, because an
+        operation name is not a service. ``oteldemo.PaymentService/Charge`` is
+        emitted by ``payment`` (server) and by ``checkout`` (client), so an
+        unscoped selector answers "how are all of these services doing" -- and a
+        health verdict about ``payment-service`` could then be decided by a
+        failing ``checkout``, or a verdict about ``checkout-service`` by a failing
+        ``frontend``. The scope is resolved from the schema and recorded on the
+        value; where the server exposes no service label the reading says it is
+        unscoped rather than presenting an aggregate as one service. What the
+        caller can see of the *path* is a different question, and
+        ``read_dependency`` is the tool that answers it.
         """
         live = self._target(target)
         window_seconds = live.probe_window_seconds
         start, end = self._window(window_seconds)
         metric = self._calls_metric(timeout_seconds)
+        scope, scope_resolution = self._service_scope(
+            operation=live.operation, service=live.service_name, timeout_seconds=timeout_seconds
+        )
         calls, errors = self._call_counts(
             metric=metric,
             operation=live.operation,
             window_seconds=window_seconds,
             timeout_seconds=timeout_seconds,
+            scope=scope,
         )
         cpu_utilization, cpu_query = self._resource_metric(
             live, "cpu_utilization", window_seconds, timeout_seconds
@@ -603,6 +675,8 @@ class LiveEnvironment:
                 "error_rate": error_rate,
                 "calls_per_second": calls,
                 "window_seconds": window_seconds,
+                "service": live.service_name,
+                "service_scope": scope_resolution,
                 "source": "prometheus",
                 "queries": [cpu_query] if cpu_query else [],
             },

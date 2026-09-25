@@ -83,6 +83,7 @@ class FakeStack:
         fail: Exception | None = None,
         span_labels: set[str] | None = None,
         span_kind_values: list[str] | None = None,
+        errors_by_service: dict[str, float] | None = None,
     ) -> None:
         self.calls = calls
         self.errors = errors
@@ -94,6 +95,12 @@ class FakeStack:
         self.span_kind_values = list(
             SPAN_KIND_VALUES if span_kind_values is None else span_kind_values
         )
+        #: Per-emitter error rates for one operation, keyed by ``service_name``.
+        #: The observed telemetry has both sides of the Charge RPC in one series
+        #: set (``checkout`` CLIENT and ``payment`` SERVER), so this models what a
+        #: scoped and an unscoped reading each return: an unscoped selector sums
+        #: every emitter, as Prometheus does.
+        self.errors_by_service = errors_by_service
         self.queries: list[str] = []
         self.writes: list[dict[str, Any]] = []
         self.series_selectors: list[str] = []
@@ -113,13 +120,13 @@ class FakeStack:
             if query.startswith("count("):
                 return httpx.Response(200, json={"status": "success", "data": {"result": []}})
             if "status_code='STATUS_CODE_ERROR'" in query:
-                value: float | None = self.errors
+                value: float | None = self._errors_for(query)
             elif "histogram_quantile" in query:
                 value = 42.0
             elif CPU_COUNTER in query or CPU in query:
                 value = self.cpu
             elif "span_name=" in query:
-                value = self.calls
+                value = self._calls_for(query)
             else:
                 value = 0.0
             sample = {"metric": {}, "value": [1_700_000_000.0, str(value)]}
@@ -158,6 +165,24 @@ class FakeStack:
             values = self.span_kind_values if label == "span_kind" else []
             return httpx.Response(200, json={"status": "success", "data": values})
         raise AssertionError(f"unexpected request to {path}")
+
+    @staticmethod
+    def _scoped_service(query: str) -> str | None:
+        match = re.search(r"service_name='([^']+)'", query)
+        return match.group(1) if match else None
+
+    def _calls_for(self, query: str) -> float:
+        if self.errors_by_service is None or self._scoped_service(query) is not None:
+            return self.calls
+        return self.calls * max(len(self.errors_by_service), 1)
+
+    def _errors_for(self, query: str) -> float:
+        if self.errors_by_service is None:
+            return self.errors
+        scoped = self._scoped_service(query)
+        if scoped is not None:
+            return self.errors_by_service.get(scoped, 0.0)
+        return sum(self.errors_by_service.values())
 
 
 def build(stack: FakeStack, **kwargs: Any) -> LiveEnvironment:
@@ -308,6 +333,54 @@ def test_health_is_serving_when_calls_succeed_and_cpu_is_normal() -> None:
     result = environment.read_service_health(target="ad-service", timeout_seconds=2.0)
     assert result.value["healthy"] is True
     assert result.value["health"] == "SERVING"
+
+
+def test_health_is_scoped_to_the_target_service_s_own_spans() -> None:
+    """An operation name is not a service: the caller's spans are not the callee's.
+
+    Measured on the pinned stack (2026-09-25): ``oteldemo.PaymentService/Charge``
+    is exported with a ``checkout`` CLIENT series and a ``payment`` SERVER series,
+    and ``oteldemo.CheckoutService/PlaceOrder`` with a ``checkout`` SERVER series
+    and a ``frontend`` CLIENT series. Before this change an unscoped selector
+    matched all of them, so a health verdict about ``payment-service`` could be
+    decided by a failing ``checkout``.
+    """
+    stack = FakeStack(calls=1.0, errors_by_service={"checkout": 1.0, "payment": 0.0})
+    environment = build(stack)
+
+    result = environment.read_service_health(target="payment-service", timeout_seconds=2.0)
+
+    assert result.value["healthy"] is True
+    assert result.value["health"] == "SERVING"
+    assert result.value["error_rate"] == 0.0
+    assert result.value["service"] == "payment"
+    assert result.value["service_scope"] == "service_name='payment'"
+    assert any("service_name='payment'" in query for query in stack.queries)
+
+
+def test_health_reports_not_serving_when_the_target_s_own_spans_error() -> None:
+    """Scoping must not hide a fault on the target itself."""
+    stack = FakeStack(calls=1.0, errors_by_service={"checkout": 1.0, "payment": 1.0})
+    environment = build(stack)
+
+    result = environment.read_service_health(target="payment-service", timeout_seconds=2.0)
+
+    assert result.value["healthy"] is False
+    assert result.value["health"] == "NOT_SERVING"
+    assert result.value["error_rate"] == 1.0
+
+
+def test_the_error_rate_metric_is_scoped_to_the_target_service() -> None:
+    """The metric read answers for the target service, not for the operation name."""
+    stack = FakeStack(calls=1.0, errors_by_service={"checkout": 1.0, "payment": 0.0})
+    environment = build(stack)
+
+    result = environment.read_metrics(
+        target="payment-service", metric="error_rate", window_seconds=300, timeout_seconds=2.0
+    )
+
+    assert result.value["value"] == 0.0
+    assert any("service_name='payment'" in query for query in stack.queries)
 
 
 def test_remediation_rewrites_only_the_requested_flag() -> None:

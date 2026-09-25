@@ -146,9 +146,26 @@ class FakeStack:
         interrupt_after: int | None = None,
         interrupt_on_flag_read: int | None = None,
         flag_read_error_after: int | None = None,
+        dependency_error_share: float | None = None,
+        dependency_attributable: bool = True,
     ) -> None:
         self.store = store
         self.probes = probes or {}
+        #: What the caller's *own client spans* for the managed edge show, which is
+        #: the observation ``read_dependency`` attributes an incident from.
+        #:
+        #: The default follows the calibrated fault: while a target's flag is armed
+        #: the caller's own call to it fails, because the pinned revision redirects
+        #: the Charge to an unreachable address and the caller sees that failure.
+        #: ``dependency_error_share`` overrides the share to model the measured
+        #: 2026-09-24 state -- a demo degraded on the caller's *parent* spans while
+        #: the caller's own Charge client share stayed at 0.0 -- so a test can prove
+        #: the premise refuses a generic caller-side failure.
+        self.dependency_error_share = dependency_error_share
+        #: When false, the caller's own spans cannot be separated from the
+        #: callee's, which is an instrumentation gap and never a healthy edge.
+        self.dependency_attributable = dependency_attributable
+        self.dependency_reads: list[tuple[str, str]] = []
         #: The demo shows a fault only while its flag is armed. Turning this off
         #: models a demo that is already failing with every flag at its safe
         #: variant, which is the state a scenario must refuse to measure against.
@@ -193,6 +210,46 @@ class FakeStack:
         if self.fault_only_when_armed and not self._armed(target):
             value = cleared(value)
         return Probe(succeeded=True, value=value)
+
+    def read_dependency(
+        self,
+        *,
+        target: str,
+        dependency: str,
+        window_seconds: int,
+        timeout_seconds: float,
+    ) -> Probe:
+        """The caller's own view of the edge, from its client spans.
+
+        Calls are carried from the caller's health probe so the two readings
+        describe the same demo: one Charge per PlaceOrder is what the pinned
+        revision does, and a quiet caller is a quiet edge.
+        """
+        self.dependency_reads.append((target, dependency))
+        caller = self.probes.get(target, {})
+        calls = float(caller.get("calls_per_second") or 0.0)
+        armed = not self.fault_only_when_armed or self._armed(dependency)
+        if self.dependency_error_share is None:
+            share: float | None = 1.0 if armed else 0.0
+        else:
+            share = self.dependency_error_share
+        return Probe(
+            succeeded=True,
+            value={
+                "caller": target,
+                "destination": dependency,
+                "operation": "Charge",
+                "span_kind": "client",
+                "attributable": self.dependency_attributable,
+                "reason": None
+                if self.dependency_attributable
+                else "the caller's own spans cannot be separated from the callee's",
+                "calls_per_second": calls,
+                "errors_per_second": calls * (share or 0.0),
+                "error_rate": share,
+                "window_seconds": window_seconds,
+            },
+        )
 
     def _armed(self, target: str) -> bool:
         """Whether the flag that faults this target is armed right now."""

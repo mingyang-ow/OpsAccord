@@ -729,17 +729,24 @@ def test_an_unreadable_baseline_is_not_a_baseline_of_zero(
 def test_the_pre_injection_readings_are_taken_before_the_fault_is_armed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both baselines are read while the flag is still safe, so the rise is real.
+    """Every baseline is read while the flag is still safe, so the rise is real.
 
     The fake shows the fault only while its flag is armed - the same shape the real
     demo has - so a baseline read *after* the write would read the fault and the
     scenario could not prove a rise. Reading it before the write is what makes the
     premise attributable, and this test fails on the code that read the caller's
     baseline after arming.
+
+    The Payment premise is satisfied by the caller's *own client spans for the
+    Charge edge*, because that is the observation the incident's diagnosis can act
+    on. The generic caller probe is recorded beside it: it rose to 1.0 here and does
+    not decide anything.
     """
     store = FakeFlagStore()
     probes = stack_health(
         **{
+            # The real signature: the callee's own spans stay clean while the caller
+            # cannot complete its own call.
             "payment-service": health(calls=0.033, error_rate=0.0),
             "checkout-service": health(calls=0.033, error_rate=1.0),
         }
@@ -757,11 +764,90 @@ def test_the_pre_injection_readings_are_taken_before_the_fault_is_armed(
 
     assert result.status == "MEASURED"
     fault_visible = result.fault_visible or {}
-    assert fault_visible["attribution"] == "caller"
+    assert fault_visible["attribution"] == "dependency"
+    assert fault_visible["dependency_before"]["error_rate"] == 0.0
+    assert fault_visible["dependency"]["probe"]["attributable"] is True
+    assert fault_visible["dependency"]["probe"]["error_rate"] == 1.0
     assert fault_visible["corroborating_before"]["error_rate"] == 0.0
     assert fault_visible["corroborating"]["probe"]["error_rate"] == 1.0
     assert fault_visible["target_before"]["error_rate"] == 0.0
     assert any("pre-injection reading" in reason for reason in result.reasons)
+
+
+def test_a_generic_caller_failure_cannot_arm_the_payment_premise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The measured 2026-09-24 state: the demo degrades, the Charge edge is clean.
+
+    ``paymentUnreachable`` showed up as a 17.66% failure share on checkout's own
+    PlaceOrder spans while the caller's own client share for Charge read 0.0. A
+    failing parent span does not say *which* dependency failed, and the controller
+    is required to refuse that inference, so the harness must not accept it either:
+    the run is not measured and the flag it armed is restored.
+    """
+    store = FakeFlagStore()
+    probes = stack_health(
+        **{
+            "payment-service": health(calls=0.1, error_rate=0.0),
+            "checkout-service": health(calls=0.12, error_rate=0.177),
+        }
+    )
+    stack = FakeStack(store, probes, dependency_error_share=0.0)
+    use_fake_stack(monkeypatch, stack, StubController())
+
+    run = live_scenarios.run_live_suite(
+        db=UNUSED_DB,
+        settings=live_settings(),
+        scenario_ids=["P1-01"],
+        scenario_budget_seconds=0.4,
+        poll_seconds=0.01,
+    )
+
+    (result,) = run.results
+    assert result.status == "NOT_MEASURED"
+    assert result.stage == "fault-visibility"
+    assert "never showed the armed fault" in " ".join(result.reasons)
+    assert store.writes == [("paymentUnreachable", "on"), ("paymentUnreachable", "off")]
+    assert store.variants["paymentUnreachable"] == "off"
+
+
+def test_an_unattributable_edge_cannot_arm_the_payment_premise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An instrumentation gap is not a fault: no attribution, no premise."""
+    store = FakeFlagStore()
+    probes = stack_health(
+        **{
+            "payment-service": health(calls=0.1, error_rate=0.0),
+            "checkout-service": health(calls=0.12, error_rate=0.5),
+        }
+    )
+    stack = FakeStack(store, probes, dependency_attributable=False)
+    use_fake_stack(monkeypatch, stack, StubController())
+
+    run = live_scenarios.run_live_suite(
+        db=UNUSED_DB,
+        settings=live_settings(),
+        scenario_ids=["P1-01"],
+        scenario_budget_seconds=0.4,
+        poll_seconds=0.01,
+    )
+
+    (result,) = run.results
+    assert result.status == "NOT_MEASURED"
+    assert result.stage == "fault-visibility"
+    assert store.writes == [("paymentUnreachable", "on"), ("paymentUnreachable", "off")]
+
+
+def test_a_quiet_or_unreadable_edge_reading_is_not_a_fault() -> None:
+    """Zero calls, a missing share and an unattributable read are not failures."""
+    visible = live_scenarios._dependency_fault_visible
+    assert visible({"attributable": True, "calls_per_second": 0.0, "error_rate": None}) is False
+    assert visible({"attributable": True, "calls_per_second": 0.05, "error_rate": None}) is False
+    assert visible({"attributable": True, "calls_per_second": 0.05, "error_rate": 0.04}) is False
+    assert visible({"attributable": True, "calls_per_second": 0.0, "error_rate": 1.0}) is False
+    assert visible({"attributable": False, "calls_per_second": 0.05, "error_rate": 1.0}) is False
+    assert visible({"attributable": True, "calls_per_second": 0.05, "error_rate": 1.0}) is True
 
 
 def test_ctrl_c_with_a_failed_cleanup_still_ends_as_an_interrupt(

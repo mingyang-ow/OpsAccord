@@ -55,6 +55,7 @@ from opsaccord.scenarios.runner import ScenarioTrace, evaluate, run_scenario
 from opsaccord.tools.contracts import TELEMETRY_ERROR_BOUND, Environment
 from opsaccord.tools.live_environment import (
     FLAG_SAFE_VARIANT,
+    LIVE_HEALTH_WINDOW_SECONDS,
     LiveEnvironment,
     LiveEnvironmentUnavailable,
 )
@@ -82,6 +83,11 @@ UNROUTABLE_HOST = "http://10.255.255.1"
 # difference between measuring the scenario and measuring the previous one.
 FAULT_VISIBILITY_TIMEOUT_SECONDS = 420
 FAULT_VISIBILITY_POLL_SECONDS = 20
+
+# Window for the caller-side dependency reading the payment premise requires. The
+# same span-metric floor as a health probe: the pipeline publishes every ~60s, so a
+# shorter window reads as "no data" rather than as "no failure".
+DEPENDENCY_PREMISE_WINDOW_SECONDS = LIVE_HEALTH_WINDOW_SECONDS
 
 # How long a scenario waits for the demo's own telemetry to start exercising the
 # target before it injects a fault. The load generator in the pinned revision is
@@ -254,15 +260,25 @@ class LivePlan:
     # for failing RPCs, "cpu" for a CPU-saturated container. Both are positive
     # observations: a quiet demo must never be mistaken for a fault.
     fault_signal: str = "error_rate"
-    # A second target whose own failing RPCs also prove this fault exists.
+    # A second target whose own failing RPCs are recorded as context for this
+    # fault.
     #
-    # ``paymentUnreachable`` is read by checkout, so the failing RPCs are
-    # checkout's own client calls, and the armed Charge call rate drops to about
-    # 0.042/s -- a 120s window can legitimately contain no Charge call at all, and
-    # the harness must not wait for evidence the fault makes intermittent. This
-    # target is a *corroborating* observation, recorded with its own attribution,
-    # never a substitute for one: zero traffic never counts, on either target.
+    # ``paymentUnreachable`` is read by checkout, so the demo degrades on checkout's
+    # own RPCs. That is *context*: a failing parent span says the caller is unhappy,
+    # not that the Payment path is why, and the controller is required to refuse
+    # exactly that inference. When ``corroborating_dependency`` is set, a rising
+    # reading here can not satisfy the premise.
     corroborating_target: str | None = None
+    # The caller whose *own client call* to this scenario's service must also show
+    # the fault. This is the observation the incident's own diagnostic surface acts
+    # on: ``read_dependency`` attributes a failure to the edge only from the
+    # caller's client spans, so a premise the controller cannot reproduce from the
+    # same evidence is a premise this harness has no business accepting.
+    #
+    # The 2026-09-24 run is the measurement: the generic caller-side probe rose to
+    # 17.7% while the caller's own Charge client share stayed at 0.0, and the
+    # scenario went on to measure a fault its own controller could not attribute.
+    corroborating_dependency: str | None = None
 
 
 LIVE_PLANS: dict[str, LivePlan] = {
@@ -271,6 +287,7 @@ LIVE_PLANS: dict[str, LivePlan] = {
         setup="flagd-ui: paymentUnreachable=on",
         fault_flag="paymentUnreachable",
         corroborating_target="checkout-service",
+        corroborating_dependency="checkout-service",
     ),
     "P1-02": LivePlan(
         scenario_id="P1-02",
@@ -293,6 +310,7 @@ LIVE_PLANS: dict[str, LivePlan] = {
         setup="flagd-ui: paymentUnreachable=on; human decision is REJECTED",
         fault_flag="paymentUnreachable",
         corroborating_target="checkout-service",
+        corroborating_dependency="checkout-service",
     ),
     "P1-06": LivePlan(
         scenario_id="P1-06",
@@ -300,6 +318,7 @@ LIVE_PLANS: dict[str, LivePlan] = {
         fault_flag="paymentUnreachable",
         induced_failure="control_plane_timeout",
         corroborating_target="checkout-service",
+        corroborating_dependency="checkout-service",
     ),
     "P1-07": LivePlan(
         scenario_id="P1-07",
@@ -307,6 +326,7 @@ LIVE_PLANS: dict[str, LivePlan] = {
         fault_flag="paymentUnreachable",
         induced_failure="fault_rearmed_after_dispatch",
         corroborating_target="checkout-service",
+        corroborating_dependency="checkout-service",
     ),
 }
 
@@ -655,8 +675,55 @@ def _health_snapshot(value: dict[str, Any]) -> dict[str, Any]:
             # reading this harness accepts averages a minute or two, so a reader
             # of the record can see how far back the evidence reaches.
             "window_seconds",
+            # Which service the reading is about, and the selector scope that
+            # makes it about that service. An operation name is emitted by both
+            # sides of an RPC, so a health verdict without this is a verdict
+            # about a set of services.
+            "service",
+            "service_scope",
         )
     }
+
+
+def _dependency_snapshot(value: dict[str, Any]) -> dict[str, Any]:
+    """The fields a caller-side dependency read reports, copied out of the value.
+
+    ``attributable`` and ``reason`` travel with the numbers on purpose: a share
+    that could not be attributed to the caller's own spans is not a reading about
+    the edge, and the record has to say which of the two it holds.
+    """
+    return {
+        key: value.get(key)
+        for key in (
+            "caller",
+            "destination",
+            "operation",
+            "span_kind",
+            "attributable",
+            "reason",
+            "calls_per_second",
+            "errors_per_second",
+            "error_rate",
+            "window_seconds",
+        )
+    }
+
+
+def _dependency_fault_visible(probe: dict[str, Any]) -> bool:
+    """True when the caller's own client spans show a positive failure share.
+
+    The same discipline as every other live predicate here: an unattributable
+    read, a window with no calls, and a missing share are all *not* a fault. The
+    share is compared against the telemetry bound rather than against zero, so a
+    couple of stray errors do not arm a scenario.
+    """
+    if probe.get("attributable") is not True:
+        return False
+    calls = _reading(probe.get("calls_per_second"))
+    rate = _reading(probe.get("error_rate"))
+    if calls is None or calls <= 0 or rate is None:
+        return False
+    return rate > TELEMETRY_ERROR_BOUND
 
 
 def wait_for_fault(
@@ -667,6 +734,9 @@ def wait_for_fault(
     target_before: dict[str, Any] | None,
     corroborating_target: str | None = None,
     corroborating_before: dict[str, Any] | None,
+    corroborating_dependency: tuple[str, str] | None = None,
+    dependency_before: dict[str, Any] | None = None,
+    dependency_window_seconds: int = LIVE_HEALTH_WINDOW_SECONDS,
     timeout_seconds: float | None = None,
     poll_seconds: float | None = None,
     observe: Callable[[dict[str, Any]], None] | None = None,
@@ -684,19 +754,27 @@ def wait_for_fault(
     its armed Charge call rate (~0.042/s, see the calibration table) is low enough
     that a single 120s window can contain no Charge call at all, so waiting only
     for the payment target's own error share can wait for an observation the fault
-    makes intermittent. ``corroborating_target`` adds that service's own failing
-    RPCs as a second positive observation, and the returned probe always says
-    which series carried it.
+    makes intermittent. ``corroborating_target`` records that service's own failing
+    RPCs, and the returned probe always says which series carried it.
+
+    The observation that *satisfies* a premise whose fault is caller-side is
+    ``corroborating_dependency``: the caller's own client call to this service, read
+    through the same ``read_dependency`` attribution the incident's diagnosis uses.
+    A generic parent-span rise is recorded and never sufficient, because a failing
+    caller RPC is not evidence that this dependency is why -- the 2026-09-24 run
+    accepted exactly that inference and handed the controller a fault it could not
+    attribute from its own evidence.
 
     What does *not* change: an absent series is not a zero, and zero traffic is
     never read as a fault, on either target. The predicate is an error share
     strictly above the telemetry bound, so a quiet demo keeps waiting and the
     failure mode is an honest setup failure rather than a fabricated one.
 
-    *Both* observations are differential, and that is now the whole premise.
-    ``target_before`` and ``corroborating_before`` carry each target's own reading
-    from *before* this scenario armed anything, and an observation only counts when
-    it is above the bound **and** higher than its own pre-injection reading. A
+    Every observation here is differential, and that is the whole premise.
+    ``target_before``, ``corroborating_before`` and ``dependency_before`` carry each
+    reading from *before* this scenario armed anything, and an observation only
+    counts when it is above the bound **and** higher than its own pre-injection
+    reading. A
     level test alone cannot tell an injected fault from a demo that was already
     failing: the 2026-09-24 run accepted payment's 100% error share 0.0s after the
     write, on a window that began two minutes before the write, so the scenario
@@ -723,6 +801,8 @@ def wait_for_fault(
             "target_before": target_before,
             "corroborating": None,
             "corroborating_before": corroborating_before,
+            "dependency": None,
+            "dependency_before": dependency_before,
         }
         if (
             health.succeeded
@@ -737,12 +817,37 @@ def wait_for_fault(
             )
             caller_probe = _health_snapshot(caller.value)
             last["corroborating"] = {"target": corroborating_target, "probe": caller_probe}
+            # Recorded always; sufficient only when this plan has no attributable
+            # observation to require. A caller's generic failure is context.
             if (
-                caller.succeeded
+                corroborating_dependency is None
+                and caller.succeeded
                 and _fault_visible("error_rate", caller_probe)
                 and _fault_is_new("error_rate", caller_probe, corroborating_before)
             ):
                 last["attribution"] = "caller"
+                last["elapsed_seconds"] = round(time.monotonic() - started, 1)
+                return last
+        if corroborating_dependency is not None:
+            dependency_caller, dependency_callee = corroborating_dependency
+            edge = environment.read_dependency(
+                target=dependency_caller,
+                dependency=dependency_callee,
+                window_seconds=dependency_window_seconds,
+                timeout_seconds=8.0,
+            )
+            edge_probe = _dependency_snapshot(edge.value)
+            last["dependency"] = {
+                "caller": dependency_caller,
+                "destination": dependency_callee,
+                "probe": edge_probe,
+            }
+            if (
+                edge.succeeded
+                and _dependency_fault_visible(edge_probe)
+                and _fault_is_new("error_rate", edge_probe, dependency_before)
+            ):
+                last["attribution"] = "dependency"
                 last["elapsed_seconds"] = round(time.monotonic() - started, 1)
                 return last
         if observe is not None:
@@ -1051,12 +1156,24 @@ def run_live_scenario(
             # how an already-failing demo came to satisfy a scenario's premise.
             target_before = _health_baseline(environment, spec.service)
             corroborating_before = _health_baseline(environment, plan.corroborating_target)
+            dependency_before = _dependency_baseline(
+                environment,
+                caller=plan.corroborating_dependency,
+                callee=spec.service,
+                window_seconds=DEPENDENCY_PREMISE_WINDOW_SECONDS,
+            )
             reporter.observation(
                 "pre-injection readings: "
                 f"{spec.service}={target_before}"
                 + (
                     f"; {plan.corroborating_target}={corroborating_before}"
                     if plan.corroborating_target
+                    else ""
+                )
+                + (
+                    f"; {plan.corroborating_dependency} -> {spec.service} client="
+                    f"{dependency_before}"
+                    if plan.corroborating_dependency
                     else ""
                 )
             )
@@ -1075,10 +1192,19 @@ def run_live_scenario(
             stage = "fault-visibility"
             visibility_budget = budget.clamp(FAULT_VISIBILITY_TIMEOUT_SECONDS)
             corroborating = f" or {plan.corroborating_target}" if plan.corroborating_target else ""
+            required = (
+                f", and attributably on the {plan.corroborating_dependency} -> {spec.service} "
+                "client call"
+                if plan.corroborating_dependency
+                else ""
+            )
             reporter.enter_stage(
                 stage,
                 budget_seconds=visibility_budget,
-                message=f"waiting for the armed fault to appear on {spec.service}{corroborating}",
+                message=(
+                    f"waiting for the armed fault to appear on {spec.service}{corroborating}"
+                    f"{required}"
+                ),
             )
             fault_visible = wait_for_fault(
                 environment,
@@ -1087,6 +1213,13 @@ def run_live_scenario(
                 target_before=target_before,
                 corroborating_target=plan.corroborating_target,
                 corroborating_before=corroborating_before,
+                corroborating_dependency=(
+                    (plan.corroborating_dependency, spec.service)
+                    if plan.corroborating_dependency
+                    else None
+                ),
+                dependency_before=dependency_before,
+                dependency_window_seconds=DEPENDENCY_PREMISE_WINDOW_SECONDS,
                 timeout_seconds=visibility_budget,
                 poll_seconds=poll_seconds,
                 observe=lambda probe: reporter.observation(_fault_observation(probe)),
@@ -1270,6 +1403,26 @@ def _health_baseline(environment: Environment, target: str | None) -> dict[str, 
     return _health_snapshot(probe.value)
 
 
+def _dependency_baseline(
+    environment: Environment, *, caller: str | None, callee: str, window_seconds: int
+) -> dict[str, Any] | None:
+    """The caller's own view of the managed edge *before* a scenario arms anything.
+
+    Read before the write for the same reason the health baselines are: the premise
+    is a rise, so a baseline taken afterwards would compare the fault with itself.
+    A read that does not answer is no baseline, and the observation it would have
+    qualified is then not accepted rather than accepted against an invented zero.
+    """
+    if caller is None:
+        return None
+    read = environment.read_dependency(
+        target=caller, dependency=callee, window_seconds=window_seconds, timeout_seconds=8.0
+    )
+    if not read.succeeded:
+        return None
+    return _dependency_snapshot(read.value)
+
+
 def _fault_observation(probe: dict[str, Any]) -> str:
     seen = probe.get("probe") or {}
     text = (
@@ -1284,6 +1437,14 @@ def _fault_observation(probe: dict[str, Any]) -> str:
             f"; {corroborating.get('target')} error_rate={caller.get('error_rate')} "
             f"calls_per_second={caller.get('calls_per_second')}"
         )
+    dependency = probe.get("dependency")
+    if dependency:
+        edge = dependency.get("probe") or {}
+        text += (
+            f"; {dependency.get('caller')} -> {dependency.get('destination')} client "
+            f"error_rate={edge.get('error_rate')} calls_per_second="
+            f"{edge.get('calls_per_second')} attributable={edge.get('attributable')}"
+        )
     return text
 
 
@@ -1294,6 +1455,17 @@ def _fault_reason(fault_visible: dict[str, Any]) -> str:
     cannot show that the fault is the one this scenario armed - that is the reading
     the 2026-09-24 run accepted - so the record carries both sides of the rise.
     """
+    if fault_visible.get("attribution") == "dependency":
+        dependency = fault_visible.get("dependency") or {}
+        return (
+            "fault visible after arming on the caller's own client spans for the managed "
+            f"edge: {dependency.get('caller')} -> {dependency.get('destination')} client read "
+            f"{dependency.get('probe')} above its pre-injection reading "
+            f"{fault_visible.get('dependency_before')}; target probe "
+            f"{fault_visible.get('probe')} against its pre-injection reading "
+            f"{fault_visible.get('target_before')}; caller-side parent-span context "
+            f"{fault_visible.get('corroborating')}"
+        )
     if fault_visible.get("attribution") == "caller":
         corroborating = fault_visible.get("corroborating") or {}
         return (
