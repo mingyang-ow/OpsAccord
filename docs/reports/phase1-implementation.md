@@ -2464,6 +2464,18 @@ Artifacts (this session's reading of your run, not a run by this session):
 `.local/user-live-checks-20260925T112231/`, `.../112323/`, `.../112332/`, `.../112344/` and their
 `reports/local/payment-trace-path-20260925T1122*.json` extracts.
 
+**Follow-up, the readiness check at 11:26:54.** The same exporter, run read-only with no named ids
+(`--lookback-minutes 15 --recent-minutes 15`), exited `0` with every stage answering and no checkpoint
+to arm: 12 services visible, `checkout` **not among them**, `0` operations advertised for it, `0` recent
+`checkout` traces, and `0` unfiltered `checkout` traces in the interval. Comparing the store's own list
+with the 02:54 run's 17 services, exactly five are missing now: `checkout`, `email`, `quote`, `shipping`
+and `flagd-ui` - and `checkout` is the one the other three hang off (they emit spans only when checkout
+calls them). So the restarted stack is **not fully up**: no `checkout` span has reached the collector,
+which means a capture taken now would have no Payment path to observe at all, whatever the fault state.
+This is a stack-readiness question, not a trace question, and it is the precondition for anything live:
+the trace half of P1-01 cannot be attempted until `checkout` registers in the store. Phase 1 remains
+PARTIAL.
+
 ## Remaining work and discussion
 
 **Blockers (environment, not code):**
