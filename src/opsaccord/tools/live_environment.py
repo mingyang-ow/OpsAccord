@@ -89,6 +89,11 @@ CONTAINER_RESTART_CANDIDATES = ("container_restarts_total", "container_restart_c
 # ``opsaccord.workflow.controller``.
 LIVE_HEALTH_WINDOW_SECONDS = 120
 
+#: How many traces one Jaeger query may return. It lives here because a read's
+#: provenance has to say whether its answer was capped: a full page is the
+#: server's limit, never a census of the window it was asked about.
+JAEGER_TRACE_LIMIT = 20
+
 # Span-metrics labels that can carry the two facts an edge attribution needs:
 # which service emitted the span, and whether it was the client or the server
 # side of the RPC. Candidates are tried against the schema the server actually
@@ -287,6 +292,108 @@ class PrometheusClient:
             return None
 
 
+def _data_list(payload: Any, path: str) -> list[Any]:
+    """The ``data`` list of a query API reply, or a failure.
+
+    A reply without one is a malformed answer, not an empty result. Reading it as
+    empty would let a changed or broken API look exactly like "nothing happened",
+    which is the one thing an evidence read must never do.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise LiveEnvironmentUnavailable(
+            f"jaeger {path} answered without a data list: {str(payload)[:120]}"
+        )
+    return list(payload["data"])
+
+
+def to_micros(moment: datetime) -> int:
+    """Jaeger's query API reads ``start``/``end`` in microseconds since the epoch."""
+    return int(moment.timestamp() * 1_000_000)
+
+
+class JaegerClient:
+    """Bounded, typed access to Jaeger's v1-compatible query API.
+
+    Two properties shape it, and both are defects it exists to avoid.
+
+    The store is bounded and in memory, so a query only means something when it
+    carries an explicit ``start``/``end``. The API's ``lookback`` argument bounds
+    the *search*; without bounds the answer is "the newest matching traces",
+    which is a statement about recent traffic rather than about an interval.
+
+    And an API error is not an empty result. A failed request raises, a request
+    that completes with nothing matching returns ``[]``, and the two are recorded
+    as different things instead of being flattened into "no evidence".
+    """
+
+    def __init__(self, base_url: str, *, client: httpx.Client | None = None) -> None:
+        self.base_url = base_url.rstrip("/")
+        self._client = client
+
+    def _get(self, path: str, params: dict[str, Any], timeout_seconds: float) -> Any:
+        client = self._client or httpx.Client(timeout=timeout_seconds, trust_env=False)
+        try:
+            response = client.get(f"{self.base_url}{path}", params=params)
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.TimeoutException as exc:
+            raise ReadTimeout(f"jaeger {path} exceeded {timeout_seconds}s") from exc
+        except httpx.HTTPStatusError as exc:
+            raise LiveEnvironmentUnavailable(
+                f"jaeger {path} failed: {exc}; body={_response_body(exc.response)}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise LiveEnvironmentUnavailable(f"jaeger {path} failed: {exc}") from exc
+        finally:
+            if self._client is None:
+                client.close()
+        return payload
+
+    def services(self, timeout_seconds: float) -> list[str]:
+        """Every service name the query API advertises, sorted."""
+        payload = self._get("/api/services", {}, timeout_seconds)
+        return sorted(str(name) for name in _data_list(payload, "/api/services"))
+
+    def operations(self, service: str, timeout_seconds: float) -> list[str]:
+        """Every operation name the query API advertises for ``service``.
+
+        This is the authoritative answer to "what does Jaeger call this span":
+        the names it offers for a service are the stored ``operationName`` values,
+        not the registry's aliases and not a name borrowed from another service's
+        language or instrumentation.
+        """
+        payload = self._get("/api/operations", {"service": service}, timeout_seconds)
+        return sorted(str(name) for name in _data_list(payload, "/api/operations"))
+
+    def traces(
+        self,
+        *,
+        service: str,
+        start_us: int,
+        end_us: int,
+        timeout_seconds: float,
+        operation: str | None = None,
+        limit: int = JAEGER_TRACE_LIMIT,
+    ) -> list[dict[str, Any]]:
+        """Traces for ``service`` whose start falls inside ``[start_us, end_us]``.
+
+        ``operation`` is optional on purpose. Jaeger matches it exactly against
+        the stored name, so filtering by an unverified one can turn "this name is
+        wrong" into "there were no traces"; a caller that has to tell those apart
+        has to ask both ways.
+        """
+        params: dict[str, Any] = {
+            "service": service,
+            "start": start_us,
+            "end": end_us,
+            "limit": limit,
+        }
+        if operation is not None:
+            params["operation"] = operation
+        payload = self._get("/api/traces", params, timeout_seconds)
+        return [trace for trace in _data_list(payload, "/api/traces") if isinstance(trace, dict)]
+
+
 class LiveEnvironment:
     """The real Astronomy Shop demo stack, reached over allow-listed HTTP APIs."""
 
@@ -303,7 +410,7 @@ class LiveEnvironment:
     ) -> None:
         self.settings = settings
         self.prometheus = PrometheusClient(settings.prometheus_base_url, client=http_client)
-        self.jaeger_base_url = settings.jaeger_base_url.rstrip("/")
+        self.jaeger = JaegerClient(settings.jaeger_base_url, client=http_client)
         self.flag_base_url = settings.flag_control_base_url.rstrip("/")
         self._client = http_client
         self._http_timeout = 5.0
@@ -553,15 +660,28 @@ class LiveEnvironment:
                 collected_at=self._now(),
             )
         start, end = self._window(window_seconds)
-        traces = self._jaeger_traces(live, span_name, window_seconds, timeout_seconds)
+        start_us, end_us = to_micros(start), to_micros(end)
+        # The window has to be *requested*, not assumed: an unbounded query asks
+        # for the newest traces and answers about recent traffic instead.
+        traces = self.jaeger.traces(
+            service=live.service_name,
+            operation=span_name,
+            start_us=start_us,
+            end_us=end_us,
+            timeout_seconds=timeout_seconds,
+        )
         spans: list[dict[str, Any]] = []
         error_spans = 0
+        outside_window = 0
         for trace in traces:
             for span in trace.get("spans", []):
                 if span.get("operationName") != span_name:
                     continue
                 failed = _span_failed(span)
                 error_spans += 1 if failed else 0
+                started_us = span.get("startTime")
+                if isinstance(started_us, (int, float)) and not start_us <= started_us <= end_us:
+                    outside_window += 1
                 spans.append(
                     {
                         "name": span.get("operationName"),
@@ -576,9 +696,19 @@ class LiveEnvironment:
             value={
                 "operation": span_name,
                 "operation_alias": live.operation_alias,
+                # The service the query was scoped to, as the store names it.
+                "service": live.service_name,
                 "spans": spans[:20],
                 "span_count": len(spans),
                 "error_spans": error_spans,
+                # Provenance, so a caller can weigh the reading instead of
+                # trusting it: which traces answered, whether the page was
+                # capped, and whether any span fell outside the bounds asked for.
+                "trace_ids": [str(trace["traceID"]) for trace in traces if trace.get("traceID")],
+                "traces_returned": len(traces),
+                "trace_limit": JAEGER_TRACE_LIMIT,
+                "truncated": len(traces) >= JAEGER_TRACE_LIMIT,
+                "spans_outside_window": outside_window,
                 "source": "jaeger",
             },
             is_simulated=False,
@@ -594,31 +724,6 @@ class LiveEnvironment:
         if operation == live.operation_alias:
             return live.operation
         return None
-
-    def _jaeger_traces(
-        self, live: LiveTarget, span_name: str, window_seconds: int, timeout_seconds: float
-    ) -> list[dict[str, Any]]:
-        client = self._client or httpx.Client(timeout=timeout_seconds, trust_env=False)
-        try:
-            response = client.get(
-                f"{self.jaeger_base_url}/api/traces",
-                params={
-                    "service": live.service_name,
-                    "operation": span_name,
-                    "lookback": f"{max(window_seconds, 60)}s",
-                    "limit": 20,
-                },
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except httpx.TimeoutException as exc:
-            raise ReadTimeout(f"jaeger query exceeded {timeout_seconds}s") from exc
-        except httpx.HTTPError as exc:
-            raise LiveEnvironmentUnavailable(f"jaeger query failed: {exc}") from exc
-        finally:
-            if self._client is None:
-                client.close()
-        return list(payload.get("data") or [])
 
     def read_service_health(self, *, target: str, timeout_seconds: float) -> ToolResult:
         """One bounded health probe built from spans and container metrics.
@@ -1059,10 +1164,13 @@ def _span_failed(span: dict[str, Any]) -> bool:
 __all__ = [
     "CALLS_METRIC_CANDIDATES",
     "FLAG_SAFE_VARIANT",
+    "JAEGER_TRACE_LIMIT",
     "LIVE_TARGETS",
     "DispatchRefused",
+    "JaegerClient",
     "LiveEnvironment",
     "LiveEnvironmentUnavailable",
     "LiveTarget",
     "PrometheusClient",
+    "to_micros",
 ]

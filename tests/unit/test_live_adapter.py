@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -27,7 +28,12 @@ from opsaccord.tools.contracts import (
     UnknownDemoTarget,
     classify_dependency_edge,
 )
-from opsaccord.tools.live_environment import LiveEnvironment, LiveEnvironmentUnavailable
+from opsaccord.tools.live_environment import (
+    JAEGER_TRACE_LIMIT,
+    LiveEnvironment,
+    LiveEnvironmentUnavailable,
+    to_micros,
+)
 
 CALLS = "traces_span_metrics_calls_total"
 DURATION = "traces_span_metrics_duration_milliseconds_bucket"
@@ -84,6 +90,8 @@ class FakeStack:
         span_labels: set[str] | None = None,
         span_kind_values: list[str] | None = None,
         errors_by_service: dict[str, float] | None = None,
+        traces_status: int | None = None,
+        traces_body: dict[str, Any] | None = None,
     ) -> None:
         self.calls = calls
         self.errors = errors
@@ -104,6 +112,11 @@ class FakeStack:
         self.queries: list[str] = []
         self.writes: list[dict[str, Any]] = []
         self.series_selectors: list[str] = []
+        #: The exact params of every Jaeger query, so a test can assert what was
+        #: asked for rather than only what came back.
+        self.trace_queries: list[dict[str, str]] = []
+        self.traces_status = traces_status
+        self.traces_body = traces_body
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         if self.fail is not None:
@@ -136,7 +149,10 @@ class FakeStack:
                 json={"status": "success", "data": {"resultType": "vector", "result": result}},
             )
         if path.endswith("/api/traces"):
-            return httpx.Response(200, json={"data": self.traces})
+            self.trace_queries.append(dict(request.url.params))
+            if self.traces_status is not None:
+                return httpx.Response(self.traces_status, json={"data": None})
+            return httpx.Response(200, json=self.traces_body or {"data": self.traces})
         if path.endswith("/api/read"):
             return httpx.Response(200, json=self.flags)
         if path.endswith("/api/write"):
@@ -311,6 +327,104 @@ def test_traces_read_refuses_an_operation_the_revision_does_not_export() -> None
     assert result.succeeded is False
     assert "no verified span" in (result.error or "")
     assert stack.queries == []
+    assert stack.trace_queries == []
+
+
+def test_traces_read_asks_for_its_own_window_with_explicit_bounds() -> None:
+    """The reported window has to be the one that was requested, in microseconds.
+
+    An unbounded Jaeger query answers "the newest matching traces", which is a
+    statement about recent traffic; the adapter used to report the window it had
+    computed as though it had asked for it. Both halves are checked here: the
+    request carries bounds, and they are the ones the result reports.
+    """
+    stack = FakeStack()
+
+    result = build(stack).read_traces(
+        target="payment-service", operation="Charge", window_seconds=300, timeout_seconds=2.0
+    )
+
+    assert len(stack.trace_queries) == 1
+    asked = stack.trace_queries[0]
+    assert asked["service"] == "payment"
+    assert asked["operation"] == "oteldemo.PaymentService/Charge"
+    assert asked["limit"] == "20"
+    assert "lookback" not in asked
+    assert asked["start"] == str(to_micros(result.observation_window_start))
+    assert asked["end"] == str(to_micros(result.observation_window_end))
+    assert result.value["service"] == "payment"
+
+
+def test_traces_read_counts_spans_outside_the_window_it_asked_for() -> None:
+    """Bounds are requested, not guaranteed, so an out-of-window span is recorded."""
+    inside = int(datetime.now(UTC).timestamp() * 1_000_000) - 1_000_000
+    stack = FakeStack(
+        traces=[
+            {
+                "traceID": "inside",
+                "spans": [
+                    {
+                        "operationName": "oteldemo.PaymentService/Charge",
+                        "startTime": inside,
+                        "duration": 1_000,
+                        "tags": [],
+                    }
+                ],
+            },
+            {
+                "traceID": "outside",
+                "spans": [
+                    {
+                        "operationName": "oteldemo.PaymentService/Charge",
+                        "startTime": inside - 86_400_000_000,
+                        "duration": 1_000,
+                        "tags": [],
+                    }
+                ],
+            },
+        ]
+    )
+
+    result = build(stack).read_traces(
+        target="payment-service", operation="Charge", window_seconds=300, timeout_seconds=2.0
+    )
+
+    assert result.value["span_count"] == 2
+    assert result.value["spans_outside_window"] == 1
+    assert result.value["trace_ids"] == ["inside", "outside"]
+    assert result.value["traces_returned"] == 2
+    assert result.value["truncated"] is False
+
+
+def test_traces_read_marks_a_full_page_as_capped() -> None:
+    stack = FakeStack(
+        traces=[
+            {
+                "traceID": f"t{index}",
+                "spans": [{"operationName": "oteldemo.PaymentService/Charge", "tags": []}],
+            }
+            for index in range(JAEGER_TRACE_LIMIT)
+        ]
+    )
+
+    result = build(stack).read_traces(
+        target="payment-service", operation="Charge", window_seconds=300, timeout_seconds=2.0
+    )
+
+    assert result.value["traces_returned"] == JAEGER_TRACE_LIMIT
+    assert result.value["trace_limit"] == JAEGER_TRACE_LIMIT
+    assert result.value["truncated"] is True
+    assert len(result.value["trace_ids"]) == JAEGER_TRACE_LIMIT
+
+
+def test_a_traces_reply_without_a_data_list_is_not_an_empty_read() -> None:
+    """A malformed answer must not read as "the dependency was healthy"."""
+    stack = FakeStack(traces_body={"total": 0})
+
+    with pytest.raises(LiveEnvironmentUnavailable):
+        build(stack).read_traces(
+            target="payment-service", operation="Charge", window_seconds=300, timeout_seconds=2.0
+        )
 
 
 def test_health_is_not_serving_when_the_dependency_call_fails() -> None:
