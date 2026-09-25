@@ -26,6 +26,20 @@ It is bounded and it cleans up:
 * the flag is restored in a ``finally`` block, including after Ctrl+C or a failed
   read, and the read-back is printed and recorded either way.
 
+What it reports, and what it deliberately does not:
+
+* every poll is classified into one of four evidence classes (see
+  ``opsaccord.tools.fault_evidence``): an attributable failure on the Charge
+  edge, a generic caller failure without it, traffic with no failure in it, or no
+  usable observation. The headline ``verdict`` is the *strongest* class observed
+  while armed, and the per-class counts are reported beside it, because the first
+  polls of any capture read a window that predates the injection;
+* ``recovery`` is ``assessed: false``. The post-restore sample averages the window
+  that contains the armed period, so it cannot show that the service recovered;
+* exit status is ``0`` when the capture completed and the flag was restored (the
+  verdict is data, not a pass/fail), ``1`` when the capture itself failed, ``3``
+  when it refused to start, and ``4`` when the flag could not be restored.
+
 Usage (the validated path is the copy-paste block in
 ``docs/reports/phase1-implementation.md``; run it from the repository root after
 ``scripts/demo.sh endpoints`` has written ``.local/demo-endpoints.env``):
@@ -59,7 +73,11 @@ from opsaccord.scenarios.live import (  # noqa: E402
     live_settings,
     restore_owned_fault,
 )
-from opsaccord.tools.contracts import TELEMETRY_ERROR_BOUND  # noqa: E402
+from opsaccord.tools.fault_evidence import (  # noqa: E402
+    EVIDENCE_CLASSES,
+    classify_reading,
+    summarize,
+)
 from opsaccord.tools.live_environment import (  # noqa: E402
     CALLS_METRIC_CANDIDATES,
     CLIENT_SPAN_KIND_TOKEN,
@@ -160,29 +178,15 @@ def shares(grouped: Any, *, service: str, kind_token: str | None = None) -> dict
     }
 
 
-def classify(charge: Any, place_order: Any, dependency: dict[str, Any] | None) -> str:
-    """Name what the capture shows, in the vocabulary the scenario uses."""
-    client = shares(charge, service="checkout", kind_token=CLIENT_SPAN_KIND_TOKEN)
-    parent = shares(place_order, service="checkout")
-    attributable = bool(
-        dependency
-        and dependency.get("attributable") is True
-        and float(dependency.get("calls_per_second") or 0.0) > 0.0
-        and float(dependency.get("error_rate") or 0.0) > TELEMETRY_ERROR_BOUND
-    )
-    if attributable:
-        return "attributable_failure"
-    if parent["error_share"] > TELEMETRY_ERROR_BOUND and client["error_share"] <= (
-        TELEMETRY_ERROR_BOUND
-    ):
-        return "generic_caller_failure_only"
-    if client["calls_per_second"] == 0.0 and parent["calls_per_second"] == 0.0:
-        return "no_traffic"
-    return "no_attributable_failure"
-
-
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "exit status: 0 capture completed and the flag was restored, 1 the capture "
+            "failed, 3 it refused to start, 4 the flag could not be restored"
+        ),
+    )
     parser.add_argument("--seconds", type=float, default=600.0)
     parser.add_argument("--poll", type=float, default=20.0)
     parser.add_argument("--window", type=int, default=DEPENDENCY_PREMISE_WINDOW_SECONDS)
@@ -327,8 +331,11 @@ def main(argv: list[str] | None = None) -> int:
                     "error_spans": traces.value.get("error_spans"),
                 },
             }
-            entry["verdict"] = classify(
-                charge, place_order, dependency.value if dependency.succeeded else None
+            entry["verdict"] = classify_reading(
+                client=entry["charge_client"],
+                parent=entry["place_order_caller"],
+                dependency=dependency.value if dependency.succeeded else None,
+                readable=dependency.succeeded,
             )
             log(
                 f"[{tag}] flag={entry['flag_variant']} verdict={entry['verdict']} "
@@ -376,26 +383,57 @@ def main(argv: list[str] | None = None) -> int:
                 }
         except Exception as exc:  # a failed read must not hide the cleanup result
             capture["after_restore"] = {"error": f"{type(exc).__name__}: {exc}"}
+        if isinstance(capture["after_restore"], dict):
+            # Named for what it is. The sample spans the same window as the last
+            # armed reading, so it reports what the window held, not what the
+            # restore caused; recovery needs a fresh window after the restore.
+            capture["after_restore"]["caveat"] = (
+                "post-restore sample, not recovery evidence: it averages the window that "
+                "includes the armed period"
+            )
         client.close()
 
-    verdicts = [item["verdict"] for item in capture["observations"]]
-    capture["verdict"] = max(verdicts, key=verdicts.count) if verdicts else "no_observation"
+    summary = summarize(item["verdict"] for item in capture["observations"])
+    capture["verdict"] = summary.strongest
+    capture["evidence_summary"] = summary.as_dict()
+    capture["recovery"] = {
+        "assessed": False,
+        "reason": (
+            "no reading in this capture can show recovery: the post-restore sample averages the "
+            "window that contains the armed period, so a clean reading there is as consistent "
+            "with the fault never having been in effect as with the service having recovered. "
+            "Recovery needs a fresh window after the restore."
+        ),
+    }
+    if not capture.get("restored"):
+        exit_status = 4
+    elif capture.get("error") is not None:
+        exit_status = 1
+    else:
+        exit_status = 0
+    capture["exit_status"] = exit_status
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(capture, indent=1, sort_keys=True), encoding="utf-8")
-    log(f"verdict: {capture['verdict']}")
+    counts = capture["evidence_summary"]["classes"]
+    log(
+        f"verdict: {capture['verdict']} (strongest of {summary.total} armed readings; "
+        + ", ".join(f"{name}={counts[name]}" for name in EVIDENCE_CLASSES)
+        + f"; last={summary.last})"
+    )
+    log(f"attributable failure observed while armed: {summary.attributable_observed}")
+    log(f"recovery assessed: False - {capture['recovery']['reason']}")
     log(f"capture written to {out_path}")
     log(
         "reading: 'attributable_failure' means the caller's own client share for the Charge "
         "edge rose above the telemetry bound, which is the evidence P1-01's premise and "
         "diagnosis both require. 'generic_caller_failure_only' is the 2026-09-24 signature: "
         "the demo degraded without that evidence, so this revision cannot demonstrate P1-01 "
-        "as written."
+        "as written. 'traffic_without_failure' is traffic on the path with nothing above the "
+        "bound, which is not health. 'no_usable_observation' is no traffic or a reading that "
+        "could not be taken, which is not health either."
     )
-    if not capture.get("restored"):
-        return 4
-    if capture.get("error") is not None:
-        return 1
-    return 0
+    log(f"exit status: {exit_status}")
+    return exit_status
 
 
 if __name__ == "__main__":
