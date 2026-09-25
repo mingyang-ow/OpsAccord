@@ -2476,6 +2476,47 @@ This is a stack-readiness question, not a trace question, and it is the precondi
 the trace half of P1-01 cannot be attempted until `checkout` registers in the store. Phase 1 remains
 PARTIAL.
 
+### The first live trace through the new classifier (11:28:33) - a corrected defect, and a confounded stack
+
+The stack-recovery run found `checkout` registered: 13 services, **4 operations** advertised for it,
+`oteldemo.CheckoutService/PlaceOrder` **observed in a returned trace** (so the registry's name is the
+stored one, re-measured), the bounded retrieval check retrieving its anchor, and **one** trace in the
+fifteen-minute interval - `290d12a9429910cab4800d4a44b79e43`, 11:26:51-11:27:56, **73 spans**. That is
+the first live payload this pass's classifier has seen, and it did its job and showed one defect.
+
+**Confirmed working on live data.** The trace root is resolved from references, not from the operation
+name: it is the load generator's own `user_checkout_multi` span (`root candidates=1`), with the frontend's
+identically named client span hanging below it. The status vocabulary read real signals the old code
+discarded, including a `frontend-proxy/router frontend egress` span whose only failure marker is the
+`error` tag. The whole payload is in the extract as a table (73 rows, `status counts {ERROR: 17, OK: 20,
+UNSET: 36}`, every span positioned `during_window`), which is what made the defect below visible at all.
+
+**The defect the live payload demonstrated (`09f8c56`).** The attempt search compared
+`span.kind == "SPAN_KIND_SERVER"`, the OTLP enum name this repo's fixtures use. The live query API stores
+the semantic-convention value, **`server`**, so no span matched, the search fell back to the longest span
+carrying `oteldemo.CheckoutService/PlaceOrder` - the **frontend client** span - and reported it as the
+measured attempt, demoting `checkout`'s server span to a child of it and placing the whole ancestry one
+level too high (`attempt basis: the longest span carrying the measured operation below a parentless
+span`). This is precisely the mis-description `0a898b8` set out to remove, in the spelling the live payload
+uses; the fixtures could not have caught it. `span_kind_of()` now reduces both spellings to the word, and
+the regression test is built from this trace's captured structure.
+
+**What the trace also proves, and it is not about Payment.** This `PlaceOrder` failed **before** the
+measured edge was reached - `edge_span_absent_with_a_failure_recorded`, no `Charge` span anywhere in the
+73 - and the recorded reason is not payment: `checkout/oteldemo.ProductCatalogService/GetProduct` failed
+with `error reading server preface: raw-read tcp 172.18.0.25:46450->172.18.0.20:3550: use of closed
+network connection`, and the attempt records `failed to prepare order: failed to get product
+#"L9ECAV7KIM"`. `scripts/demo.sh status` in the same run shows every container up except
+`product-catalog`, which is **Up (unhealthy)**. So the current stack fails `PlaceOrder` for a reason that
+has nothing to do with payment, and a Payment capture taken against it would measure the product catalog.
+That is a stack defect to fix before any armed capture, not a trace-classification question, and it is
+recorded here rather than worked around: no selector, limit, wait or scenario was changed.
+
+Checks on this tree: offline `263 passed, 7 skipped, 85 deselected` in both variants, `ruff check`,
+`ruff format --check` (89 files) and `mypy src/opsaccord` (42 files) clean - logs
+`reports/local/validation-20260925T113048`. Reading of the live run: `.local/user-live-checks-20260925T112831/`
+(`demo-status.log`, `trace-readiness.log`) and `reports/local/payment-trace-readiness-20260925T112831.json`.
+
 ## Remaining work and discussion
 
 **Blockers (environment, not code):**
