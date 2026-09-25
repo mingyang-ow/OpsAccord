@@ -443,6 +443,13 @@ def summarize_trace(
     Each span is reported with the service that emitted it, because for this
     question the interesting fact is precisely that the caller's *client* span for
     the edge belongs to ``checkout`` and the callee's *server* span to ``payment``.
+
+    ``spans`` is the whole payload as a table, earliest start first, each row
+    carrying the same fields as the named spans plus its relationship to the
+    attempt. The named rows answer the question; the table is what lets a reader
+    check the answer, because a span that is neither an ancestor, a child, the edge
+    nor failing - a retry, a sibling branch, the load generator's own HTTP span -
+    otherwise never appears in the summary at all.
     """
     spans = [span for span in (trace.get("spans") or []) if isinstance(span, Mapping)]
     processes = trace.get("processes") or {}
@@ -537,6 +544,7 @@ def summarize_trace(
         "edge_span": None,
         "other_edge_spans": [],
         "failure_message": None,
+        "spans": [brief(span_id) for span_id in order],
     }
     candidates = [span_id for span_id in order if records[span_id]["operation"] == root_operation]
     if not candidates:
@@ -624,6 +632,19 @@ def summarize_trace(
     if failure_message is None:
         failure_message = next((span["message"] for span in failed_spans if span["message"]), None)
     end_times = [record["ends_at_us"] for record in records.values() if record["ends_at_us"]]
+    table = []
+    for span_id in sorted(
+        order,
+        key=lambda sid: (
+            _as_float(records[sid]["started_at_us"]) is None,
+            _as_float(records[sid]["started_at_us"]) or 0.0,
+        ),
+    ):
+        name, hops = relationship(span_id)
+        entry = brief(span_id)
+        entry["relationship"] = name
+        entry["hops_from_attempt"] = hops
+        table.append(entry)
     return {
         "trace_id": trace.get("traceID"),
         "spans_seen": len(spans),
@@ -645,6 +666,7 @@ def summarize_trace(
         "span_status_counts": status_counts,
         "span_position_counts": position_counts,
         "latest_span_end_us": max(end_times) if end_times else None,
+        "spans": table,
     }
 
 

@@ -561,6 +561,142 @@ def test_the_extract_is_written_with_its_stages_and_evidence(
     assert extract["stages"]["services"]["caller_service_visible"] is True
 
 
+# --- naming the traces the run is about --------------------------------------
+
+
+def test_a_named_trace_is_queried_without_an_operation_filter(export: Any) -> None:
+    """The named ids are what the caller wants; a filter could only exclude them."""
+    fake = FakeJaeger(traces=[place_order_trace("wanted", start_us=HISTORICAL[0])])
+
+    probe(export, fake, trace_ids=("wanted",))
+
+    historical = [call for call in fake.trace_requests if call["start"] == str(HISTORICAL[0])]
+    assert historical, fake.trace_requests
+    assert "operation" not in historical[0]
+    assert historical[0]["service"] == "checkout"
+
+
+def test_only_the_named_traces_are_reported_and_counted(export: Any) -> None:
+    """A page answers "what starts here", so the rest of it is not the caller's question."""
+    fake = FakeJaeger(
+        traces=[
+            place_order_trace("wanted", start_us=HISTORICAL[0]),
+            place_order_trace("wanted-too", start_us=HISTORICAL[0] + SECOND),
+            place_order_trace("other", start_us=HISTORICAL[0] + 2 * SECOND),
+        ]
+    )
+
+    result = probe(export, fake, trace_ids=("wanted", "wanted-too"))
+
+    assert [item["trace_id"] for item in result["traces"]] == ["wanted", "wanted-too"]
+    assert result["missing_trace_ids"] == []
+    # The stage still records the whole page: the narrowed report is not a smaller page.
+    assert result["stages"]["historical"]["count"] == 3
+
+
+def test_a_named_trace_the_interval_did_not_return_is_reported_as_missing(
+    export: Any,
+) -> None:
+    """Retention, the interval and the collector stay separate causes, not one verdict."""
+    fake = FakeJaeger(traces=[place_order_trace("held", start_us=HISTORICAL[0])])
+
+    result = probe(export, fake, trace_ids=("held", "rotated-out"))
+
+    assert [item["trace_id"] for item in result["traces"]] == ["held"]
+    assert result["missing_trace_ids"] == ["rotated-out"]
+
+
+def test_select_requested_keeps_the_callers_order_and_deduplicates(export: Any) -> None:
+    summaries = [{"trace_id": "b"}, {"trace_id": "a"}]
+
+    kept, missing = export.select_requested(summaries, ["a", "b", "a", "c"])
+
+    assert [item["trace_id"] for item in kept] == ["a", "b"]
+    assert missing == ["c"]
+
+
+def test_a_missing_named_trace_makes_the_run_fail(
+    export: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial hand-off must not read as a complete one, even with every query answered."""
+    inside = iso_to_micros("2026-09-25T02:24:41Z")
+    fake = FakeJaeger(traces=[place_order_trace("held", start_us=inside)])
+    out = tmp_path / "extract.json"
+    # Build the client before patching, or ``FakeJaeger`` would patch itself.
+    http_client = fake._http_client()
+    monkeypatch.setattr(export.httpx, "Client", lambda **_: http_client)
+    monkeypatch.setenv("OPSACCORD_JAEGER_BASE_URL", "http://jaeger.test/jaeger/ui")
+
+    status = export.main(
+        [
+            "--start",
+            "2026-09-25T02:24:30Z",
+            "--end",
+            "2026-09-25T02:25:10Z",
+            "--trace-id",
+            "held",
+            "--trace-id",
+            "rotated-out",
+            "--out",
+            str(out),
+        ]
+    )
+
+    assert status == 1
+    extract = json.loads(out.read_text())
+    assert extract["failures"] == {}
+    assert extract["requested_trace_ids"] == ["held", "rotated-out"]
+    assert extract["missing_trace_ids"] == ["rotated-out"]
+    assert extract["counts"] == {"traces": 1, "with_error_spans": 1, "without_error_spans": 0}
+    assert [item["trace_id"] for item in extract["traces"]] == ["held"]
+
+
+# --- the whole payload, not only the spans the answer rests on ---------------
+
+
+def test_the_extract_carries_every_span_with_its_relationship_and_position(
+    export: Any,
+) -> None:
+    """A sibling branch or the load generator's own span has to stay checkable.
+
+    Only named rows - the attempt, its ancestry, its children, the edge, the failing
+    spans - cannot be audited: the span that is none of those is exactly the one a
+    reader needs in order to disagree with how the others were classified.
+    """
+    start = HISTORICAL[0]
+    trace_ = place_order_trace("t1", start_us=start)
+    trace_["spans"][0]["startTime"] = start + 2  # the load generator's span starts first
+    trace_["spans"].append(
+        {
+            "traceID": "t1",
+            "spanID": "t1-lg",
+            "operationName": "POST",
+            "processID": "load-generator",
+            "startTime": start + 1,
+            "duration": 900,
+            "tags": [{"key": "otel.status_code", "value": "ERROR"}],
+        }
+    )
+    trace_["processes"]["load-generator"] = {"serviceName": "load-generator"}
+
+    summary = probe(export, FakeJaeger(traces=[trace_]))["traces"][0]
+
+    table = {row["span_id"]: row for row in summary["spans"]}
+    assert set(table) == {"t1-root", "t1-charge", "t1-lg"}
+    assert next(row["span_id"] for row in summary["spans"]) == "t1-lg"  # earliest start first
+    assert table["t1-root"]["relationship"] == "same_span"
+    assert table["t1-charge"]["relationship"] == "direct_child"
+    assert table["t1-charge"]["hops_from_attempt"] == 1
+    assert table["t1-charge"]["position"] == "during_window"
+    # A parentless span that is not the attempt is an unrelated branch, not a child.
+    assert table["t1-lg"]["relationship"] == "unrelated_branch"
+    assert table["t1-lg"]["position"] == "during_window"
+    assert table["t1-lg"]["service"] == "load-generator"
+    described = export.describe(summary, summary["finding"])
+    assert "every span in the payload" in described
+    assert "t1-lg <- (none)" in described
+
+
 # --- the bounds, the counts and the ladder ----------------------------------
 
 

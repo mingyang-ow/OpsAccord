@@ -29,6 +29,15 @@ Every request is a read-only HTTP GET against Jaeger's query API with explicit
 ``start``/``end`` bounds. No flag is armed, cleared or changed, no scenario runs,
 nothing is written to the demo, and there is therefore nothing to restore.
 
+``--trace-id`` narrows the run to traces the caller already has. The interval is
+still queried with explicit bounds - the store is in memory and the query API has
+no "fetch this id" route this project uses - but the historical query is then made
+*without* an operation filter, because a named trace is what the caller wants and
+an unverified operation name could only exclude it. Every returned trace that is
+not one of the named ids is dropped from the counts and the report, an id the page
+does not hold is listed as missing rather than passed off as absent, and the run
+exits ``1`` in that case so a partial hand-off cannot read as a complete one.
+
 What this script does *not* claim. An empty answer is not eviction: an in-memory
 store that no longer holds an interval, an operation filter that does not match
 the stored name, and a collector that dropped the traces are different facts, and
@@ -64,7 +73,8 @@ Usage (after ``scripts/demo.sh endpoints`` has written the endpoint file):
         --start 2026-09-25T00:56:00Z --end 2026-09-25T01:06:00Z
 
 Exit status: ``0`` every query completed (whatever they found), ``1`` at least one
-query failed to complete, ``2`` bad arguments, ``3`` it refused to start.
+query failed to complete or a named trace was not returned, ``2`` bad arguments,
+``3`` it refused to start.
 """
 
 from __future__ import annotations
@@ -224,6 +234,25 @@ def trace_stage(
     return record
 
 
+def select_requested(
+    summaries: list[dict[str, Any]], requested: list[str]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """The named traces this page held, and the names it did not.
+
+    A page answers "which traces *start* inside this interval", not "where is this
+    request". A named trace the page does not hold is therefore reported as *not
+    returned by this query* - weaker, and true - rather than as "not retained": the
+    store may have rotated it out, the interval may not cover its start, or the
+    collector may never have kept it. The reply keeps the caller's order so two
+    runs of the same command read the same way.
+    """
+    wanted = list(dict.fromkeys(str(item) for item in requested))
+    by_id = {str(item.get("trace_id")): item for item in summaries}
+    return [by_id[item] for item in wanted if item in by_id], [
+        item for item in wanted if item not in by_id
+    ]
+
+
 def choose_entry_operation(
     *, expected: str, advertised: list[str], observed: list[str]
 ) -> tuple[str, str]:
@@ -295,6 +324,8 @@ class ProbeRequest:
     recent_start_us: int
     recent_end_us: int
     limit: int
+    #: Traces the caller named. Empty means "report whatever the interval holds".
+    trace_ids: tuple[str, ...] = ()
 
     def window(self) -> dict[str, str]:
         return {"start": iso(self.window_start_us / 1e6), "end": iso(self.window_end_us / 1e6)}
@@ -356,6 +387,8 @@ def describe(summary: dict[str, Any], finding: str) -> str:
     if summary.get("other_edge_spans"):
         lines.append("  other spans carrying the edge operation:")
         lines.extend(f"    {span_row(item)}" for item in summary["other_edge_spans"])
+    lines.append("  every span in the payload, earliest start first:")
+    lines.extend(f"    {span_row(item)}" for item in summary.get("spans") or [])
     lines.append("  spans reported failing:")
     lines.extend(f"    {span_row(item)}" for item in summary.get("failed_spans") or [])
     if not summary.get("failed_spans"):
@@ -525,11 +558,15 @@ def run_probe(client: JaegerClient, request: ProbeRequest) -> dict[str, Any]:
                 f"{check_window_iso}: retrieved={stages['bounded_retrieval_check']['retrieved']}"
             )
 
+    # A named trace is what the caller wants, so the operation filter is dropped for
+    # it: the filter's only work would be to exclude the very payload asked for, and
+    # the entry-operation choice it depends on is itself unverified on this stack.
+    historical_operation = None if request.trace_ids else chosen
     ok, historical = stage(
         "historical",
         lambda: client.traces(
             service=CALLER_SERVICE,
-            operation=chosen,
+            operation=historical_operation,
             start_us=request.window_start_us,
             end_us=request.window_end_us,
             timeout_seconds=REQUEST_TIMEOUT_SECONDS,
@@ -542,14 +579,25 @@ def run_probe(client: JaegerClient, request: ProbeRequest) -> dict[str, Any]:
             historical,
             window=request.window(),
             service=CALLER_SERVICE,
-            operation=chosen,
+            operation=historical_operation,
             limit=request.limit,
         )
-        log(
-            f"{chosen} traces in {request.window()}: {len(historical)}"
-            f"{' (capped)' if stages['historical']['truncated'] else ''}"
+        if request.trace_ids:
+            stages["historical"]["requested_trace_ids"] = list(request.trace_ids)
+            stages["historical"]["operation_filter_skipped"] = (
+                "the caller named the traces it wants, so the interval was queried without an "
+                "operation filter: an unverified name could only exclude them"
+            )
+        filter_note = (
+            "no operation filter, the caller named the traces"
+            if request.trace_ids
+            else f"operation={chosen!r}"
         )
-    if ok and not historical:
+        log(
+            f"interval query {request.window()}: {len(historical)} traces"
+            f"{' (capped)' if stages['historical']['truncated'] else ''}; {filter_note}"
+        )
+    if ok and not historical and not request.trace_ids:
         # The same interval without an operation filter: an empty filtered answer
         # is only interpretable beside an unfiltered one.
         unfiltered_ok, unfiltered = stage(
@@ -575,16 +623,21 @@ def run_probe(client: JaegerClient, request: ProbeRequest) -> dict[str, Any]:
                 f"{stages['historical_unfiltered']['count']}"
             )
 
+    summaries = summarize_traces(
+        historical,
+        root_operation=chosen,
+        window=(request.window_start_us, request.window_end_us),
+    )
+    missing: list[str] = []
+    if request.trace_ids:
+        summaries, missing = select_requested(summaries, list(request.trace_ids))
     return {
         "stages": stages,
         "failures": failures,
         "services_visible": sorted(str(name) for name in services),
         "operation_analysed": chosen,
-        "traces": summarize_traces(
-            historical,
-            root_operation=chosen,
-            window=(request.window_start_us, request.window_end_us),
-        ),
+        "traces": summaries,
+        "missing_trace_ids": missing,
     }
 
 
@@ -670,7 +723,8 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "exit status: 0 every query completed (whatever they found), 1 at least one query "
-            "failed to complete, 2 bad arguments, 3 it refused to start"
+            "failed to complete or a named trace was not returned, 2 bad arguments, 3 it "
+            "refused to start"
         ),
     )
     parser.add_argument("--start", default=None, help="UTC ISO start, e.g. 2026-09-25T00:56:00Z")
@@ -683,6 +737,18 @@ def main(argv: list[str] | None = None) -> int:
         help="length of the bounded recent window used to establish that queries work",
     )
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    parser.add_argument(
+        "--trace-id",
+        dest="trace_ids",
+        action="append",
+        default=[],
+        metavar="ID",
+        help=(
+            "report only this trace id (repeatable). The interval is queried without an "
+            "operation filter, ids the page did not hold are listed as missing, and the run "
+            "exits 1 if any named trace was not returned"
+        ),
+    )
     parser.add_argument("--max-traces", type=int, default=DEFAULT_MAX_TRACES)
     parser.add_argument(
         "--max-success",
@@ -718,6 +784,7 @@ def main(argv: list[str] | None = None) -> int:
         recent_start_us=recent_start,
         recent_end_us=recent_end,
         limit=args.limit,
+        trace_ids=tuple(str(item) for item in args.trace_ids),
     )
     out_path = args.out or (Path("reports/local") / f"payment-trace-path-{int(time.time())}.json")
     extract: dict[str, Any] = {
@@ -733,6 +800,8 @@ def main(argv: list[str] | None = None) -> int:
         "operation": ENTRY_OPERATION,
         "operation_analysed": None,
         "edge_operation": EDGE_OPERATION,
+        "requested_trace_ids": list(dict.fromkeys(str(item) for item in args.trace_ids)),
+        "missing_trace_ids": [],
         "stages": {},
         "failures": {},
         "services_visible": [],
@@ -744,6 +813,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     exit_status = 0
     summaries: list[dict[str, Any]] = []
+    missing: list[str] = []
     client = httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS, trust_env=False)
     try:
         probe = run_probe(JaegerClient(base, client=client), request)
@@ -752,13 +822,30 @@ def main(argv: list[str] | None = None) -> int:
         extract["services_visible"] = probe["services_visible"]
         extract["operation_analysed"] = probe["operation_analysed"]
         summaries = probe["traces"]
-        exit_status = 1 if probe["failures"] else 0
+        missing = probe["missing_trace_ids"]
+        # A partial hand-off must not read as a complete one, so a named trace the
+        # interval did not return carries the same exit status as a failed query.
+        exit_status = 1 if probe["failures"] or missing else 0
     except Exception as exc:
         extract["error"] = f"{type(exc).__name__}: {exc}"
         log(f"trace probe failed: {extract['error']}")
         exit_status = 1
     finally:
         client.close()
+
+    requested = list(dict.fromkeys(str(item) for item in args.trace_ids))
+    extract["missing_trace_ids"] = missing
+    if requested:
+        log(
+            f"named traces: {len(requested)} requested, {len(summaries)} returned by this "
+            f"interval's query, {len(missing)} not returned"
+        )
+        for trace_id in missing:
+            log(
+                f"  not returned by this query: {trace_id} - the store may have rotated it out, "
+                "the interval may not cover its start, or the collector may never have kept it; "
+                "this run does not tell those apart"
+            )
 
     failing = [item for item in summaries if item.get("has_error_spans")]
     without_errors = [item for item in summaries if not item.get("has_error_spans")]
@@ -778,17 +865,24 @@ def main(argv: list[str] | None = None) -> int:
             f"retained window actually seen: {extract['retained_window_seen']['earliest']} .. "
             f"{extract['retained_window_seen']['latest']}"
         )
-    for label, chosen_traces in (
-        ("trace with error spans", failing[: args.max_traces]),
-        ("trace without error spans", without_errors[: max(args.max_success, 0)]),
-    ):
-        for item in chosen_traces:
-            log(
-                f"[{label}] id={item.get('trace_id')} started={item.get('started_at')} "
-                f"ended={item.get('ended_at')} finding={item['finding']}"
-            )
-            for line in describe(item, item["finding"]).splitlines():
-                log(line)
+    if requested:
+        # Every named trace is described: the caller asked for these, not for a sample.
+        to_describe = [
+            (f"named trace {index + 1}/{len(summaries)}", item)
+            for index, item in enumerate(summaries)
+        ]
+    else:
+        to_describe = [("trace with error spans", item) for item in failing[: args.max_traces]] + [
+            ("trace without error spans", item)
+            for item in without_errors[: max(args.max_success, 0)]
+        ]
+    for label, item in to_describe:
+        log(
+            f"[{label}] id={item.get('trace_id')} started={item.get('started_at')} "
+            f"ended={item.get('ended_at')} finding={item['finding']}"
+        )
+        for line in describe(item, item["finding"]).splitlines():
+            log(line)
     log(f"trace counts: {extract['counts']} findings: {extract['finding_counts']}")
 
     evidence = evidence_ladder(
