@@ -8,7 +8,7 @@
 | Branch | `phase1/baseline` |
 | Base commit | `3168bcf` (branch point: design baseline and Phase 1 foundation) |
 | Implementation commit | `5102dbe` (the commit immediately preceding this report) |
-| Branch commits | `1296b23`, `821414a`, `b4b75aa`, `5102dbe`, `5cbcce2`, `b508a0f`, `cb60242`, the deadlock-correction commits `ed0d132` (committed user guidance), `7b66f11` (the fix), `7becf98` (review fixes), `e8a8e76` (records, which is what the user ran), the configuration-isolation commits `fe16796` (tests), `843b34d` (validation runner), `a60cecb` (records), `5294575` (corrected a test-selection count) and `7f8c71e` (review fixes), the live-run-recovery commits `74ac1f2` and `2286565`, the dependency-attribution commits `8165c3b`, `fe1a0ea` and `d873dae` (the live edge read pinned offline), the verification-reason commit `4ccca4d`, the braced-selector commit `952b045`, the test-scope correction `b4d80e7`, the live-premise correction `79d733e`, the records commits `d905465` and `9058671` (which is the revision the user ran for this pass), then the code-and-test commit `e6232c2` (the scoped health predicate, the attributed premise, the new fakes and tests, the bounded diagnostic capture), the records commit `723fe7b` (which is the revision the user ran for this pass), and the fault-evidence commit `56fab5a` (the four-class evidence vocabulary, the corrected verdict aggregation and the bounded read-only trace exporter), followed by this report's record commit, which is the tip (`git log --oneline -1`) - per-revision totals are reproducible with `git diff --shortstat 3168bcf <rev>`; for the branch tip as it stood at `b508a0f` that reports 87 files changed, 18404 insertions(+), 42 deletions(-). The commits after `4ccca4d` that change code are `952b045`, `b4d80e7`, `79d733e`, `e6232c2` and `56fab5a` - each also carries its own report update - while the rest are records only. |
+| Branch commits | `1296b23`, `821414a`, `b4b75aa`, `5102dbe`, `5cbcce2`, `b508a0f`, `cb60242`, the deadlock-correction commits `ed0d132` (committed user guidance), `7b66f11` (the fix), `7becf98` (review fixes), `e8a8e76` (records, which is what the user ran), the configuration-isolation commits `fe16796` (tests), `843b34d` (validation runner), `a60cecb` (records), `5294575` (corrected a test-selection count) and `7f8c71e` (review fixes), the live-run-recovery commits `74ac1f2` and `2286565`, the dependency-attribution commits `8165c3b`, `fe1a0ea` and `d873dae` (the live edge read pinned offline), the verification-reason commit `4ccca4d`, the braced-selector commit `952b045`, the test-scope correction `b4d80e7`, the live-premise correction `79d733e`, the records commits `d905465` and `9058671` (which is the revision the user ran for this pass), then the code-and-test commit `e6232c2` (the scoped health predicate, the attributed premise, the new fakes and tests, the bounded diagnostic capture), the records commit `723fe7b` (which is the revision the user ran for this pass), the fault-evidence commit `56fab5a` (the four-class evidence vocabulary, the corrected verdict aggregation and the bounded read-only trace exporter) and the trace-query commit `a686617` (the bounded trace read, the shared `JaegerClient`, the progressive read-only exporter and 24 new tests), followed by this report's record commit, which is the tip (`git log --oneline -1`) - per-revision totals are reproducible with `git diff --shortstat 3168bcf <rev>`; for the branch tip as it stood at `b508a0f` that reports 87 files changed, 18404 insertions(+), 42 deletions(-). The commits after `4ccca4d` that change code are `952b045`, `b4d80e7`, `79d733e`, `e6232c2`, `56fab5a` and `a686617` - each also carries its own report update - while the rest are records only. |
 | Dirty state | Clean except the user's own uncommitted `AGENTS.md` reviewer-policy change (`M AGENTS.md`, preserved and never staged); only gitignored local state (`.local/`, `reports/local/`, `.venv/`) otherwise remains |
 | Host | WSL 2, kernel `6.18.33.2-microsoft-standard-WSL2`, Ubuntu 26.04 LTS, 16 CPU, 15.5 GB RAM |
 | Toolchain | `uv` 0.12.5, Python 3.12.14 (`.python-version`), project-local PostgreSQL 18.6 on `127.0.0.1:55432`, Docker 29.7.2 (client and server), Docker Compose v5.4.0 |
@@ -23,7 +23,8 @@
 | **Test-scope / live-Payment status** | **PARTIAL** - at `2812871` the user's run cleared every stage except one acceptance check, so the harness stopped at integration and the live Payment path did not run. The failure was the check's own observation scope: it asked the whole incident history for the absence of a dependency read, and the P1-01 *diagnosis* plan reads the edge on purpose. The check is now scoped by persisted tool-call id and additionally asserts the persisted verdict; the user's `131320` run then verified it live. The live schema question is measured: the braced selector answers `200` with 160 series exposing `service_name` and `span_kind`. See "The test-scope correction (`114517`)". |
 | **Live-premise status (branch tip with this report)** | **PARTIAL** - the user's `131320` run is the first live run with attributable caller-side evidence (`checkout-service -> payment-service`, `Charge`, `span_kind=client`) and a verification that reports a *measured* continuing failure, but the premise of that run is not attributable: visibility was accepted 0.0s after the write from a 120s window that predates it, and both pre-injection readings already carried a 100% error share. The predicate is now a rise over pre-injection readings taken *before* the write, committed at `79d733e` and pinned by three new tests and a falsification log; the integration suite, the sensitivity harness, the simulated scenarios and the live path have not been re-run here. P1-01 has still never reached `RESOLVED`. See "The live Payment premise (`b4d80e7` measured, corrected at `79d733e`)". |
 | **Payment-evidence status (branch tip with this report)** | **PARTIAL** - at `9058671` the user's run cleared every stage (offline 197/7 in both variants, integration 85, static checks, sensitivity harness, 9/9 simulated scenarios) and the live P1-01 ended `SAFE_ESCALATION` / `READY_FOR_HUMAN` with zero approvals and zero actions, 541.9s, cleanup `on -> off` read back `off`. Its premise was accepted on a *generic* caller-side failure (checkout `PlaceOrder` 17.66%) while the attributed Charge edge read `error_rate` 0.0, so the controller had no attributable Payment evidence and handed off - correctly, on the evidence it had. Two corrections are committed at `e6232c2`: service-health reads are now scoped to the target's own spans, and the premise requires the attributed caller-side reading (`LivePlan.corroborating_dependency`) instead of a generic parent-span rise. P1-01 remains unverified on this revision, and Payment recovery has still never been demonstrated. See "The Payment fault's behaviour and a scoped premise (`9058671` measured, corrected at `e6232c2`)". |
-| **Payment fault-evidence status (branch tip with this report)** | **PARTIAL** - at `723fe7b` the user's diagnostic capture (30 polls, 00:56:03-01:05:48 UTC, flag armed and restored with a read-back) measured the mismatch decisively: at 00:58:04 checkout's `PlaceOrder` read a **0.3333** error share while the attributed Charge series read 0.0334 calls/s on `checkout`'s client spans and 0.0167 calls/s on `payment`'s, both at **0.0** error share, and the closing polls read a **1.0** caller error share with no Charge traffic at all. The pinned source confirms the injected failure *should* appear on the selected client span (same RPC, same operation name, same `otelgrpc` handler), so the inconsistency is real rather than a selector artefact. The traces that would settle it are unavailable: `_jaeger_traces` sends no `start`/`end`, so the capture's six distinct payloads were unbounded newest-N sets with no trace IDs, and Jaeger's store is bounded by `max_traces` rather than by age. This pass corrected the diagnostic's reporting - four disjoint evidence classes, the *strongest* reading instead of the commonest one (which reported the least informative class by construction), `recovery: assessed: false`, and an exit status that is recorded and printed - and added a bounded read-only trace exporter so the missing evidence can be collected in one shot; both are committed as `56fab5a`. Offline `218 passed, 7 skipped` in both variants; lint, format and `mypy` clean. P1-01 remains unverified and Payment recovery has still never been demonstrated. See "The payment fault-evidence pass (`723fe7b` measured)". |
+| **Payment fault-evidence status (branch tip with this report)** | **PARTIAL** - at `723fe7b` the user's diagnostic capture (30 polls, 00:56:03-01:05:48 UTC, flag armed and restored with a read-back) measured the mismatch decisively: at 00:58:04 checkout's `PlaceOrder` read a **0.3333** error share while the attributed Charge series read 0.0334 calls/s on `checkout`'s client spans and 0.0167 calls/s on `payment`'s, both at **0.0** error share, and the closing polls read a **1.0** caller error share with no Charge traffic at all. The pinned source confirms the injected failure *should* appear on the selected client span (same RPC, same operation name, same `otelgrpc` handler), so the inconsistency is real rather than a selector artefact. The traces that would settle it are unavailable: `_jaeger_traces` sends no `start`/`end`, so the capture's six distinct payloads were unbounded newest-N sets with no trace IDs, and Jaeger's store is bounded by `max_traces` rather than by age *(a bounded store is not a demonstrated eviction - corrected in the trace-query pass below)*. This pass corrected the diagnostic's reporting - four disjoint evidence classes, the *strongest* reading instead of the commonest one (which reported the least informative class by construction), `recovery: assessed: false`, and an exit status that is recorded and printed - and added a bounded read-only trace exporter so the missing evidence can be collected in one shot; both are committed as `56fab5a`. Offline `218 passed, 7 skipped` in both variants; lint, format and `mypy` clean. P1-01 remains unverified and Payment recovery has still never been demonstrated. See "The payment fault-evidence pass (`723fe7b` measured)". |
+| **Trace-query status (branch tip with this report)** | **PARTIAL** - the user's `022150` run (revision `6b7fe61`) is the first to reach the trace exporter: 18 armed observations resolved to 6 `generic_caller_failure_only`, 6 `traffic_without_failure`, 6 `no_usable_observation`, 0 `attributable_failure`, with the strongest-class aggregation working live, and `paymentUnreachable` restored with a read-back. The exporter exited `0` and returned **0 PlaceOrder traces**, and suggested eviction. Auditing the request showed it was well-formed - correct base path, real service names, microsecond UTC bounds, percent-encoded operation, no credentials - while the *entry filter* was an assumption: the pinned collector rewrites span names with `set_semconv_span_name`, the registry already carries two different naming forms, and no run has ever returned this operation. The **read** was the confirmed defect: `read_traces` reported an `observation_window_start/end` it never asked for, since the request carried `lookback` and `limit=20` and no bounds, and the same capture's `charge_traces` payload changed only twice in 18 polls. This pass bounds the read, retains trace IDs and cap/out-of-window provenance, makes an API error raise instead of reading as empty, and rebuilds the exporter as a progressive read-only sequence with an explicit "cause unknown" empty-result explanation; `a686617`. Offline `242 passed, 7 skipped` in both variants; lint, format and `mypy` clean. The historical interval has still not been read, P1-01 is unverified, and Payment recovery has still never been demonstrated. See "The trace-query pass (`6b7fe61` measured)". |
 
 `READY_FOR_DISCUSSION` means every executable technical gate in `docs/phase1.md`
 passed on this commit, including the four primary paths against the real isolated
@@ -1966,8 +1967,15 @@ measured or sourced rather than assumed:
    cannot be re-read from the retained payloads;
 3. Jaeger runs the in-memory store with `max_traces: ${env:MEMORY_MAX_TRACES}` and
    compose sets `MEMORY_MAX_TRACES=25000` (`src/jaeger/config.yml:43`,
-   `compose.observability.yaml:29`), so retention is **by count, not by age**: whether
-   that interval still exists depends on traffic since, and the record cannot say.
+   `compose.observability.yaml:29`), so the store is bounded rather than unbounded -
+   but **which** trace left, and why, is not something this record shows. The
+   in-memory backend is also documented by the demo's own telemetry tests as rotating
+   ("the in-memory backend rotates traces and the aggregator output is unreliable
+   within the warmup window", `test/telemetry/README.md`), and the `022150` capture
+   measured a payload that changed only twice in 18 polls. None of that is a
+   demonstration that an interval was *evicted*, and the sentence this pass replaced
+   said it was. See "The trace-query pass (`6b7fe61` measured)" for the correction:
+   the exporter now reports which causes it ruled out instead of naming one.
 
 Jaeger itself is unreachable from this session - `AF_INET 127.0.0.1:9090` raises
 `PermissionError [Errno 1] Operation not permitted` at socket construction, re-measured
@@ -1985,6 +1993,12 @@ only, arms no flag and runs no scenario.
 window, because the capture's stored trace payloads are unbounded newest-N sets with
 no trace IDs and the window's traces may already have been evicted by count. The
 distinguishing evidence has to be collected while the fault is armed.
+
+*(Corrected in "The trace-query pass (`6b7fe61` measured)": the payloads are unbounded
+newest-N sets and had no trace IDs, which is exactly right - but the last clause named
+eviction as the cause. It is one candidate, not a measurement, and the exporter no
+longer claims it. The exporter also now records the window it *asked for* beside the range
+it observed, rather than presenting one as the other.)*
 
 ### Three hypotheses, and the evidence that separates them
 
@@ -2108,6 +2122,157 @@ collects only the missing evidence: a shorter bounded re-capture of the fault, a
 Jaeger trace extract for that same window. It is **not** another ten minutes of the
 same metrics.
 
+## The trace-query pass (`6b7fe61` measured) - the request was well-formed, the read was not bounded, and the entry filter was an assumption
+
+### The user's measured run
+
+Log directory `.local/user-live-checks-20260925T022150/`, capture
+`payment-fault-diagnostic.json`, trace extract
+`reports/local/payment-trace-path-1790303263.json`, interval 02:21:59-02:27:43 UTC.
+The diagnostic exited `0` and restored `paymentUnreachable` to `off` with a read-back.
+Its 18 armed observations resolved to **6 `generic_caller_failure_only`, 6
+`traffic_without_failure`, 6 `no_usable_observation`, 0 `attributable_failure`**, with
+`verdict: generic_caller_failure_only`, `attributable_observed: false` and
+`summary total 18`.
+
+That is the previous pass's aggregation working live. Three of the four classes tied at
+six readings each, and the *strongest* class won without a tie-break: the rule that
+reported the commonest reading would have picked one of the three by dictionary order,
+and by construction the least informative one. The capture is also the third live
+measurement of the same underlying fact - checkout's `PlaceOrder` fails while the
+attributed `Charge` edge reads a clean error share - so the Payment premise question is
+unchanged by this pass and still needs a decision (see "Decisions for discussion").
+
+The trace exporter exited `0` and returned **zero `PlaceOrder` traces**, and its log
+suggested eviction. Two separate things are wrong there, and neither is settled by the
+zero: one is our exporter's reasoning, the other is our adapter's contract.
+
+### The request was well-formed; the entry filter was an assumption
+
+Audited against the pinned stack, every mechanical part of the request checks out:
+
+- **Endpoint and base path.** The exporter builds
+  `http://127.0.0.1:51984/jaeger/ui/api/traces`, and the pinned Jaeger sets
+  `jaeger_query.base_path: /jaeger/ui` (`src/jaeger/config.yml`), so the query API is
+  the base path plus `/api/...`. The same run's `/jaeger/ui/api/services` answered with
+  17 services, which the extract records - the path is not in question.
+- **Service names.** `checkout` and `payment` are the store's own names, not registry
+  aliases: both appear in that 17-service list and in the demo's own signal matrix.
+- **Timestamps.** `start`/`end` are microseconds since the epoch, which is what the v1
+  query API reads, and they are derived from the UTC interval on the command line.
+- **Encoding and shape.** Parameters sorted, the `/` in the operation name
+  percent-encoded as `%2F`, `limit` within bounds, one HTTP GET per stage, no
+  credentials, nothing written.
+- **Errors.** `/api/traces` used `raise_for_status`, so an HTTP error was a failure
+  rather than an empty answer, and the run recorded `exit_status` either way.
+
+The part that was *not* verified is the one that decided the answer:
+
+- **`operation=oteldemo.CheckoutService/PlaceOrder` is an assumption.** No run has ever
+  returned a span with that name. The pinned gateway collector rewrites every span name
+  through `transform/sanitize_spans` -> `set_semconv_span_name("1.43.0",
+  "original_span_name")` (`src/otel-collector/otelcol-config.yml:199-204`), so what
+  Jaeger stores is the semantic-convention form, and the pinned revision's own registry
+  already carries **two different** forms - `payment` is `oteldemo.PaymentService/Charge`
+  while `cart` is `POST /oteldemo.CartService/EmptyCart` - because the form depends on
+  the service's language and instrumentation. The demo's own telemetry tests never
+  filter by operation for this reason: they ask *by service*, then walk the spans
+  (`test/telemetry/test_traces.py`, `test/telemetry/test_traces_edges.py`).
+
+So a zero under an operation filter cannot distinguish "the store holds nothing" from
+"the filter does not match what the store holds". The exporter had no way to ask either
+question, which is the defect this pass fixes.
+
+### The read was not bounded, and the reported window was not the observed one
+
+`LiveEnvironment.read_traces` computed `start, end = self._window(window_seconds)` and
+reported those as the reading's `observation_window_start/end`, while the request it
+actually sent carried `service`, `operation`, `lookback` and `limit=20` and **no
+`start`/`end`**. `lookback` bounds the *search*; the reply is the newest matching
+traces. The reading therefore described an interval it had never asked for, and
+discarded the trace identity, the cap and any out-of-window span.
+
+This is our adapter's own contract, and it matters because `DeterministicAdapter` reads
+`error_spans` from this evidence as a second independent signal for a critical service
+(`src/opsaccord/reasoning/deterministic.py`): a payload that is not scoped to the window
+can both corroborate and hide.
+
+The same capture measured the practical shape of it: the runtime `Charge` read returned
+**only 2 distinct payloads across 18 polls** spanning about six minutes, 5 spans each,
+every one `status: OK`, `error_spans: 0`. What that does *not* establish is why. With
+the callee unreachable, checkout's client `Charge` span is exported but payment's server
+span is never created, so a frozen payload is as consistent with the fault as with a
+bounded store; the capture keeps no trace IDs and cannot tell the two apart. It is
+**not** evidence of health either way, and the pass records it as unexplained.
+
+### The corrections
+
+1. **A shared `JaegerClient`** (`src/opsaccord/tools/live_environment.py`) with one
+   honest contract for both callers: `traces()` always carries explicit microsecond
+   bounds and takes the operation filter as *optional*, an HTTP or API error raises,
+   and a reply without a `data` list raises instead of reading as "nothing found".
+   `services()` and `operations()` complete the surface.
+2. **`read_traces` honours its window.** It converts the same `_window(window_seconds)`
+   it reports into `start`/`end` and asks for exactly that, then keeps the provenance
+   the reading needs to be weighed: `service`, `trace_ids`, `traces_returned`,
+   `trace_limit`, `truncated` (a full page is the server's cap, never a census) and
+   `spans_outside_window` (bounds are requested, not guaranteed).
+3. **The exporter measures instead of assuming.** It now runs a progressive read-only
+   sequence: services, then the operations advertised *for the caller service*, then a
+   bounded recent query **with no operation filter**, then the same query filtered by an
+   operation a returned trace actually showed, then a **bounded retrieval check** that
+   re-queries one returned trace inside its own timestamp window as a positive control,
+   and only then the historical interval (plus an unfiltered replay of it when the
+   filtered query is empty). Each stage records its requested window, observed range,
+   count, trace IDs and cap, or its failure - never both.
+4. **The eviction claim is gone.** An empty interval now reports which causes were ruled
+   out and which remain open, and an `evidence` block separates command completion from
+   evidence sufficiency, so a successful exit is never read as a sufficient answer. Exit
+   codes are documented and now match behaviour: `0` every query completed, `1` at least
+   one query failed to complete, `2` bad arguments, `3` refused to start (the documented
+   `3` previously could not happen, because `parser.error` exits `2`).
+
+Nothing about the fault, the flag, the budgets, the attribution criteria or the scenario
+objective changed. The Payment scenario still requires the same attributable evidence,
+and no selector, limit or wait was loosened.
+
+### Tests, and what was executed here
+
+24 new tests: 20 for the exporter (`tests/unit/test_trace_path_export.py`) and 4 for the
+adapter contract (`tests/unit/test_live_adapter.py`), covering the explicit
+microsecond bounds, the service/operation sent, advertised-and-observed operation
+discovery, the bounded retrieval check, empty-versus-error, a capped page, out-of-window
+spans, retained trace IDs and the refusal/argument exit codes. The fixtures are labelled
+rather than guessed: request and reply shapes follow the query API the demo's own
+telemetry tests consume plus the measured service list, while the operation names are
+explicitly modelled, because no run has yet returned one from the live stack.
+
+Executed in this session: **offline `242 passed, 7 skipped, 85 deselected`** in both
+environment variants; `ruff check` clean; `ruff format --check` clean (89 files);
+`mypy src/opsaccord` clean (42 files); and exit-code smoke checks (`3` with no endpoint,
+`2` for `--limit 0`). Nothing here can reach the live stack - `AF_INET
+127.0.0.1:51984` still raises `Operation not permitted` at socket construction, which
+the new script now reports as four failed stages with `evidence.sufficiency:
+not_sufficient` and exit `1`, instead of as an empty store. The integration suite needs
+PostgreSQL and did not run.
+
+### What the next read decides
+
+The historical interval 02:21:59-02:27:43 has still not been read, and this pass does not
+claim it was, nor that it was evicted. One read-only run answers the questions that are
+actually open, in this order:
+
+- whether traces are retrievable at all right now (the recent unfiltered query and the
+  bounded retrieval check);
+- **what Jaeger calls checkout's entry span** (the advertised operations, cross-checked
+  against the operation names a returned trace shows) - which is what decides whether
+  `LIVE_TARGETS["checkout-service"].operation` is right, and therefore whether the
+  registry, the exporter or both need changing;
+- whether the historical interval is still readable, and if not, whether that is a
+  retention fact (a working query that cannot find that window) or an unproven query.
+
+Payment recovery remains undemonstrated and P1-01 remains unverified on this revision.
+
 ## Remaining work and discussion
 
 **Blockers (environment, not code):**
@@ -2191,37 +2356,34 @@ same metrics.
   from the live demo).
 - Whether Phase 1's live scope should include a paid reasoning provider at all,
   or stay deterministic with live tools.
-- **Whether to fix `read_traces`' window** by passing an explicit `start`/`end`
+- ~~**Whether to fix `read_traces`' window** by passing an explicit `start`/`end`
   derived from the requested `window_seconds` and reporting the window actually
-  observed. This is in scope (it is our own adapter's contract, and the controller
-  consumes `error_spans` from it as a second independent signal for a critical
-  service, so a mislabelled window can both corroborate and hide), and it is
-  recommended - but the useful shape depends on what the retained traces show, so it
-  was not implemented on a guess. If the failing request has no Charge child span at
-  all, windowing changes nothing and the honest change is a stated
-  retention/coverage limit instead.
+  observed.~~ **Done in "The trace-query pass (`6b7fe61` measured)"** at `a686617`: the
+  read carries explicit microsecond bounds and reports the window it asked for, and the
+  reading now keeps the trace IDs, the page cap and any span outside the bounds as
+  provenance. The second half of the question stands and is what the same pass made
+  measurable: if the window holds nothing, the exporter says which causes it ruled out
+  instead of naming one.
 - **Whether the pinned demo can carry P1-01 as written**, if the traces show a
   failing `PlaceOrder` with no Charge child span: an instrumentation change that
   makes the redirected attempt visible, or an explicitly restated scenario
   objective. Deliberately not implemented - the fault, the flag, the budgets and the
   scenario objective are unchanged, and no failure was reported as health.
 
-**One command block for the next run.** It starts the project's own PostgreSQL cluster and
-the pinned demo, then collects the evidence that is *missing* rather than the evidence that
-was already taken: a short bounded capture of the payment fault path **and** a Jaeger trace
-extract for exactly the window that capture armed. The trace half is the new part, and it
-is why this is not another metrics run - the previous capture's trace payloads are
-unbounded newest-N sets with no trace IDs, so its window cannot be re-read from the record.
-The capture arms only `paymentUnreachable`, restores it in a `finally` block with a
-read-back, and writes a JSON record; the trace extract is read-only, arms nothing and has
-nothing to restore. The block runs in a subshell so the operator's interactive shell is
-neither closed by a failing stage nor left in another directory, activates the project's
-own environment explicitly, prints the interpreter and the revision it is testing, keeps
-live settings inside the subprocess, writes timestamped logs, preserves each stage's
-failure status through `tee`, and stops on the first failure. The capture is shortened to
-360s on purpose (18 polls): its job is a window the trace extract can cover, and the fault
-itself is proven present within about two minutes of arming, so a ten-minute capture would
-only re-measure what the last one already established.
+**One command block for the next run.** It is **read-only**: it starts nothing, arms
+nothing, changes no flag and generates no traffic. It refreshes the resolved endpoint file
+from the stack that is already running (`scripts/demo.sh endpoints` only reads published
+ports; it refuses if the stack is down rather than starting it), then runs the trace
+exporter once. A single invocation now performs the whole progressive sequence - services,
+the operations advertised for checkout, a bounded recent query with no operation filter, a
+query filtered by an operation a returned trace showed, a bounded retrieval check, and the
+historical interval last - so it answers "can we read traces at all", "what is this span
+called" and "is the 02:21:59-02:27:43 interval still there" together, without arming the
+fault again. It runs in a subshell so the operator's interactive shell is neither closed by
+a failing stage nor left in another directory, activates the project's own environment
+explicitly, prints the interpreter and the revision it is testing, keeps the live settings
+inside the subprocess, writes timestamped logs, preserves the failure status through `tee`,
+and stops on the first failure.
 
 ```bash
 (
@@ -2237,66 +2399,54 @@ only re-measure what the last one already established.
   LOGDIR=".local/user-live-checks-$(date -u +%Y%m%dT%H%M%S)"
   mkdir -p "$LOGDIR"
   printf 'log directory: %s\n' "$LOGDIR"
-  scripts/pg.sh start
-  scripts/demo.sh health >/dev/null 2>&1 || scripts/demo.sh start
-  scripts/demo.sh endpoints >/dev/null
+  bash scripts/demo.sh endpoints >>"$LOGDIR/endpoints.log" 2>&1 \
+    || printf 'warning: could not refresh .local/demo-endpoints.env; see %s/endpoints.log\n' "$LOGDIR"
+  test -f .local/demo-endpoints.env || { printf 'no .local/demo-endpoints.env; run: bash scripts/demo.sh endpoints\n'; exit 3; }
   set -a
   . .local/demo-endpoints.env
   set +a
-  printf 'prometheus: %s\n' "$OPSACCORD_PROMETHEUS_BASE_URL"
   printf 'jaeger: %s\n' "$OPSACCORD_JAEGER_BASE_URL"
-  CAPTURE="$PWD/$LOGDIR/payment-fault-diagnostic.json"
+  TS="$(date -u +%Y%m%dT%H%M%S)"
   rc=0
-  python scripts/diagnose-payment-fault.py --seconds 360 --poll 20 --out "$CAPTURE" 2>&1 | tee "$LOGDIR/payment-fault-diagnostic.log" || rc=$?
-  printf 'diagnostic exit status: %s\n' "$rc"
-  if [ "$rc" -ne 0 ]; then printf 'capture did not complete; check cleanup and the demo before continuing\n'; exit "$rc"; fi
-  START="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["armed_at"])' "$CAPTURE")"
-  END="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["restored_at"])' "$CAPTURE")"
-  printf 'trace window: %s .. %s\n' "$START" "$END"
-  trc=0
-  python scripts/diagnose-payment-trace-path.py --start "$START" --end "$END" --max-traces 200 2>&1 | tee "$LOGDIR/payment-trace-path.log" || trc=$?
-  printf 'trace-path exit status: %s\n' "$trc"
-  printf 'evidence directory: %s\n' "$LOGDIR"
-  exit "$trc"
+  python scripts/diagnose-payment-trace-path.py \
+    --recent-minutes 60 \
+    --start 2026-09-25T02:21:59Z \
+    --end 2026-09-25T02:27:43Z \
+    --out "reports/local/payment-trace-path-$TS.json" \
+    2>&1 | tee "$LOGDIR/payment-trace-path.log" || rc=$?
+  printf 'trace-path exit status: %s\n' "$rc"
+  printf 'extract: reports/local/payment-trace-path-%s.json\n' "$TS"
+  printf 'log directory: %s\n' "$LOGDIR"
+  exit "$rc"
 )
 ```
 
-Expected, in `$LOGDIR` (plus `reports/local/payment-trace-path-*.json`):
+Expected, in `$LOGDIR/payment-trace-path.log` and the extract:
 
-- `payment-fault-diagnostic.log`: one `baseline` line, the `paymentUnreachable armed at
-  <UTC>` line, one line per poll showing the flag position, the grouped client/server
-  rates, the caller-side parent share and the attributed edge read, then `cleanup:` with
-  the read-back, a headline `verdict:` naming the strongest class with the per-class
-  counts beside it, `attributable failure observed while armed:`, `recovery assessed:`,
-  and an explicit `exit status:` line.
-- `payment-trace-path.log`: the Jaeger services it can see, the **window it actually
-  observed** rather than the one it was asked for, then one block per retained trace -
-  root span, children, every failed span with its service and message, whether the
-  measured `Charge` edge span exists under the failing operation and what status it
-  recorded - and a finding per trace. If the window has been evicted it says so instead
-  of reporting an absence of failures as a result.
-- The capture's `verdict` and `evidence_summary` decide the next step, and nothing is
-  scored either way: `attributable_failure` means the attributed Charge series itself
-  failed while armed, so P1-01's premise and diagnosis have their signal and the focused
-  live path (`scripts/validate.sh --live --scenario P1-01`) is the next run;
-  `generic_caller_failure_only` with `attributable_observed: false` is the `233003`
-  signature, and it is a discussion item about an honest scenario or instrumentation
-  adjustment, never a reason to loosen the premise; `traffic_without_failure` is traffic
-  seen with nothing above the bound, and `no_usable_observation` is no traffic or an
-  unreadable read - neither is health.
-- The trace findings separate the hypotheses the offline reads could not: an edge span
-  present and failing (the metric series is the artefact), an edge span present and *not*
-  failing (status is not being recorded on the redirect), an edge span absent with a
-  failure recorded elsewhere (the failure is on another dependency, named in the log), or
-  an edge span absent with no failure recorded (no span was exported at all) - plus the
-  case where the window was evicted, which is a retention fact, not a Payment reading.
-- Exit statuses: the capture returns `0` when it completed and the flag was restored, `1`
-  when it failed, `3` when it refused to start, `4` when the flag could not be restored
-  (check the demo before anything else); the trace extract returns `0` when the query
-  completed whatever it found, `1` when a query failed and `3` when it refused to start.
-  Both refuse to run without their endpoint in the environment, and the capture refuses to
-  start beside another live scenario driver or when any verified fault flag is not in its
-  safe position.
+- one line per stage recording what was asked for and what answered: services visible,
+  the operations **advertised for `checkout`** (with whether the expected name is among
+  them and which names contain `PlaceOrder`), the recent unfiltered query with the
+  operation names a returned trace actually shows, the chosen operation and the basis for
+  that choice, the bounded retrieval check with its `retrieved:` verdict, and the
+  historical interval filtered and (only if empty) unfiltered.
+- the extract under `stages.*` keeps each stage's `requested_window`, `observed_start`/
+  `observed_end`, `count`, `trace_ids` and `truncated`, and `failures` holds any stage
+  that did not complete - an unanswered query is never recorded as a zero-count answer.
+- `evidence.sufficiency` says whether the run produced something usable, separately from
+  the exit status: `0` means every query completed, **not** that the evidence was
+  sufficient. If the interval is empty, `evidence.reason` names which causes were ruled
+  out - and if the bounded retrieval check succeeded, that is the one case where the
+  answer may be read as "the store no longer holds this interval", without claiming *why*.
+- the decision this run settles: the advertised/observed operation names decide whether
+  `LIVE_TARGETS["checkout-service"].operation` is correct. If it is not, the registry and
+  the exporter are both wrong in the same way and that is a code change; if it is, the
+  historical zero is a retention question and the fault's trace evidence has to be
+  collected while it is armed.
+
+*(The capture-and-extract pairing that stood here belonged to the fault-injection run.
+This pass does not inject another fault, so the read-only block above replaces it; the
+previous run's own expectations and exit codes are recorded with it in "The payment
+fault-evidence pass (`723fe7b` measured)".)*
 
 `scripts/validate.sh` remains the full gate (it starts and verifies PostgreSQL, runs the
 offline suite, linter, formatter, `mypy`, the integration suite, the sensitivity harness

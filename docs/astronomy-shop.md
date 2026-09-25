@@ -288,39 +288,55 @@ Three limits are recorded rather than papered over:
   caller is unhappy, not which dependency is why;
 * a window with no Charge calls proves nothing in either direction, and the
   span-metric cadence means any window shorter than 120s reads as "no data"
-  (see "Two telemetry pipelines, two cadences"). The **trace** read has a third
-  limit, and it is a defect rather than a calibration - see the next section.
+  (see "Two telemetry pipelines, two cadences"). The **trace** read answers a
+  different question - whether a span exists at all, and what it recorded - and its
+  window, its entry operation and its retention are the subject of the next section.
 
-### Trace reads are not time-bounded, so their window is whatever Jaeger still holds
+### Trace reads are bounded, and their window is verified rather than assumed
 
-`LiveEnvironment.read_traces` (`src/opsaccord/tools/live_environment.py:598-627`)
-sends `service`, `operation`, `lookback` and `limit=20`, but no `start`/`end`.
-Jaeger's `/api/traces` answers with the newest matching traces, so the reply means
-"the 20 most recent traces for this operation", not "the traces in this window":
-two polls seconds apart return the *same payload* whenever no new matching trace
-completed in between, and the `lookback` only bounds the search, not the result.
+`LiveEnvironment.read_traces` asks `JaegerClient` for explicit `start`/`end` bounds in
+microseconds, derived from the same `_window(window_seconds)` it reports as
+`observation_window_start/end`, so the reading describes the interval it actually
+requested rather than one it merely computed. The value keeps the provenance a reader
+needs to weigh it: the real service name, the trace IDs that answered,
+`traces_returned`, `trace_limit`, `truncated` (a full page is the server's cap, never a
+census) and `spans_outside_window`. An HTTP or API error raises instead of reading as an
+empty store, and a reply without a `data` list raises too.
 
-The 2026-09-25 capture measures exactly that. Its 30 polls produced only **6 distinct
-payloads**, and 12 consecutive polls shared one payload verbatim; every payload had
-`error_spans: 0` and every span in every payload was `status: OK`. So a trace reading
-here is evidence about *recent* Charge traffic, never about an interval, and it cannot
-reconstruct one that has passed.
+The `operation` argument is matched exactly against the stored `operationName`, which is
+why the entry name is a real question rather than a detail. The pinned gateway collector
+rewrites span names with `set_semconv_span_name("1.43.0", "original_span_name")`
+(`src/otel-collector/otelcol-config.yml:199-204`), so what Jaeger stores is the
+semantic-convention form - and that form depends on the emitting service's language and
+instrumentation: the pinned registry already carries `oteldemo.PaymentService/Charge` for
+`payment` and `POST /oteldemo.CartService/EmptyCart` for `cart`. No run has yet returned a
+span whose `operationName` is `oteldemo.CheckoutService/PlaceOrder`, so that registry
+entry is an assumption the exporter now *measures* instead of one the query silently
+depends on.
 
-Retention makes the second half of that worse. Jaeger runs the in-memory store with
+Retention is bounded because the store is: Jaeger runs the in-memory backend with
 `max_traces: ${env:MEMORY_MAX_TRACES}` and compose sets `MEMORY_MAX_TRACES=25000`
-(`src/jaeger/config.yml:43`, `compose.observability.yaml:29`), so traces are evicted
-**by count, not by age**. Whether an earlier interval still exists is therefore a
-function of how much traffic has been through the collector since - and the stored
-capture keeps only `name`, `status` and `duration_ms` per span, no trace ID, so that
-question is not answerable from the record either.
+(`src/jaeger/config.yml:43`, `compose.observability.yaml:29`), and the demo's own telemetry
+tests describe that backend as rotating within a warmup window. How much traffic that
+admits is **not** measured, and an empty answer is not evidence that an interval was
+evicted. The 2026-09-25 capture's `read_traces` payload changed only twice across 18 polls
+and carried no trace IDs, which is as consistent with a store that has moved on as with a
+fault whose callee never creates its server span. The exporter reports which causes it
+ruled out and leaves the rest open.
 
 `scripts/diagnose-payment-trace-path.py` is the read-only exporter for it. It takes an
-explicit `--start`/`--end` pair (UTC ISO) or `--lookback-minutes`, reports the window
-it could *actually* see rather than the one it was asked for, and classifies each
-retained trace as `edge_span_present_and_failing`,
-`edge_span_absent_with_a_failure_recorded`, `edge_span_absent_no_failure_recorded`,
-`edge_span_present_and_ok` or `no_root_span`. It issues HTTP GETs only, arms no flag,
-runs no scenario, and so has nothing to restore.
+explicit `--start`/`--end` window (UTC ISO) or `--lookback-minutes`, and runs a progressive
+sequence: the services visible, the operations advertised *for the caller service*, a
+bounded recent query with no operation filter, a query for an operation a returned trace
+actually showed, a bounded retrieval check that re-queries one returned trace inside its
+own timestamp window, and only then the historical interval. It classifies each retained
+trace as `edge_span_present_and_failing`, `edge_span_absent_with_a_failure_recorded`,
+`edge_span_absent_no_failure_recorded`, `edge_span_present_and_ok` or `no_root_span`, and
+records each stage's requested window, observed range, count, trace IDs, cap and failure.
+Exit codes: `0` every query completed, `1` at least one query failed to complete, `2` bad
+arguments, `3` refused to start - and `evidence.sufficiency` separately reports whether the
+result is usable, so a successful exit is never read as a sufficient answer. It issues HTTP
+GETs only, arms no flag, runs no scenario, and so has nothing to restore.
 
 ### Health probes are scoped to one service
 
@@ -348,8 +364,8 @@ is `read_dependency`'s question, and recovery still requires both.
 | Health-probe window (payment, ad) | 120s | 120s | shortest span window that always has samples |
 | Health-probe window (cart) | 300s | 300s | EmptyCart carries roughly one call per 1-2 minutes |
 | Ad `cpu_utilization` read window | 300s | 60s | container metrics are fresh; a five-minute average dilutes a burn that started a minute ago |
-| Verification window | 300s | 120s | lets a recovering signal leave the lookback promptly |
-| Verification settling | 1 attempt / 0s | 6 rounds x 30s | covers one 120s lookback plus one export interval |
+| Verification window | 300s | 120s | lets a recovering signal leave the probe window promptly |
+| Verification settling | 1 attempt / 0s | 6 rounds x 30s | covers one 120s probe window plus one export interval |
 | Step budgets | soft 8 / hard 16 | soft 12 / hard 36 | investigation 6 + model 1 + dispatch 1 + 6 settle rounds x 4 reads = 32, with headroom |
 
 Both budgets stay enforced; the live values are larger because bounded settling
