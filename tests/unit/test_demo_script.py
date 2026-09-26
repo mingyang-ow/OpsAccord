@@ -13,6 +13,12 @@ wrong:
 A stub docker binary is enough to pin both, and to pin that a failing ``inspect``
 reports itself instead of printing nothing. No container is started, and the real
 demo checkout is never touched.
+
+The stub can also drain stdin, because that is what the real CLI does. On
+2026-09-26 the live capture reported one container out of the twenty-five the stack
+had started, and exited 0 while doing it: ``docker inspect`` reads stdin, so the
+here-string the loop was reading was handed to the first ``inspect`` and every
+remaining name was consumed with it.
 """
 
 from __future__ import annotations
@@ -39,12 +45,16 @@ argv0="$1"
 } >>"$STUB_ARGV_LOG"
 case "$argv0" in
   version) printf '29.7.2\\n' ;;
-  ps) printf 'product-catalog\\n/checkout\\n' ;;
+  ps) printf 'product-catalog\\ncheckout\\n' ;;
   inspect)
+    if [ -n "${STUB_EATS_STDIN:-}" ]; then cat >/dev/null; fi
     if [ -n "${STUB_INSPECT_RC:-}" ]; then exit "$STUB_INSPECT_RC"; fi
+    # `docker inspect` names a container with a leading slash; the helper is
+    # expected to strip it, so the stub supplies it.
+    container="$3"
     case "$*" in
       *HostConfig*)
-        printf '/product-catalog state=running health=unhealthy restarts=0 exit=0 '
+        printf '/%s state=running health=unhealthy restarts=0 exit=0 ' "$container"
         printf 'oom_killed=false memory_limit=20971520 nano_cpus=0 '
         printf 'started=2026-09-25T11:23:30Z healthcheck=[]\\n' ;;
       *Health.Log*)
@@ -52,8 +62,14 @@ case "$argv0" in
         printf 'within 1s"}]\\n' ;;
       *GOMEMLIMIT*) printf 'GOMEMLIMIT=16MiB\\n' ;;
     esac ;;
+  pull)
+    if [ -n "${STUB_EATS_STDIN:-}" ]; then cat >/dev/null; fi
+    exit "${STUB_PULL_RC:-0}" ;;
   compose)
     case " $* " in
+      *" config --images "*)
+        printf 'ghcr.io/example/a:1.0\\nghcr.io/example/b:1.0\\nghcr.io/example/c:1.0\\n'
+        exit 0 ;;
       *" port "*)
         if [ -n "${STUB_COMPOSE_RC:-}" ]; then
           printf 'compose: port lookup failed\\n' >&2
@@ -163,6 +179,39 @@ def test_inspect_reports_per_container_state_and_its_own_failures(tmp_path: Path
 
     assert failed.returncode == 1
     assert "failed" in failed.stderr
+
+
+def test_inspect_and_pull_keep_their_name_list_out_of_docker_stdin(tmp_path: Path) -> None:
+    """A `while read` loop is fed from the same stdin `docker inspect` consumes.
+
+    On 2026-09-26 two live captures reported **one** container out of the twenty-five
+    the stack had started, and exited 0 while doing it, so the per-container state
+    that the whole pass is judged on arrived incomplete and looked complete. The
+    cause is not Docker's output: `docker inspect` reads stdin, so the here-string the
+    loop was reading from was handed to the first `inspect`, which consumed every
+    remaining name. `cmd_pull` had the identical shape over its image list. The stub
+    drains stdin only when asked, so this stays a regression test rather than a test
+    of the stub.
+    """
+    inspected = _run(tmp_path, "inspect", STUB_EATS_STDIN="1")
+
+    assert inspected.returncode == 0, inspected.stderr
+    assert "product-catalog state=running health=unhealthy" in inspected.stdout
+    assert "checkout state=running health=unhealthy" in inspected.stdout
+
+    pulled = _run(tmp_path, "pull", STUB_EATS_STDIN="1")
+
+    assert pulled.returncode == 0, pulled.stderr
+    images = [argv[-1] for argv in _invocations(tmp_path, "pull")]
+    assert images == ["ghcr.io/example/a:1.0", "ghcr.io/example/b:1.0", "ghcr.io/example/c:1.0"]
+
+
+def test_a_failing_pull_is_reported_rather_than_only_the_last_one(tmp_path: Path) -> None:
+    """`pull` returns one status for a loop of images; a failure must reach the caller."""
+    result = _run(tmp_path, "pull", STUB_PULL_RC="5")
+
+    assert result.returncode == 5
+    assert len(_invocations(tmp_path, "pull")) == 3
 
 
 def test_the_inspect_templates_use_no_go_function_the_cli_may_lack() -> None:

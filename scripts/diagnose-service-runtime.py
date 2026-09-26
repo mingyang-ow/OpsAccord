@@ -29,6 +29,16 @@ queries only those. A name that is absent is reported as absent rather than
 guessed at, and the ``service_name`` label values are printed so that "this
 service reports nothing at all" is visible as such.
 
+That guess is then checked against the store, because a guessed name list cannot
+distinguish a service whose export path is broken from one whose metrics are named
+something this script never asked about - on 2026-09-26 it reported "0 of 24 runtime
+metrics have a value" for a service the store advertised 347 names for, and both
+causes read the same. For each service the script first runs
+``count by (__name__) ({service_name="..."})``, which lists the metric names the
+store really holds for that service. An empty answer is then a statement about the
+service, and any name in that list which the discovery never asked about is printed
+as ``held but never asked about`` - the vocabulary to build the next discovery from.
+
 Read-only: every request is an HTTP GET against the Prometheus query API with an
 explicit timeout. No flag is armed, nothing is written to the demo, no service is
 started, stopped or restarted.
@@ -73,6 +83,10 @@ from opsaccord.tools.live_environment import (  # noqa: E402
 DEFAULT_SERVICES = ("product-catalog", "checkout", "payment")
 DEFAULT_TIMEOUT_SECONDS = 10.0
 MAX_METRICS = 40
+# How many names of an unguessed family to print before summarizing the rest. The
+# count is printed either way; this only keeps one service's vocabulary from
+# burying the next service's readings.
+MAX_UNREAD_NAMES = 30
 
 # What "resource-bound" looks like in a metric name: a runtime or process family
 # crossed with one of the quantities that decides it. Substring matching, because
@@ -119,6 +133,20 @@ def read_service_runtime(
         raise ValueError(f"{service!r} is not a plain service name")
     readings: dict[str, float | None] = {}
     failures: list[str] = []
+    # What the store actually holds for this service, before any guess about what
+    # the names should be. Discovery by substring can only ever answer "is one of
+    # my guesses present"; on 2026-09-26 that produced "0 of 24 runtime metrics
+    # have a value" for a service the store advertised 347 names for, and the two
+    # causes of that - a broken export path, or names this script never thought to
+    # ask about - look identical from there. One probe separates them, and an
+    # empty answer then means the service publishes nothing rather than that the
+    # guess was wrong.
+    scope = f'{{service_name="{service}"}}'
+    try:
+        held = client.metric_names_for(scope, timeout_seconds)
+    except (LiveEnvironmentUnavailable, ReadTimeout) as exc:
+        held = set()
+        failures.append(f"count by (__name__) ({scope}): {exc}")
     for name in metrics:
         selector = f'{name}{{service_name="{service}"}}'
         try:
@@ -132,7 +160,17 @@ def read_service_runtime(
             readings[name] = None
             failures.append(f"{selector}: {exc}")
     found = {name: value for name, value in readings.items() if value is not None}
-    return {"service": service, "metrics": readings, "values": found, "failures": failures}
+    return {
+        "service": service,
+        "metrics": readings,
+        "values": found,
+        # Names the service really publishes that this script never asked about.
+        # A non-empty list is the finding that the guessed families were wrong,
+        # and it is the list to build the next discovery from.
+        "names_held_but_not_read": sorted(held.difference(metrics)),
+        "held_metric_names": sorted(held),
+        "failures": failures,
+    }
 
 
 def collect(
@@ -174,6 +212,16 @@ def report(document: dict[str, Any]) -> None:
         found = reading["values"]
         total = len(reading["metrics"])
         print(f"\n{service}: {len(found)} of {total} runtime metrics have a value")
+        held = reading["held_metric_names"]
+        if not held:
+            print(f'  the store holds no series at all under service_name="{service}"')
+        else:
+            print(f"  the store holds {len(held)} metric names for this service")
+            unread = reading["names_held_but_not_read"]
+            if unread:
+                shown = unread[:MAX_UNREAD_NAMES]
+                more = f" (+{len(unread) - len(shown)} more)" if len(unread) > len(shown) else ""
+                print(f"  held but never asked about ({len(unread)}): {' '.join(shown)}{more}")
         for name, value in sorted(found.items()):
             print(f"  {name} = {value:g}")
         absent = [n for n, v in reading["metrics"].items() if v is None]

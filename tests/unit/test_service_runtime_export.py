@@ -51,6 +51,22 @@ VALUES = {
     "process_cpu_seconds_total": 41.25,
 }
 
+# What each service really publishes, as the store would answer
+# ``count by (__name__)``. ``product-catalog`` publishes nothing, which is what its
+# timing-out export path produces, and ``payment`` publishes a family this script
+# does not guess - together the two states an empty read must be told apart from.
+HELD = {
+    "checkout": {
+        "go_gc_duration_seconds",
+        "go_goroutines",
+        "http_server_duration_bucket",
+        "process_cpu_seconds_total",
+    },
+    "payment": {"nodejs_eventloop_lag_seconds", "process_resident_memory_bytes"},
+    "product-catalog": set(),
+    "frontend": {"go_goroutines"},
+}
+
 
 def _module() -> Any:
     spec = importlib.util.spec_from_file_location("opsaccord_service_runtime", MODULE_PATH)
@@ -78,6 +94,8 @@ class StubPrometheus:
     @staticmethod
     def _selector(params: dict[str, str]) -> str:
         query = params["query"]
+        if query.startswith("count by (__name__) ("):
+            return query[len("count by (__name__) (") : -1]
         assert query.startswith("sum(") and query.endswith(")"), query
         return query[4:-1]
 
@@ -90,8 +108,10 @@ class StubPrometheus:
         if path.endswith("/api/v1/label/service_name/values"):
             return httpx.Response(200, json={"status": "success", "data": sorted(self.services)})
         if path.endswith("/api/v1/query"):
-            selector = self._selector(dict(request.url.params))
-            self.queries.append(selector)
+            params = dict(request.url.params)
+            query = params["query"]
+            self.queries.append(query)
+            selector = self._selector(params)
             # The selector is a braced series selector: reject anything else the
             # way Prometheus itself would, so an unbraced form fails the test
             # instead of quietly answering.
@@ -99,8 +119,21 @@ class StubPrometheus:
                 return httpx.Response(
                     400, json={"status": "error", "error": 'parse error: unexpected "="'}
                 )
-            name = selector.split("{", 1)[0]
             service = selector.split('service_name="', 1)[1].split('"', 1)[0]
+            if query.startswith("count by (__name__) ("):
+                held = sorted(HELD.get(service, set())) if service in self.services else []
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "success",
+                        "data": {
+                            "result": [
+                                {"metric": {"__name__": name}, "value": [1, "1"]} for name in held
+                            ]
+                        },
+                    },
+                )
+            name = selector.split("{", 1)[0]
             value = VALUES.get(name)
             if value is None or service not in self.services:
                 return httpx.Response(200, json={"status": "success", "data": {"result": []}})
@@ -171,6 +204,48 @@ def test_a_service_that_reports_nothing_is_visible_as_such() -> None:
 
     assert "product-catalog" not in document["service_name_label_values"]
     assert document["services"][0]["values"] == {}
+
+
+def test_the_store_is_asked_what_the_service_publishes_not_what_we_guessed() -> None:
+    """An empty read has two causes, and 2026-09-26 could not tell them apart.
+
+    That run reported ``product-catalog: 0 of 24 runtime metrics have a value`` while
+    the store advertised 347 names, which reads the same whether the catalog's export
+    path is broken or the script never asked about the names it actually uses. The
+    probe is what makes the empty answer a statement about the service, so it is
+    pinned as a braced selector over the service's own series.
+    """
+    module = _module()
+    stub = StubPrometheus()
+
+    document = module.collect(stub.client(), ("product-catalog", "payment"), 5.0)
+
+    probes = [query for query in stub.queries if query.startswith("count by (__name__)")]
+    assert probes == [
+        'count by (__name__) ({service_name="product-catalog"})',
+        'count by (__name__) ({service_name="payment"})',
+    ]
+
+    catalog, payment = document["services"]
+    assert catalog["held_metric_names"] == []
+    assert catalog["names_held_but_not_read"] == []
+    assert payment["held_metric_names"] == [
+        "nodejs_eventloop_lag_seconds",
+        "process_resident_memory_bytes",
+    ]
+    assert payment["names_held_but_not_read"] == ["nodejs_eventloop_lag_seconds"]
+
+
+def test_a_held_name_the_discovery_missed_is_reported_rather_than_dropped() -> None:
+    """A name the service really publishes must reach the report even if unguessed."""
+    module = _module()
+    stub = StubPrometheus()
+
+    reading = module.collect(stub.client(), ("checkout",), 5.0)["services"][0]
+
+    # Held, but not a runtime-looking name, so it is never queried - and still has to
+    # be visible as vocabulary the discovery would have to grow to see the value.
+    assert reading["names_held_but_not_read"] == ["http_server_duration_bucket"]
 
 
 def test_a_refused_query_is_a_failure_not_a_silent_zero() -> None:

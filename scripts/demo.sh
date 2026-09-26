@@ -84,7 +84,7 @@ compose() {
 # container is not running, which the callers treat as "not up yet".
 published_port() {
   local service="$1" container_port="$2" mapping
-  mapping="$(compose port "$service" "$container_port" 2>/dev/null | head -1)" || true
+  mapping="$(compose port "$service" "$container_port" 2>/dev/null </dev/null | head -1)" || true
   printf '%s' "${mapping##*:}"
 }
 
@@ -103,15 +103,28 @@ resolve_host() {
 
 cmd_pull() {
   require_docker; require_checkout
-  local image
+  local rc=0
   # `compose pull` skips every service that also declares `build:` -- which is most
   # of this stack -- so the images would silently never arrive and `start` would
   # then try to build them on the Windows side. Resolving the image references from
   # the compose model and pulling them directly is what actually pins the revision.
-  while read -r image; do
+  #
+  # The list is read into an array before the loop rather than streamed into it.
+  # A `while read` loop takes its input from stdin, and `docker pull` is a CLI
+  # that may read stdin; when it does, it consumes the list the loop is reading
+  # and every image after the first is silently skipped. Both loops here had that
+  # shape, and `docker inspect` demonstrably consumed it on 2026-09-26 - which is
+  # how `inspect` came to report one container out of twenty-five on two runs
+  # while still exiting 0.
+  local images=()
+  mapfile -t images < <(compose config --images | sort -u)
+  local image
+  for image in "${images[@]}"; do
+    [ -n "$image" ] || continue
     printf 'pulling %s\n' "$image"
-    "$DOCKER_BIN" pull "$image"
-  done < <(compose config --images | sort -u)
+    "$DOCKER_BIN" pull "$image" </dev/null || rc=$?
+  done
+  return "$rc"
 }
 
 cmd_start() {
@@ -285,19 +298,24 @@ cmd_logs() {
 # every command's exit status reported rather than hidden behind a pipeline.
 cmd_inspect() {
   require_docker
-  local names rc=0 name line probe gomem
-  names="$("$DOCKER_BIN" ps -a --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}}')" || rc=$?
+  local names_out rc=0 name line probe gomem
+  names_out="$("$DOCKER_BIN" ps -a --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}}')" || rc=$?
   printf 'demo: listing project containers exited %s\n' "$rc"
   [ "$rc" -eq 0 ] || return "$rc"
-  if [ -z "$names" ]; then
+  if [ -z "$names_out" ]; then
     printf 'demo: no containers in project %s\n' "$PROJECT"
     return 0
   fi
-  while read -r name; do
+  # An array, not a `while read` loop: `docker inspect` reads stdin, so a loop fed
+  # from a here-string hands it the rest of the container list and stops after the
+  # first. Each call also gets /dev/null, so there is nothing left to consume.
+  local names=()
+  mapfile -t names <<<"$names_out"
+  for name in "${names[@]}"; do
     [ -n "$name" ] || continue
     line="$("$DOCKER_BIN" inspect --format \
       '{{.Name}} state={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} restarts={{.RestartCount}} exit={{.State.ExitCode}} oom_killed={{.State.OOMKilled}} memory_limit={{.HostConfig.Memory}} nano_cpus={{.HostConfig.NanoCpus}} started={{.State.StartedAt}} healthcheck={{if .Config.Healthcheck}}{{json .Config.Healthcheck.Test}}{{else}}none{{end}}' \
-      "$name")" || { printf 'demo: inspect %s failed\n' "$name" >&2; rc=1; continue; }
+      "$name" </dev/null)" || { printf 'demo: inspect %s failed\n' "$name" >&2; rc=1; continue; }
     # `docker inspect` reports the name with a leading slash. The template
     # functions that strip it (`trimPrefix`) need Go 1.19 and the Windows
     # interop binary answered `template parsing error: function "trimPrefix" not
@@ -309,16 +327,16 @@ cmd_inspect() {
     # separates "connect timed out" from "the server answered not-serving".
     probe="$("$DOCKER_BIN" inspect --format \
       '{{if .State.Health}}{{if ne .State.Health.Status "healthy"}}{{json .State.Health.Log}}{{end}}{{end}}' \
-      "$name")" || rc=1
+      "$name" </dev/null)" || rc=1
     if [ -n "$probe" ]; then printf '  health_log=%s\n' "$probe"; fi
     # The Go memory policy is the value under test when a service is wedged, so it
     # is printed. `printf "%.11s"` keeps the filter exact without dumping the whole
     # environment, which carries a database DSN with a password.
     gomem="$("$DOCKER_BIN" inspect --format \
       '{{range .Config.Env}}{{if eq (printf "%.11s" .) "GOMEMLIMIT="}}{{.}}{{end}}{{end}}' \
-      "$name")" || rc=1
+      "$name" </dev/null)" || rc=1
     if [ -n "$gomem" ]; then printf '  %s\n' "$gomem"; fi
-  done <<<"$names"
+  done
   return "$rc"
 }
 

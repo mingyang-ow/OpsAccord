@@ -473,6 +473,19 @@ def run_probe(client: JaegerClient, request: ProbeRequest) -> dict[str, Any]:
             "names_containing_alias": sorted(n for n in advertised if ENTRY_ALIAS in n),
         }
         log(f"operations advertised for {CALLER_SERVICE}: {len(advertised)}")
+        # The names themselves, not only the count. On 2026-09-26 the store
+        # advertised exactly one operation for `checkout` and it was not the one
+        # this script looks for, so the interval query returned nothing while a
+        # recent unfiltered trace existed - and the log line that would have named
+        # the difference printed a count. An entry filter that does not match is
+        # not an absent path, so the vocabulary belongs in the log.
+        for name in advertised:
+            log(f"  advertised: {name!r}")
+        if advertised and ENTRY_OPERATION not in advertised:
+            log(
+                f"  none of them is {ENTRY_OPERATION!r}; an interval query under an "
+                f"unmatched filter cannot distinguish a wrong name from an empty window"
+            )
     else:
         advertised = []
 

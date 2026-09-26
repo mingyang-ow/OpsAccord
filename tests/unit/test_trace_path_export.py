@@ -131,7 +131,14 @@ class FakeJaeger:
         traces_without_data: bool = False,
     ) -> None:
         self.traces = list(traces or [])
-        self.operations = [PLACE_ORDER_EXPECTED] if operations is None else list(operations)
+        # The live shape, measured on 2026-09-26: `/api/operations` answers a list
+        # of objects, not a list of names. A fixture that answers bare strings
+        # cannot catch a reader that stringifies the objects.
+        self.operations = (
+            [{"name": PLACE_ORDER_EXPECTED, "spanKind": "server"}]
+            if operations is None
+            else list(operations)
+        )
         self.status = status
         self.traces_status = traces_status
         self.traces_without_data = traces_without_data
@@ -256,6 +263,38 @@ def test_the_advertised_operation_names_are_recorded_verbatim(export: Any) -> No
     assert stage["names"] == ADVERTISED
     assert stage["advertises_expected"] is False
     assert stage["names_containing_alias"] == [PLACE_ORDER_ALTERNATE]
+
+
+def test_a_live_operations_reply_is_unwrapped_into_names_not_reprs(export: Any) -> None:
+    """``str()`` over the live reply's objects produced their repr, not the name.
+
+    The 2026-09-26 extract recorded ``names`` as
+    ``["{'name': 'oteldemo.CartService/GetCart', 'spanKind': 'client'}"]`` and
+    ``advertises_expected`` as ``False``, so the "advertised" rung of the
+    entry-operation ladder could never fire - a name the store was willing to
+    confirm would have been reported as unverified. Older builds answer bare
+    strings, which still have to work.
+    """
+    fake = FakeJaeger(
+        operations=[
+            {"name": "oteldemo.CartService/GetCart", "spanKind": "client"},
+            {"name": PLACE_ORDER_EXPECTED, "spanKind": "server"},
+        ]
+    )
+
+    result = probe(export, fake)
+
+    stage = result["stages"]["operations_for_service"]
+    assert stage["names"] == sorted([PLACE_ORDER_EXPECTED, "oteldemo.CartService/GetCart"])
+    assert stage["advertises_expected"] is True
+    assert (
+        result["stages"]["entry_operation"]["basis"]
+        == "expected operation advertised for the service, not observed"
+    )
+
+    bare = FakeJaeger(operations=[PLACE_ORDER_EXPECTED])
+    bare_names = probe(export, bare)["stages"]["operations_for_service"]["names"]
+    assert bare_names == [PLACE_ORDER_EXPECTED]
 
 
 # --- an operation filter that does not match what the store holds ------------

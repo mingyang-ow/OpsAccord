@@ -277,6 +277,28 @@ class PrometheusClient:
         payload = self._get(f"/api/v1/label/{label}/values", {}, timeout_seconds=timeout_seconds)
         return {str(value) for value in payload.get("data") or []}
 
+    def metric_names_for(self, selector: str, timeout_seconds: float) -> set[str]:
+        """Every metric name the server holds a series for under ``selector``.
+
+        ``series_names`` answers "which names does the server know", which cannot
+        tell a component that publishes nothing from one whose metrics are named
+        something the caller did not guess. ``count by (__name__)`` collapses the
+        selector's series to one entry per metric name, so an empty answer is a
+        statement about the selector rather than about the caller's vocabulary.
+        """
+        payload = self._get(
+            "/api/v1/query",
+            {"query": f"count by (__name__) ({selector})"},
+            timeout_seconds=timeout_seconds,
+        )
+        result = payload.get("data", {}).get("result") or []
+        names = set()
+        for sample in result:
+            name = (sample.get("metric") or {}).get("__name__")
+            if name:
+                names.add(str(name))
+        return names
+
     def scalar(self, query: str, timeout_seconds: float) -> float | None:
         """Evaluate one PromQL expression and return a single scalar, or None."""
         payload = self._get("/api/v1/query", {"query": query}, timeout_seconds=timeout_seconds)
@@ -368,7 +390,18 @@ class JaegerClient:
         language or instrumentation.
         """
         payload = self._get("/api/operations", {"service": service}, timeout_seconds)
-        return sorted(str(name) for name in _data_list(payload, "/api/operations"))
+        # The v1 API answers ``[{"name": ..., "spanKind": ...}]``; older builds
+        # answer a bare list of strings. ``str(entry)`` over the dicts produced the
+        # *repr* - ``"{'name': 'oteldemo.CartService/GetCart', 'spanKind': 'client'}"``
+        # - so on 2026-09-26 the extract's ``advertises_expected`` was False however
+        # the store was spelled, and the "advertised" rung of the entry-operation
+        # ladder could never fire.
+        names = []
+        for entry in _data_list(payload, "/api/operations"):
+            name = entry.get("name") if isinstance(entry, dict) else entry
+            if name is not None:
+                names.append(str(name))
+        return sorted(names)
 
     def traces(
         self,

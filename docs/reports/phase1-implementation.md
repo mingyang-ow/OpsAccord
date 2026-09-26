@@ -3162,7 +3162,271 @@ PY
 )
 ```
 
-One note on the local files: `.local/demo-endpoints.env` was absent before this pass, and a sandbox
-check of the block wrote a stub-generated file into that path by mistake. It was moved to
-`.local/sandbox-checks/stub-endpoints-20260926/` with a README and never deleted, and the path is
-absent again, so the block's `endpoints` step is the only thing that writes it.
+One note on the local files: a sandbox check of the block wrote a stub-generated
+`.local/demo-endpoints.env` by mistake. It was moved to
+`.local/sandbox-checks/stub-endpoints-20260926/` with a README and never deleted. The path now holds a
+real file resolved by the user's run (see "The restart pass, measured" below), and the block moves any
+existing file aside as `.pre-<timestamp>` before resolving, so a stale file whose ports a replaced
+stack owned can never be sourced.
+
+## The restart pass, measured (`7f46e69`) - the restart cleared the CPU symptom, the helper ate the per-container state again, and Payment is still unverified
+
+Appended 2026-09-26. Everything above is left as it was and the corrections below are marked rather
+than written over.
+
+### The user's measured run
+
+The user ran the block from "The restart pass" in their own terminal at **02:57-02:58 UTC on
+2026-09-26**, from revision `7f46e69`. Evidence: `.local/user-next-action-20260926T025708/`
+(`containers-{before,after}.log`, `stats-{before,after}.log`, `restart.log`,
+`logs-catalog-{before,after}.log`, `health-after.log`, `flags.json`, `runtime-{before,after}.log`,
+`trace.log`, `endpoints.log`, `docker-version.log`), with
+`reports/local/payment-trace-readiness-20260926T025708.json` and
+`reports/local/service-runtime-{before,after}-20260926T025708.json`. Every step exited `0` and
+`failed=()` was empty. Nothing in this section was produced by this session; the code changes, the
+tests and this record are.
+
+| Reading | What it measured | Source |
+| --- | --- | --- |
+| Engine and stack surface | Docker engine 29.7.2; the block brought up 25 containers and every published port answered `ok`, including `PRODUCT_CATALOG product-catalog:3550 -> 55172`, plus `prometheus /-/healthy`, `flagd-ui /api/read`, `jaeger /jaeger/ui/api/services` | `docker-version.log`, `health-after.log` |
+| The catalog, as found | `cpu=286.48% mem=19.68MiB / 20MiB mem_pct=98.38% pids=22`, then `cpu=793.98% mem=14.81MiB / 20MiB mem_pct=74.04% pids=27` - i.e. **at its cap, on a container seconds old** | `stats-before.log` |
+| The catalog, after the in-place restart | `cpu=2.66% mem=12.83MiB / 20MiB (64.14%) pids=21`, then `cpu=0.76% mem=17.91MiB / 20MiB (89.57%) pids=21` - CPU fell from 793.98% to 0.76% | `stats-after.log` |
+| The catalog's own output, before | two `exporter export timeout: rpc error: code = DeadlineExceeded`, at 02:57:43 and 02:57:59 - **within ~30 s of the container starting** | `logs-catalog-before.log` |
+| The catalog's own output, after (`--since 5m`) | the **same two lines and no later one**; the window is 5 minutes and it contains the restart | `logs-catalog-after.log` |
+| Per-container state | **one container out of twenty-five, on both captures** - the defect below; `product-catalog` and `otel-collector`, the two services the block existed to read, are the two it did not collect | `containers-{before,after}.log` |
+| Go runtime metrics in the store, before | 347 names advertised, 24 kept, 20 services report metrics; **0 of 24 have a value** for all three services | `runtime-before.log` |
+| Go runtime metrics, after | `checkout` **7 of 24** (the `go_memory_*` / `go_goroutine_count` family); `product-catalog` **0 of 24**; `payment` **0 of 24** | `runtime-after.log` |
+| The trace read | 17 services visible; the store advertises **1** operation for `checkout` and it is `oteldemo.CartService/GetCart` (client), not the entry operation the probe asks for; 1 recent unfiltered `checkout` trace (`cb41c59b21d6c832ee86d7da67605aae`); bounded retrieval check `retrieved=False`; the operation-filtered interval query returned **0**, so `traces_retrieved=0`, `request_path_reconstructed=False`, `sufficiency: not_sufficient` | `trace.log`, trace extract |
+| Fault flags | `18 flags read; not off: <none>` | `flags.json` |
+
+### The helper ate the per-container state again
+
+`containers-before.log` and `containers-after.log` are each **268 bytes** and hold exactly one
+container - `checkout` - while printing `demo: listing project containers exited 0` and exiting `0`.
+That is the second run in a row in which the helper lost the evidence the run was made for, by a
+different cause from the first.
+
+`docker inspect` reads stdin, so
+`while read -r name; do ... "$DOCKER_BIN" inspect ... "$name"; done <<<"$names"` hands the rest of
+the here-string to the first `inspect` invocation, which consumes it; the loop then sees EOF and ends.
+`cmd_pull` had the identical shape over its image list, so every image after the first was silently
+skipped. Reproduced here with a stub whose `inspect` drains stdin: a stub that does not read stdin
+prints all three containers, and a stub that does is handed only the first.
+
+Both loops now read their list into an array before iterating (`mapfile`) and every `docker`/`compose`
+call that could read stdin is given `</dev/null`. The regression test drives the stub **with**
+stdin-draining enabled and asserts that every container is reported and every image pulled; both
+assertions fail against the pre-fix script. A second test pins that a failing `pull` still reaches the
+caller rather than being reported as the last image's status.
+
+### A second defect the same run exposed: the advertised operation names were dict reprs
+
+`JaegerClient.operations()` ran `sorted(str(name) for name in _data_list(...))` over the v1 reply,
+whose entries are **objects** (`{"name": ..., "spanKind": ...}`), so it returned their repr. The
+extract shows it verbatim: `names` as `["{'name': 'oteldemo.CartService/GetCart', 'spanKind':
+'client'}"]` and `advertises_expected` as `false`.
+
+Two consequences, both live in the same run. `ENTRY_OPERATION in advertised` was `False` however the
+store spelled a name, so the "expected operation **advertised**, not observed" rung of the
+entry-operation ladder could never fire and a name the store was willing to confirm would still have
+been recorded as `unverified`. And `names_containing_alias` was matched against repr text rather than
+names. Fixed by unwrapping `name` from the object, with the bare-string form older builds answer still
+accepted. The fixture answered bare strings, which is exactly why no test caught it; the default
+fixture now answers the live shape.
+
+The trace log also printed a **count** of advertised operations rather than the names, which is what
+made the mismatch invisible. It now prints each name and says plainly when none of them is the
+operation the probe looks for.
+
+### The runtime probe could not tell a broken export from a guessed name
+
+`runtime-before` reported "0 of 24 runtime metrics have a value" for all three services while the
+store advertised 347 names. Read alone, that cannot distinguish a service whose export path is broken
+from one whose metrics are named something the discovery never asked about - the one question the
+script exists to answer.
+
+The script now asks the store directly, per service: `count by (__name__) ({service_name="..."})`
+lists the metric names the store really holds for that service. An empty answer is then a statement
+about the service, and any held name the discovery never asked about is printed as
+`held but never asked about` - the vocabulary to build the next discovery from. The probe is additive
+and a failed probe is recorded as a failure, so it cannot turn a failed read into an empty one.
+
+What the three-service comparison already argues, without deciding it: `checkout` and
+`product-catalog` are both Go services of this revision with the same instrumentation, and in the
+**same run and the same query** the first returned 7 of 24 and the second 0 of 24. A name-shape
+artefact would have to be service-specific to explain that; a broken export path on the catalog
+explains it directly and matches its own `DeadlineExceeded` output. The probe in the next run settles
+it.
+
+### What this run does and does not settle
+
+Settled:
+
+- The restart was reversible and stayed in scope: `compose restart product-catalog otel-collector
+  exited 0`, and `checkout` carries the same `started=2026-09-26T02:57:33.504438613Z` in both
+  captures, so nothing outside the two named services was replaced and no volume or image was touched.
+- A fresh process **does** clear the CPU symptom: 793.98% collapsed to 0.76-2.66%.
+- No `DeadlineExceeded` line later than 02:57:59 appears in the post-restart 5-minute window.
+- Nothing was injected: all 18 fault flags `off`.
+
+Not settled, and not claimed:
+
+- **Payment recovery remains unverified on this revision.** The store advertises exactly one operation
+  for `checkout` and it is not the one the probe asks for, so the interval query returned nothing.
+  There is no `Charge` evidence either way, and a zero under a filter that does not match is not an
+  absent path.
+- The catalog's **Docker health after the restart was never captured** - the defect above ate it.
+  `health-after` is `demo.sh health`, a TCP connect, which proves a listener exists and not that the
+  service is serving.
+- Whether the catalog's export timeouts actually stopped, or the restarted process is simply younger
+  than one export interval, is not decidable from two lines in a `--tail 80` window.
+- The catalog's Go runtime metrics did not return after restarting **both** it and the collector,
+  while `checkout`'s appeared after restarting the collector alone. That is the state the next run's
+  probe reads.
+
+### `D27`'s table is again not a partition
+
+`D27` (the local decision log) records two rows - "CPU near the core count **with RSS at the limit**"
+or "CPU near idle, RSS below" - and the 2026-09-25 11:46:57 reading matched neither, because CPU was high
+*and* RSS was low (56.50%, 28.34%). This run adds a third observation of the same container: at ~30 s
+of age its RSS is **98.38% and 74.04%** of the cap with 286.48% and 793.98% CPU; at ~23 minutes of age
+it was 56.50% and 28.34% with 159.76% and 378.74%.
+
+So the two rows do not partition the container's life: the same container sits at the cap early and
+well below it later, which is what a Go heap held under `GOMEMLIMIT` does when the collector runs and
+returns memory. A single RSS sample therefore cannot decide the memory question, and the deviation
+stays **not applied** - this is not a re-reading of the earlier number. What the pair does support is
+that neither observation is a stable state to repair against, and that the readings which persist
+across both are the catalog's export timeouts and its never-answering health probe.
+
+### Executed in this session, and what was not
+
+Offline suite `291 passed, 7 skipped, 85 deselected` in **both** environment variants (`ruff check`,
+`ruff format --check` over 92 files, `mypy src/opsaccord` over 42 files, `bash -n scripts/demo.sh` all
+clean) at `reports/local/validation-20260926T030620`. Each new test was falsified against the pre-fix
+code before it was kept: both `demo.sh` assertions and the operations-shape assertion fail there, the
+latter producing the live repr verbatim. Those suites run against stubs, which is structure and not
+live evidence.
+
+**Not run:** no live scenario, no integration suite, no PostgreSQL, and no live stack from this
+session - the sandbox reaches neither the Docker socket nor a loopback port, so the per-container
+state, the corrected runtime probe and Payment recovery all stay with the user. **No P1-01 outcome is
+reported**, and no recovery is claimed.
+
+### The one next action
+
+Read-only; the stack is already up and healthy, so nothing is started, restarted or armed. It runs the
+integration suite this pass could not, then captures the per-container state that was lost, the
+catalog's own numbers and output, the runtime probe and the retained traces.
+
+```bash
+( set -euo pipefail
+  cd /home/brentiburo/projects/OpsAccord
+  deactivate 2>/dev/null || true
+  source .venv/bin/activate
+  export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+  PYTHON="$PWD/.venv/bin/python"
+  printf 'interpreter: %s\n' "$("$PYTHON" -c 'import sys; print(sys.executable)')"
+  printf 'tested revision: %s on %s\n' "$(git rev-parse --short HEAD)" "$(git rev-parse --abbrev-ref HEAD)"
+
+  TS="$(date -u +%Y%m%dT%H%M%S)"; LOGDIR=".local/user-next-action-$TS"; mkdir -p "$LOGDIR"
+  printf 'evidence dir: %s\n' "$LOGDIR"
+
+  failed=()
+  run() { local name="$1"; shift
+    set +e; { "$@"; } 2>&1 | tee "$LOGDIR/$name.log"; rc="${PIPESTATUS[0]}"; set -e
+    printf '==== %s exited %s (log %s) ====\n' "$name" "$rc" "$LOGDIR/$name.log"
+    [ "$rc" -eq 0 ] || failed+=("$name"); }
+
+  # 1. The stages this pass could not run: PostgreSQL, then the integration suite. Both
+  #    are project-local and idempotent. The live settings are removed so an exported
+  #    endpoint file cannot turn the suite into a live run against the demo stack.
+  run postgres bash scripts/pg.sh start
+  run integration env -u OPSACCORD_DEMO_MODE -u OPSACCORD_PROMETHEUS_BASE_URL \
+      -u OPSACCORD_JAEGER_BASE_URL -u OPSACCORD_FLAG_CONTROL_BASE_URL -u OPSACCORD_LIVE_DEMO \
+      "$PYTHON" -m pytest -q -m integration
+
+  # 2. Refresh the endpoints from the stack that is up now. A stale file names ports a
+  #    replaced stack owned, and querying those answers "connection refused", which reads
+  #    like a stack fault. It is moved aside, never deleted, and only a file resolved by
+  #    this run is used. Sourcing it sets these variables in this subshell only.
+  if [ -f .local/demo-endpoints.env ]; then mv .local/demo-endpoints.env ".local/demo-endpoints.env.pre-$TS"; fi
+  run endpoints bash scripts/demo.sh endpoints
+  if [ ! -f .local/demo-endpoints.env ]; then
+    printf '\nSTOP: scripts/demo.sh endpoints could not resolve the stack; nothing further was run.\n'; exit 1
+  fi
+  if [ "$(grep -c '^OPSACCORD_[A-Z_]*=' .local/demo-endpoints.env)" -ne 4 ]; then
+    printf '\nSTOP: the refreshed endpoints file does not hold exactly the four expected settings.\n'; exit 1
+  fi
+  set -a; . .local/demo-endpoints.env; set +a
+
+  # 3. The per-container state, now that the loop no longer consumes its own list. This is
+  #    the reading the 2026-09-26 block was written for and did not get: every container,
+  #    `product-catalog` and `otel-collector` included, not one out of twenty-five.
+  run containers bash scripts/demo.sh inspect
+  containers_seen="$(grep -cE '^[^ ]+ state=' "$LOGDIR/containers.log" 2>/dev/null || true)"
+  case "$containers_seen" in ''|*[!0-9]*) containers_seen=0 ;; esac
+  printf 'containers reported: %s\n' "$containers_seen"
+  if [ "$containers_seen" -le 1 ]; then
+    printf 'WARNING: that is fewer containers than the stack has, so the list is still being\n'
+    printf 'consumed by the first inspect. Read nothing from containers.log; send it back as-is.\n'
+  fi
+
+  # 4. The catalog's own resource numbers and its own output, on the restarted process.
+  run stats bash scripts/demo.sh stats
+  export OPSACCORD_DEMO_LOG_SINCE=20m
+  run logs-catalog bash scripts/demo.sh logs product-catalog
+  unset OPSACCORD_DEMO_LOG_SINCE
+
+  # 5. The runtime read, now with the store-side probe: it prints the metric names the store
+  #    really holds per service, so an empty answer is a statement about the service rather
+  #    than about the names this script guessed.
+  run runtime "$PYTHON" scripts/diagnose-service-runtime.py \
+      --services product-catalog checkout payment \
+      --out "reports/local/service-runtime-$TS.json"
+
+  # 6. The retained traces. The lines carrying the store's own operation names, and the
+  #    evidence-sufficiency line, are the ones that decide the next step.
+  run trace "$PYTHON" scripts/diagnose-payment-trace-path.py --lookback-minutes 15 --recent-minutes 15 \
+      --out "reports/local/payment-trace-readiness-$TS.json"
+
+  # 7. What the fault flags say, so no reading above is attributed to an armed fault.
+  set +e
+  curl -fsS --max-time 10 "$OPSACCORD_FLAG_CONTROL_BASE_URL/api/read" >"$LOGDIR/flags.json" 2>"$LOGDIR/flags.err"
+  flags_rc=$?
+  set -e
+  printf '==== flag read exited %s ====\n' "$flags_rc"
+  set +e
+  "$PYTHON" - "$LOGDIR/flags.json" <<'PY'
+import json, sys
+try:
+    flags = json.load(open(sys.argv[1]))["flags"]
+except Exception as exc:
+    print(f"flags document unreadable: {exc}")
+    raise SystemExit(0)
+armed = {n: f.get("defaultVariant") for n, f in flags.items() if f.get("defaultVariant") not in (None, "off")}
+print(f"{len(flags)} flags read; not off: {armed or '<none>'}")
+PY
+  set -e
+
+  printf '\nDone. Evidence: %s/\n' "$LOGDIR"
+  printf 'Also: reports/local/service-runtime-%s.json and reports/local/payment-trace-readiness-%s.json\n' "$TS" "$TS"
+  if [ "${#failed[@]}" -gt 0 ]; then
+    printf 'Steps that failed (their logs are above): %s\n' "${failed[*]}"
+    printf 'Send back: the failed step names, the containers log, the runtime log and the trace log.\n'
+    exit 1
+  fi
+  printf 'Send back: the "containers reported" count and the product-catalog and otel-collector\n'
+  printf 'lines from containers.log, both stats samples, the runtime log in full (its "held" and\n'
+  printf '"never asked about" lines especially), and the "advertised:" lines plus the\n'
+  printf 'evidence-sufficiency line from the trace log.\n'
+)
+```
+
+Read that run as follows. A `containers reported` count of 1 means the list is still being consumed
+and the capture is worthless - stop and send it back rather than reading it. The runtime log's
+`held but never asked about` line is the vocabulary the next discovery needs, and a service that
+holds **no** names at all is the attributable form of "its export path is broken".
+
+**Phase 1 remains PARTIAL.** Its required live outcomes - a resolved Payment scenario and a measured
+recovery - have not been demonstrated on this revision, and this pass did not attempt them.

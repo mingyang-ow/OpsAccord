@@ -408,13 +408,23 @@ starting the stack. No flag, span name, or service behaviour is changed, and the
 override is documented in the file header with the measurement that motivated it.
 
 The same pair is still on `product-catalog`, and the catalog is `Up (unhealthy)`,
-but the signature does **not** repeat: on 2026-09-25 its resident set measured
-11.3 MiB and 5.668 MiB of the 20 MiB cap (56.50% and 28.34%) while its CPU was
-159.76% and 378.74%. A runtime held down by its ceiling sits *at* the ceiling;
-this one is well below it. So the checkout precedent is not a licence to raise
-the catalog's limits, and the measurement that would name the catalog's cause -
-its own runtime metrics and the text of its failing health probe - is the next
-step. See `docs/reports/phase1-implementation.md`, "The restart pass".
+but the signature does **not** repeat and is not stable either. Two measurements
+of the same container disagree: at ~30 s of age (2026-09-26) its resident set was
+19.68 MiB and 14.81 MiB of the 20 MiB cap (98.38% and 74.04%) with CPU at 286.48%
+and 793.98%; at ~23 minutes of age (2026-09-25) it was 11.3 MiB and 5.668 MiB
+(56.50% and 28.34%) with CPU at 159.76% and 378.74%. A Go heap held under
+`GOMEMLIMIT` sits at the cap while it is allocating and drops well below it once
+the collector returns memory, so a single sample cannot decide the question and
+neither figure is a state to repair against.
+
+So the checkout precedent is not a licence to raise the catalog's limits. What
+persists across both measurements is narrower and more useful: the catalog's OTLP
+export to `otel-collector:4317` times out (`exporter export timeout: ... code =
+DeadlineExceeded`, within ~30 s of container start), its `grpc_health_probe` never
+answers, and after a restart of `product-catalog` and `otel-collector` it still
+publishes **no** Go runtime metrics to Prometheus while `checkout` - the same
+language and instrumentation - publishes seven. See
+`docs/reports/phase1-implementation.md`, "The restart pass, measured".
 
 ## Live adapter
 
@@ -432,5 +442,6 @@ live mode fails closed: if the stack does not answer, reads raise and the gatewa
 records collection-error evidence instead of falling back to simulated numbers.
 
 `src/opsaccord/tools/factory.py` selects the adapter from `OPSACCORD_DEMO_MODE`,
-and `scripts/demo.sh` provides `pull|start|stop|status|health|wait|endpoints|urls|host|logs|override`
+and `scripts/demo.sh` provides
+`pull|start|stop|restart|status|inspect|stats|health|override|wait|endpoints|urls|host|logs`
 for lifecycle management limited to this project's containers.
