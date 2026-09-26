@@ -2645,7 +2645,9 @@ changed.
   this session), and any measurement of `product-catalog` - the block below is the only thing that can
   produce that.
 
-### The one next action
+### The one next action (superseded: this block ran on 2026-09-25 11:46:57, and its readings are
+recorded - with four corrections and a replacement block - in "The restart pass" at the end of this
+report)
 
 Paste the block below from the host. It refreshes the endpoints, moves a stale endpoints file aside
 instead of trusting it, and collects in one run: per-container state (health, restarts, exit, OOM, limits,
@@ -2936,3 +2938,221 @@ uv run bash scripts/pg.sh stop
 
 Stopping here for discussion. No merge, no release, no visibility change, and no
 Phase 2 work was started.
+
+---
+
+## The restart pass: what the 2026-09-25 measurement settled (code `86735c1`)
+
+Appended 2026-09-26 on top of everything above. The earlier sections are left as they were and
+the corrections below are marked rather than written over.
+
+### The measurement the previous block asked for
+
+The user ran the read-only block from "The one next action" in their own terminal at **11:46:57 UTC
+on 2026-09-25**, after the state the previous section describes. Evidence:
+`.local/user-catalog-diagnostics-20260925T114656/`, with the trace extract at
+`reports/local/payment-trace-readiness-20260925T114656.json`. Nothing here was produced by this
+session; it is the user's measurement, read and recorded.
+
+| Reading | What it measured | Source |
+| --- | --- | --- |
+| Every published port, the catalog's included | `ok` for all 14 endpoints, `PRODUCT_CATALOG product-catalog:3550 -> 65235`, plus `prometheus /-/healthy`, `flagd-ui /api/read`, `jaeger /jaeger/ui/api/services` | `health.log` |
+| `product-catalog` CPU and resident set | **159.76% then 378.74% CPU; 11.3 MiB then 5.668 MiB of a 20 MiB cap** (56.50%, 28.34%); 28 then 33 pids. `checkout` 0.01% / 22.45 MiB of 256 MiB, `payment` 0.23% / 98.45 MiB of 140 MiB | `stats.log` |
+| The catalog's own output | ~30 consecutive export timeouts, 11:27:58 to 11:46:49, roughly every 30-60 s, never recovering: `exporter export timeout: rpc error: code = DeadlineExceeded desc = context deadline exceeded`, `processor export timeout`, `failed to upload metrics: context deadline exceeded`, `traces export: processor export timeout` | `logs-catalog.log` |
+| The collector | Up and exporting - the `debug` exporter logs `resource spans: 1, spans: 9` at 11:47:12. Its only recurring error is the `kafkametrics` receiver failing to resolve host `kafka` | `logs-collector.log` |
+| Per-container state | **Not collected at all**, in 144 bytes: `demo: listing project containers exited 0`, `template parsing error: template: :1: function "trimPrefix" not defined`, `demo: inspect checkout failed` | `containers.log` |
+| Retained traces | 7 traces for `checkout`, `query_completed: true`, `request_path_reconstructed: true`, exit 0, `sufficiency: sufficient_for_path_review`, 18 services visible, 123 spans in the first trace `{ERROR: 15, OK: 43, UNSET: 65}` | trace extract |
+| The Payment edge | **Present and serving** in 6 of the 7: `payment / oteldemo.PaymentService/Charge / server / status OK` at 1.1-55.8 ms beside `checkout / same operation / client / status UNSET` at 2.5-90.0 ms. In the seventh no edge span was recorded and the attempt records a failure (`edge_span_absent_with_a_failure_recorded`) | trace extract |
+| `GetProduct` (checkout -> catalog) | client spans of **37.2 s to 238.9 s**, 14 samples, no error status | trace extract |
+| `PlaceOrder` | 144.7 s to 482.5 s across the 7 attempts | trace extract |
+| Fault flags | all 18 `off`, including `paymentUnreachable`, `paymentFailure`, `productCatalogFailure`, `productCatalogLockContention` | `flags.json` |
+
+### Four corrections this measurement forces
+
+1. **The "resource wedge" reading for the catalog is not supported.** The previous section's leading
+   reading was that `product-catalog` carries the same memory wedge the local override documents for
+   `checkout`. The measurement says otherwise: the catalog's resident set is **28-56% of its cap**, not
+   pinned at it. `D27` fixed this decider in advance - "RSS well below the limit ... **no** memory
+   change" - so **no memory deviation is applied to the catalog**, and the same reasoning forbids
+   reaching for one. The catalog's CPU is *not* idle, so the second row of that table did not match
+   cleanly either, and `D27`'s table is now recorded as having been incomplete rather than quietly
+   reinterpreted: the measurement matched neither row exactly.
+2. **The catalog is no longer what blocks the Payment path on this revision.** The previous section
+   records that `PlaceOrder` failed before the payment edge and that no `Charge` span existed. That was
+   true of the one trace then retained. In these 7, the `Charge` edge is present in 6 with the payment
+   server span recording `OK`. Recovery is still unverified (a retained span cannot show a service is
+   serving now), but "no Charge span exists" is no longer a property of the current stack.
+3. **`demo.sh health` proves reachability, not serving.** It printed `ok PRODUCT_CATALOG` while Docker
+   reported the same container `unhealthy`. Both are correct: the probe is a TCP connect, which
+   succeeds as soon as the listener exists. The surface must not be read as a health verdict, and the
+   catalog's `Up (unhealthy)` is the stronger claim.
+4. **The collector's `kafka` errors are not a fault to repair.** `kafkametrics` fails to resolve
+   `kafka:9092` because that service belongs to `compose.full.yaml`, which this stack does not start,
+   and `compose.observability.yaml` documents the consequence in its own words: the Kafka and
+   PostgreSQL receivers "are harmless - they will simply fail to scrape since those services are not
+   running". Restarting or reconfiguring the collector to silence them would be a change made to
+   remove noise.
+
+### What the numbers do point at, and what was changed
+
+The catalog is **CPU-busy with a small heap** while its OTLP export to `otel-collector:4317` times out
+continuously, its gRPC health probe never answers, and `GetProduct` takes 37-239 s. That is not the
+ceiling signature; it is a process that is doing something expensive and not answering. The
+measurement that separates *starved* from *blocked* is the runtime's own (`go_`/`process_` metrics)
+plus the health probe's own text - and the second was **lost by a defect in the helper**, so this pass
+fixed the helper before asking for another run:
+
+* `cmd_inspect` opened with `{{trimPrefix "/" .Name}}`, and the installed Docker CLI answered
+  `function "trimPrefix" not defined` for every container. The whole per-container reading - health,
+  restarts, exit and OOM state, the limits, the effective `GOMEMLIMIT` and the probe's message - was
+  lost while the step still reported exit 0. The slash is now removed in bash, and a test reads the
+  script's own `--format` templates and fails on any template function outside a listed set. The stub
+  docker binary cannot evaluate a Go template, which is exactly how this reached a live run.
+* `scripts/diagnose-service-runtime.py` reads the Go runtime metrics the demo publishes to Prometheus
+  for named services, discovery-driven so it does not depend on which instrumentation shape a service
+  emits, and reports a metric it cannot find as absent rather than as zero.
+* `demo.sh restart [services...]` was added: `compose restart` keeps each container and its state, so a
+  wedged service can be given a fresh process without destroying the restart count and probe history a
+  diagnosis reads. `stop` removes the containers and is therefore *not* the primitive for this.
+* `docs/development.md` named `OPSACCORD_DEMO_CHECKOUT`, which no script reads (the helper reads
+  `OPSACCORD_DEMO_DIR`); a test now fails if a documented `OPSACCORD_*` setting exists nowhere.
+
+### Executed in this session, and what was not
+
+| Check | Result | Log |
+| --- | --- | --- |
+| `pytest -q -m "not integration"`, scrubbed environment | **286 passed, 7 skipped, 85 deselected** | `reports/local/validation-20260926T003439/06-offline.log` |
+| the same with live settings exported (stale ports) | **286 passed, 7 skipped, 85 deselected** | `.../07-offline-live-settings.log` |
+| `ruff check`, `ruff format --check` (92 files), `mypy src/opsaccord` (42 files), `bash -n` | clean | `01`-`04` in the same directory |
+| the block, against a stub engine | full flow runs; per-step statuses reported; a failing step is named and the block exits 1 | `.../08-block-full-stub-run.log` |
+| the block, with no engine | stops before touching anything | `.../09-block-stop-path.log` |
+| **Not run** | no live scenario, no integration suite, no PostgreSQL (none in this session) - and therefore **no P1-01 outcome and no recovery measurement** | - |
+
+The stub runs are structure checks, not live evidence. The catalog is still `Up (unhealthy)` until a
+run measures it, and Payment recovery remains unverified on this revision: Phase 1 stays **PARTIAL**.
+
+### The one next action
+
+Paste the block below from the host. It starts what is missing, records the state **as found**, then
+restarts the two services whose state the 2026-09-25 capture put in question and records the state
+again, so "a fresh process clears it" and "a fresh process fails the same way" are distinguishable
+from one directory. It names every step's exit status, stops on a failed prerequisite, and exits
+non-zero if any step failed.
+
+```bash
+( set -euo pipefail
+  cd /home/brentiburo/projects/OpsAccord
+  deactivate 2>/dev/null || true
+  source .venv/bin/activate
+  export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+  PYTHON="$PWD/.venv/bin/python"
+  DC="${OPSACCORD_DOCKER_BIN:-/mnt/c/Users/admin/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe}"
+  printf 'interpreter: %s\n' "$("$PYTHON" -c 'import sys; print(sys.executable)')"
+  printf 'tested revision: %s on %s\n' "$(git rev-parse --short HEAD)" "$(git rev-parse --abbrev-ref HEAD)"
+
+  TS="$(date -u +%Y%m%dT%H%M%S)"; LOGDIR=".local/user-next-action-$TS"; mkdir -p "$LOGDIR"
+  printf 'evidence dir: %s\n' "$LOGDIR"
+
+  failed=()
+  run() { local name="$1"; shift
+    set +e; { "$@"; } 2>&1 | tee "$LOGDIR/$name.log"; rc="${PIPESTATUS[0]}"; set -e
+    printf '==== %s exited %s (log %s) ====\n' "$name" "$rc" "$LOGDIR/$name.log"
+    [ "$rc" -eq 0 ] || failed+=("$name"); }
+
+  # 1. The engine is the one prerequisite this block cannot start for you.
+  if ! "$DC" version --format '{{.Server.Version}}' >"$LOGDIR/docker-version.log" 2>&1; then
+    printf '\nSTOP: the Docker engine did not answer. Start Docker Desktop, wait until it settles,\n'
+    printf 'then run this block again. Nothing was started and nothing was changed.\n'
+    exit 1
+  fi
+  printf 'docker engine: %s\n' "$(cat "$LOGDIR/docker-version.log")"
+
+  # 2. PostgreSQL is project-local (no root, no Docker) and idempotent. The next action needs it.
+  run postgres bash scripts/pg.sh start
+
+  # 3. Bring the pinned stack up. Idempotent: a container that is already running is left alone.
+  printf 'starting the pinned demo stack (waits up to 900s for health; quiet until it ends)...\n'
+  run stack bash scripts/demo.sh start
+
+  # 4. Refresh the endpoints from the stack that is up now. A stale file names ports a replaced stack
+  #    owned, and querying those answers "connection refused", which reads like a stack fault. It is
+  #    moved aside, never deleted. Sourcing it sets these variables in this subshell only.
+  if [ -f .local/demo-endpoints.env ]; then mv .local/demo-endpoints.env ".local/demo-endpoints.env.pre-$TS"; fi
+  run endpoints bash scripts/demo.sh endpoints
+  if [ ! -f .local/demo-endpoints.env ]; then
+    printf '\nSTOP: scripts/demo.sh endpoints could not resolve the stack; nothing further was run.\n'; exit 1
+  fi
+  if [ "$(grep -c '^OPSACCORD_[A-Z_]*=' .local/demo-endpoints.env)" -ne 4 ]; then
+    printf '\nSTOP: the refreshed endpoints file does not hold exactly the four expected settings.\n'; exit 1
+  fi
+  set -a; . .local/demo-endpoints.env; set +a
+
+  # 5. State as found, before anything is restarted.
+  run containers-before bash scripts/demo.sh inspect
+  run stats-before bash scripts/demo.sh stats
+  export OPSACCORD_DEMO_LOG_SINCE=20m
+  run logs-catalog-before bash scripts/demo.sh logs product-catalog
+  unset OPSACCORD_DEMO_LOG_SINCE
+  run runtime-before "$PYTHON" scripts/diagnose-service-runtime.py \
+      --services product-catalog checkout payment \
+      --out "reports/local/service-runtime-before-$TS.json"
+
+  # 6. The smallest reversible restart: `compose restart` keeps each container, its configuration and
+  #    its state, and touches no volume and no image. It is applied to the two services in question -
+  #    the catalog (unhealthy, and slow in the retained traces) and the collector (its export target).
+  run restart bash scripts/demo.sh restart product-catalog otel-collector
+  run wait bash env OPSACCORD_DEMO_WAIT_SECONDS=300 bash scripts/demo.sh wait
+
+  # 7. The same readings after the restart, plus the health surface.
+  run containers-after bash scripts/demo.sh inspect
+  run health-after bash scripts/demo.sh health
+  run stats-after bash scripts/demo.sh stats
+  export OPSACCORD_DEMO_LOG_SINCE=5m
+  run logs-catalog-after bash scripts/demo.sh logs product-catalog
+  unset OPSACCORD_DEMO_LOG_SINCE
+  run runtime-after "$PYTHON" scripts/diagnose-service-runtime.py \
+      --services product-catalog checkout payment \
+      --out "reports/local/service-runtime-after-$TS.json"
+
+  # 8. What the fault flags say, so no reading above is attributed to an armed fault.
+  set +e
+  curl -fsS --max-time 10 "$OPSACCORD_FLAG_CONTROL_BASE_URL/api/read" >"$LOGDIR/flags.json" 2>"$LOGDIR/flags.err"
+  flags_rc=$?
+  set -e
+  printf '==== flag read exited %s ====\n' "$flags_rc"
+  set +e
+  "$PYTHON" - "$LOGDIR/flags.json" <<'PY'
+import json, sys
+try:
+    flags = json.load(open(sys.argv[1]))["flags"]
+except Exception as exc:
+    print(f"flags document unreadable: {exc}")
+    raise SystemExit(0)
+armed = {n: f.get("defaultVariant") for n, f in flags.items() if f.get("defaultVariant") not in (None, "off")}
+print(f"{len(flags)} flags read; not off: {armed or '<none>'}")
+PY
+  set -e
+
+  # 9. The retained traces, to say whether a fresh Checkout -> Payment path exists.
+  run trace "$PYTHON" scripts/diagnose-payment-trace-path.py --lookback-minutes 15 --recent-minutes 15 \
+      --out "reports/local/payment-trace-readiness-$TS.json"
+
+  printf '\nDone. Evidence: %s/\n' "$LOGDIR"
+  printf 'Also: reports/local/payment-trace-readiness-%s.json, reports/local/service-runtime-{before,after}-%s.json\n' "$TS" "$TS"
+  if [ "${#failed[@]}" -gt 0 ]; then
+    printf 'Steps that failed (their logs are above): %s\n' "${failed[*]}"
+    printf 'Send back: the failed step names, the product-catalog and otel-collector lines from\n'
+    printf 'containers-before/containers-after, the PRODUCT_CATALOG line from health-after, both\n'
+    printf 'stats samples, and logs-catalog-before/after.\n'
+    exit 1
+  fi
+  printf 'Send back: the product-catalog and otel-collector lines from containers-before and\n'
+  printf 'containers-after, the PRODUCT_CATALOG line from health-after, both stats samples,\n'
+  printf 'whether logs-catalog-after still shows DeadlineExceeded, and the service-runtime reads.\n'
+)
+```
+
+One note on the local files: `.local/demo-endpoints.env` was absent before this pass, and a sandbox
+check of the block wrote a stub-generated file into that path by mistake. It was moved to
+`.local/sandbox-checks/stub-endpoints-20260926/` with a README and never deleted, and the path is
+absent again, so the block's `endpoints` step is the only thing that writes it.

@@ -407,6 +407,15 @@ resident, gRPC never listening, and 118 consecutive failed health probes.
 starting the stack. No flag, span name, or service behaviour is changed, and the
 override is documented in the file header with the measurement that motivated it.
 
+The same pair is still on `product-catalog`, and the catalog is `Up (unhealthy)`,
+but the signature does **not** repeat: on 2026-09-25 its resident set measured
+11.3 MiB and 5.668 MiB of the 20 MiB cap (56.50% and 28.34%) while its CPU was
+159.76% and 378.74%. A runtime held down by its ceiling sits *at* the ceiling;
+this one is well below it. So the checkout precedent is not a licence to raise
+the catalog's limits, and the measurement that would name the catalog's cause -
+its own runtime metrics and the text of its failing health probe - is the next
+step. See `docs/reports/phase1-implementation.md`, "The restart pass".
+
 ## Live adapter
 
 `src/opsaccord/tools/live_environment.py` implements the same typed tool surface
