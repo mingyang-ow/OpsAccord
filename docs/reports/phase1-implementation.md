@@ -3067,16 +3067,20 @@ non-zero if any step failed.
   fi
   printf 'docker engine: %s\n' "$(cat "$LOGDIR/docker-version.log")"
 
-  # 2. PostgreSQL is project-local (no root, no Docker) and idempotent. The next action needs it.
+  # 2. PostgreSQL is project-local (no root, no Docker) and idempotent. The catalog
+  #    still needs it for the next action even though it is not the current fault.
   run postgres bash scripts/pg.sh start
 
-  # 3. Bring the pinned stack up. Idempotent: a container that is already running is left alone.
+  # 3. Bring the pinned stack up. Idempotent: a container that is already running is
+  #    left alone. It can print nothing for several minutes while it waits for health.
   printf 'starting the pinned demo stack (waits up to 900s for health; quiet until it ends)...\n'
   run stack bash scripts/demo.sh start
 
-  # 4. Refresh the endpoints from the stack that is up now. A stale file names ports a replaced stack
-  #    owned, and querying those answers "connection refused", which reads like a stack fault. It is
-  #    moved aside, never deleted. Sourcing it sets these variables in this subshell only.
+  # 4. Refresh the endpoints from the stack that is up now. A stale file names ports a
+  #    replaced stack owned, and querying those answers "connection refused", which
+  #    reads like a stack fault. It is moved aside, never deleted, and only a file
+  #    resolved by this run is used. Sourcing it here sets these variables in this
+  #    subshell only; they do not outlive the block.
   if [ -f .local/demo-endpoints.env ]; then mv .local/demo-endpoints.env ".local/demo-endpoints.env.pre-$TS"; fi
   run endpoints bash scripts/demo.sh endpoints
   if [ ! -f .local/demo-endpoints.env ]; then
@@ -3087,7 +3091,8 @@ non-zero if any step failed.
   fi
   set -a; . .local/demo-endpoints.env; set +a
 
-  # 5. State as found, before anything is restarted.
+  # 5. State as found, before anything is restarted. This is what separates "wedged
+  #    since it started" from "a fresh process fails the same way" below.
   run containers-before bash scripts/demo.sh inspect
   run stats-before bash scripts/demo.sh stats
   export OPSACCORD_DEMO_LOG_SINCE=20m
@@ -3097,13 +3102,18 @@ non-zero if any step failed.
       --services product-catalog checkout payment \
       --out "reports/local/service-runtime-before-$TS.json"
 
-  # 6. The smallest reversible restart: `compose restart` keeps each container, its configuration and
-  #    its state, and touches no volume and no image. It is applied to the two services in question -
-  #    the catalog (unhealthy, and slow in the retained traces) and the collector (its export target).
+  # 6. The restart the user asked for, and the smallest reversible version of it:
+  #    `compose restart` keeps each container, its configuration and its state, and
+  #    touches no volume and no image, so it cannot lose evidence - unlike `stop`,
+  #    which removes the containers. It is applied to the two services whose state
+  #    the 2026-09-25 capture put in question: the catalog (unhealthy, and slow in
+  #    the retained traces) and the collector (its receiver, and the catalog's
+  #    export target). Restarting a healthy container is harmless; both are named.
   run restart bash scripts/demo.sh restart product-catalog otel-collector
   run wait bash env OPSACCORD_DEMO_WAIT_SECONDS=300 bash scripts/demo.sh wait
 
-  # 7. The same readings after the restart, plus the health surface.
+  # 7. State after the restart, the same readings as step 5 plus the health surface,
+  #    so "did a fresh process clear it" is answerable from one directory.
   run containers-after bash scripts/demo.sh inspect
   run health-after bash scripts/demo.sh health
   run stats-after bash scripts/demo.sh stats
