@@ -18,6 +18,7 @@ demo checkout is never touched.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -38,7 +39,7 @@ argv0="$1"
 } >>"$STUB_ARGV_LOG"
 case "$argv0" in
   version) printf '29.7.2\\n' ;;
-  ps) printf '/product-catalog\\n/checkout\\n' ;;
+  ps) printf 'product-catalog\\n/checkout\\n' ;;
   inspect)
     if [ -n "${STUB_INSPECT_RC:-}" ]; then exit "$STUB_INSPECT_RC"; fi
     case "$*" in
@@ -151,7 +152,10 @@ def test_inspect_reports_per_container_state_and_its_own_failures(tmp_path: Path
 
     assert ok.returncode == 0, ok.stderr
     assert "listing project containers exited 0" in ok.stdout
-    assert "state=running health=unhealthy" in ok.stdout
+    # `docker inspect` names the container with a leading slash; the report wants
+    # the name to line up with `docker ps` and with the stats samples.
+    assert "/product-catalog" not in ok.stdout
+    assert "product-catalog state=running health=unhealthy" in ok.stdout
     assert "restarts=0 exit=0 oom_killed=false" in ok.stdout
     assert "GOMEMLIMIT=16MiB" in ok.stdout
 
@@ -159,6 +163,114 @@ def test_inspect_reports_per_container_state_and_its_own_failures(tmp_path: Path
 
     assert failed.returncode == 1
     assert "failed" in failed.stderr
+
+
+def test_the_inspect_templates_use_no_go_function_the_cli_may_lack() -> None:
+    """`trimPrefix` cost a live run its per-container state; keep it out.
+
+    The 2026-09-25 capture answered
+    ``template parsing error: function "trimPrefix" not defined`` for the
+    inspect line, so the block that was meant to record health, restart counts,
+    limits and the health probe's own message recorded none of it. ``trimPrefix``
+    needs Go 1.19 in the template engine, and the Docker CLI on this host is the
+    Windows interop binary, whose templating is not the part that follows the
+    Linux release notes. The template functions that are safe are older than
+    that, so they are listed here and anything else fails the test on purpose:
+    the fix for a new one is to check the running CLI supports it and add it, not
+    to discover it in a live run.
+    """
+    allowed = {
+        "and",
+        "call",
+        "else",
+        "end",
+        "eq",
+        "html",
+        "if",
+        "index",
+        "js",
+        "json",
+        "len",
+        "ne",
+        "not",
+        "or",
+        "print",
+        "printf",
+        "println",
+        "range",
+        "slice",
+        "urlquery",
+        "with",
+    }
+    script = DEMO_SCRIPT.read_text(encoding="utf-8")
+    templates = re.findall(r"'({{[^']*}})'", script)
+    assert templates, "no --format template found; this guard would be vacuous"
+
+    offending: list[str] = []
+    for template in templates:
+        for action in re.findall(r"{{(.*?)}}", template):
+            # String literals are not identifiers, and a `.Field` access is a
+            # field, not a function, so only bare words are candidates.
+            body = re.sub(r'"[^"]*"', " ", action)
+            for token in re.findall(r"(?<![\w.$])([a-z][A-Za-z0-9]*)", body):
+                if token not in allowed:
+                    offending.append(f"{token!r} in {template}")
+    assert not offending, offending
+
+
+def test_restart_forwards_the_named_services_and_reports_its_status(tmp_path: Path) -> None:
+    """A restart is the reversible primitive; it must name exactly what it restarts."""
+    named = _run(tmp_path, "restart", "product-catalog", "otel-collector")
+
+    assert named.returncode == 0, named.stderr
+    calls = _invocations(tmp_path, "compose")
+    assert len(calls) == 1, calls
+    assert calls[0][-3:] == ["restart", "product-catalog", "otel-collector"]
+    assert "exited 0" in named.stderr
+
+    failed = _run(tmp_path, "restart", "product-catalog", STUB_COMPOSE_RC="4")
+
+    assert failed.returncode == 4
+    assert "exited 4" in failed.stderr
+
+
+def test_restart_without_a_name_restarts_the_whole_project(tmp_path: Path) -> None:
+    result = _run(tmp_path, "restart")
+
+    assert result.returncode == 0, result.stderr
+    calls = _invocations(tmp_path, "compose")
+    assert len(calls) == 1, calls
+    assert calls[0][-1] == "restart"
+
+
+def test_every_documented_OPSACCORD_variable_exists_somewhere_in_the_repository() -> None:
+    """A documented setting that does not exist sends the reader to a silent no-op.
+
+    ``docs/development.md`` told the reader to point ``OPSACCORD_DEMO_CHECKOUT`` at a
+    checkout in another location; ``scripts/demo.sh`` reads ``OPSACCORD_DEMO_DIR``, so
+    following the instruction changed nothing and the helper kept using the default
+    path. The check is deliberately repo-wide rather than script-wide, because these
+    settings legitimately live in several places.
+    """
+    documented = set(
+        re.findall(r"OPSACCORD_[A-Z_]+", (REPO_ROOT / "docs" / "development.md").read_text("utf-8"))
+    )
+    assert documented, "no settings found; this guard would be vacuous"
+
+    sources = [
+        path
+        for path in list((REPO_ROOT / "scripts").iterdir()) + list((REPO_ROOT / "tests").iterdir())
+        if path.suffix in {".sh", ".py"}
+    ]
+    sources.append(REPO_ROOT / "docs" / "development.md")
+    text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sources
+        if path.is_file() and path.name != "development.md"
+    )
+
+    missing = sorted(name for name in documented if name not in text)
+    assert not missing, missing
 
 
 def test_logs_bounds_its_window_only_when_asked(tmp_path: Path) -> None:

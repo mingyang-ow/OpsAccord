@@ -128,6 +128,29 @@ cmd_stop() {
   compose down --remove-orphans
 }
 
+# Restart this project's containers in place, or only the ones named.
+#
+# This is deliberately *not* `stop` followed by `start`: `down` removes the
+# containers, which throws away the running state that a diagnosis is reading -
+# restart counts, the health probe's own history, and how long a wedged process
+# has been wedged. `restart` keeps the container, its configuration and its
+# anonymous state, touches no volume, and leaves the image at the pinned
+# revision, so a service that is wedged in its own runtime can be given a fresh
+# process and the result compared. Every argument is passed straight to compose,
+# so a named service is restarted only when it is named.
+cmd_restart() {
+  require_docker; require_checkout
+  local rc=0
+  if (($# > 0)); then
+    compose restart "$@" || rc=$?
+    printf 'demo: compose restart %s exited %s\n' "$*" "$rc" >&2
+  else
+    compose restart || rc=$?
+    printf 'demo: compose restart (whole project) exited %s\n' "$rc" >&2
+  fi
+  return "$rc"
+}
+
 cmd_status() {
   require_docker
   printf 'project: %s   revision: %s\n' "$PROJECT" "$REVISION"
@@ -273,9 +296,15 @@ cmd_inspect() {
   while read -r name; do
     [ -n "$name" ] || continue
     line="$("$DOCKER_BIN" inspect --format \
-      '{{trimPrefix "/" .Name}} state={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} restarts={{.RestartCount}} exit={{.State.ExitCode}} oom_killed={{.State.OOMKilled}} memory_limit={{.HostConfig.Memory}} nano_cpus={{.HostConfig.NanoCpus}} started={{.State.StartedAt}} healthcheck={{if .Config.Healthcheck}}{{json .Config.Healthcheck.Test}}{{else}}none{{end}}' \
+      '{{.Name}} state={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} restarts={{.RestartCount}} exit={{.State.ExitCode}} oom_killed={{.State.OOMKilled}} memory_limit={{.HostConfig.Memory}} nano_cpus={{.HostConfig.NanoCpus}} started={{.State.StartedAt}} healthcheck={{if .Config.Healthcheck}}{{json .Config.Healthcheck.Test}}{{else}}none{{end}}' \
       "$name")" || { printf 'demo: inspect %s failed\n' "$name" >&2; rc=1; continue; }
-    printf '%s\n' "$line"
+    # `docker inspect` reports the name with a leading slash. The template
+    # functions that strip it (`trimPrefix`) need Go 1.19 and the Windows
+    # interop binary answered `template parsing error: function "trimPrefix" not
+    # defined` on the 2026-09-25 run, which cost that run its per-container
+    # state entirely; the slash is removed here, where it cannot depend on the
+    # CLI's Go version.
+    printf '%s\n' "${line#/}"
     # Only for a container that is not healthy: the probe's own message is what
     # separates "connect timed out" from "the server answered not-serving".
     probe="$("$DOCKER_BIN" inspect --format \
@@ -320,6 +349,7 @@ usage: scripts/demo.sh <command>
   pull        download every image the pinned compose model references
   start       start the core + observability stack and wait until it is healthy
   stop        stop and remove this project's containers
+  restart     restart this project's containers in place (optionally: names only)
   status      show this project's containers
   inspect     per-container health, restarts, exit/OOM state and limits
   stats       two bounded CPU/memory samples for the Go services
@@ -361,6 +391,7 @@ main() {
     pull) cmd_pull "$@" ;;
     start) cmd_start "$@" ;;
     stop) cmd_stop "$@" ;;
+    restart) cmd_restart "$@" ;;
     status) cmd_status "$@" ;;
     inspect) cmd_inspect "$@" ;;
     health) cmd_health "$@" ;;

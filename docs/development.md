@@ -41,7 +41,7 @@ portability concessions it makes are documented in `scripts/prefix_sensitivity/R
 The live paths run against the pinned upstream demo, not a mock. The checkout
 lives outside this repository (for example
 `/mnt/c/Users/admin/opsaccord-demo/opentelemetry-demo` at tag `3.1.0`); point
-`OPSACCORD_DEMO_CHECKOUT` at it if it is somewhere else. All lifecycle commands
+`OPSACCORD_DEMO_DIR` at it if it is somewhere else. All lifecycle commands
 are scoped to this project's containers.
 
 ```
@@ -53,6 +53,7 @@ scripts/demo.sh status
 scripts/demo.sh inspect      # health, restarts, exit/OOM state, limits, effective GOMEMLIMIT
 scripts/demo.sh stats        # two CPU/memory samples for the Go services
 scripts/demo.sh logs checkout
+scripts/demo.sh restart product-catalog otel-collector   # in place, keeps the containers
 scripts/demo.sh stop
 ```
 
@@ -60,6 +61,15 @@ scripts/demo.sh stop
 cannot show - restart count, exit code, `OOMKilled`, configured limits, the effective `GOMEMLIMIT` and
 the health probe's own message - and both it and `stats` report every command's exit status instead of
 hiding a failure behind a pipeline.
+
+`restart` is the reversible way to give a service a fresh process, and the one a diagnosis should reach
+for: `stop` removes the containers, which destroys the restart count, the health probe's history and
+whatever made the process wedged. Name services to restart only those; no name restarts the project.
+
+`scripts/diagnose-service-runtime.py` reads the Go runtime metrics the demo publishes to Prometheus for
+one or more services (discovery-driven, so it works whichever instrumentation shape a service emits).
+It exists to separate a *starved* process - a Go runtime whose collector cannot keep up with a heap
+ceiling far below the workload - from a *blocked* one, which `docker stats` alone cannot do.
 
 **An empty `logs` capture is not evidence that a service was silent.** This revision sends the Go
 services' `slog` output over OTLP and its `otel-config.yml` declares no stdout exporter, so their
