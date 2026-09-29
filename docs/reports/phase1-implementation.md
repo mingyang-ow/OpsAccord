@@ -3430,3 +3430,238 @@ holds **no** names at all is the attributable form of "its export path is broken
 
 **Phase 1 remains PARTIAL.** Its required live outcomes - a resolved Payment scenario and a measured
 recovery - have not been demonstrated on this revision, and this pass did not attempt them.
+
+## The resume pass (this commit) - the lifecycle hazard was real, its cause was mis-stated, and the guard now refuses instead of guessing
+
+Resumed 2026-09-29 after the break. **No live command ran from this session.** This sandbox reaches
+neither Docker nor a loopback port, so every lifecycle action below is the user's to run; what this
+pass did is establish the state, fix the lifecycle hazard it was asked to fix, and pin the refusals in
+tests that fail against the previous script. No new live outcome is reported here: the live readings
+this project holds are still the user's, in `.local/user-live-checks-*`, unchanged and unextended.
+
+### The state as found, before anything was touched (read-only)
+
+| Item | Finding |
+| --- | --- |
+| Revision | `2e3ccbc` on `phase1/baseline`; `AGENTS.md` modified (the user's uncommitted edit, preserved) and `scripts/pg.sh` carrying this pass's work |
+| Drivers | none running: no postmaster, no `validate.sh`, no `run_live_scenarios.sh`, no pytest |
+| PostgreSQL | **stopped**, and provably so from a shell that can see it: `.local/pg/data/postmaster.pid` does not exist, `.local/pg/run/` is empty (no socket, no lock file), and `postgres.log` ends at `2026-09-26 11:07:58` with `FATAL: could not create any TCP/IP sockets` followed by `LOG: database system is shut down` |
+| Docker | **cannot be inspected from here** (`UtilBindVsockAnyPort:309: socket failed`); that is an inability to inspect, not evidence that the engine or the containers are down |
+| Sockets | every loopback connect from this shell is denied, so `scripts/pg.sh status` here exits **4** (*unknown*) by design - see below. A failed probe was never read as "down" |
+| Endpoints | `.local/demo-endpoints.env` still names the 2026-09-26 stack (prometheus 9090, jaeger 49716, flagd 8080) and is stale if that stack was not restarted |
+| Teardown | no `.local/user-teardown-*` directory exists, so the teardown block an earlier pass supplied was never run. All `.local/user-*` evidence directories are intact, and the quarantined `.local/sandbox-checks/` fixture is untouched |
+
+### The incident, read from the log rather than from the earlier summary
+
+```
+2026-09-26 10:57:08.550 [44909] LOG:  database system is ready to accept connections
+2026-09-26 11:04:13.002 [13]    FATAL: could not create any TCP/IP sockets        <- a start from this sandbox
+2026-09-26 11:05:09.017 [44909] LOG:  could not open file "postmaster.pid": No such file or directory
+2026-09-26 11:05:09.017 [44909] LOG:  performing immediate shutdown because data directory lock file is invalid
+2026-09-26 11:05:09.020 [44909] LOG:  database system is shut down
+2026-09-26 11:07:58.358 [24]    FATAL: could not create any TCP/IP sockets        <- a second attempt
+```
+
+**A correction to the previous pass's account.** It reported that the failed attempt "removed the pid
+file". The log does not say that, and the difference is worth keeping: the *live* postmaster (PID
+44909) found the lock file it owns missing or invalid and shut itself down. `pg_ctl start` - and the
+postmaster itself, early in startup - writes `postmaster.pid` before the listen socket is created, so
+the sandboxed attempt **replaced** the live server's lock file. The live server, finding a lock file
+that no longer identified it, refused to continue and shut down immediately (not fast: the next start
+replays WAL as after a crash). Same hazard, same outcome, but nothing "deleted" a file behind the
+server's back - the supported tooling rewrote it.
+
+**Why the obvious guard was not enough.** `pg_ctl status` decides liveness by reading `postmaster.pid`
+and testing that PID with `kill(0)`. That test is namespace-sensitive: a shell that cannot see the
+postmaster reads a *live* server as *stopped*, and the next `pg_ctl start` is then issued against a
+data directory that already has an owner. The two checks disagreeing is the whole incident, and a
+single failed probe could not have distinguished them. Two further shapes were the same hazard:
+`cmd_stop` treated a failed `status` as "nothing to do", and `cmd_reset` was
+`cmd_stop || true; rm -rf`, so the destructive path could reach `rm -rf` after a refused stop.
+
+### The safeguards added to `scripts/pg.sh`
+
+1. **`pg_state()`** decides liveness from two independent signals and never from one probe: the PID in
+   `postmaster.pid` when `kill -0` can see it (in which case the port is not probed at all), otherwise
+   a TCP probe of `127.0.0.1:$PG_PORT` that separates *refused* (`Connection refused` - definitively
+   nothing listening) from *cannot probe* (anything else, including this sandbox's `Operation not
+   permitted`). What the two cannot agree on is `unknown`.
+2. **`pg_refuse_unknown()`** - `start` and `stop` refuse on `unknown`, naming the pid file, the port
+   and the reason, instead of guessing. This is the demonstrated failure's direct fix: on
+   2026-09-26 the sandboxed shell would now be refused before touching the cluster.
+3. **`cmd_start`** serialises with `flock -n 9` on `$PG_HOME/start.lock` (released on process exit, so
+   a crashed start cannot leave a lock behind) and re-checks the state *inside* the lock, because the
+   attempt that held it may already have started the server. The post-start `SELECT 1` and
+   `cmd_ensure_dbs` still propagate their failures.
+4. **`cmd_stop`** requires `pg_ctl status` to identify a server in `$PG_DATA` before signalling it, so
+   a host shell cannot signal an unrelated process sitting in a stale pid file; a stopped cluster is a
+   no-op and an unknown one is a refusal.
+5. **`cmd_status`** now distinguishes the two: `0` running, `3` stopped, **`4` unknown** (it used to
+   return 3 for both).
+6. **`cmd_reset`** no longer masks the stop with `|| true`: it stops first, re-reads the state, refuses
+   unless the cluster is *stopped*, and only then runs `rm -rf`.
+7. **No path writes, deletes, renames or fabricates a pid file**, there is no automatic stale-PID
+   deletion, and every signal is sent through PostgreSQL's own tooling against the verified
+   project-local data directory.
+
+The script is also sourceable now (dispatch is guarded by `[ "${BASH_SOURCE[0]}" = "$0" ]`), which is
+what lets the tests below replace the single socket attempt and still exercise the real classification,
+refusals, locking and argv.
+
+### A second defect, caught by the new tests before this fix was committed
+
+The first version of `pg_state`/`port_reachable` toggled `set +e` / `set -e` around the socket attempt.
+`errexit` is a shell-wide option, so restoring it inside a function that is about to return non-zero
+aborts the caller that is reading that very status: `state="$(pg_state)"` came back empty and
+`pg.sh start` died with **no message at all**. A *stopped* cluster could not be started. The new tests
+caught it on their first run (`test_start_of_a_stopped_cluster_starts_once_and_verifies` failed with
+`rc 1` and an empty stderr). Both sites now use `|| rc=$?`, which captures the status without touching
+the option - the same idiom `cmd_endpoints` already used for the same reason. Had this been committed
+untested it would have read on the host as "PostgreSQL will not start".
+
+### Regression coverage: `tests/unit/test_pg_lifecycle.py`
+
+Thirteen cases, all offline, each against a disposable fixture - its own temporary `PG_DATA`, `PG_RUN`,
+`PGBIN` and port 55439, with `pg_ctl`, `psql`, `createdb` and `initdb` stubs that record their argv and
+cannot touch a real cluster. The suite asserts, in the fixture's terms:
+
+- a server this shell can *see* is never started again, and its port is never probed;
+- a shell that cannot see the server refuses to start, sends no signal, and leaves the pid file byte
+  for byte as it found it (the demonstrated failure);
+- `status` separates stopped (3) from unknown (4);
+- a start of a stopped cluster runs exactly one `pg_ctl start` against the fixture, verifies with
+  `SELECT 1`, and fabricates no pid file;
+- a failed `pg_ctl start`, and a successful start whose verification fails, are both propagated;
+- a second start is refused while another holds the lock, with no start attempted;
+- `stop` refuses when the port answers but `pg_ctl` cannot identify a server, and otherwise sends
+  `-m fast` to the fixture's own data directory - or does nothing at all when stopped;
+- `reset` cannot reach its delete without proving the cluster stopped - two ways, with a canary file
+  left in the data directory as the witness;
+- only a *refused* connection counts as nothing listening (0/1/2 for reachable/refused/cannot-probe);
+- the script still dispatches when executed and dispatches nothing when sourced.
+
+**Falsified first.** Pointed at `HEAD`'s copy of the script (`PG_SCRIPT_UNDER_TEST`), all thirteen cases
+fail; against the fixed script all thirteen pass. The error text quoted in the report of the previous
+pass's live run - `pg_ctl` reading a live cluster as stopped - is exactly what the fixture reproduces.
+
+### Executed in this session
+
+| Check | Result |
+| --- | --- |
+| `bash -n scripts/pg.sh` | clean |
+| `tests/unit/test_pg_lifecycle.py` | **13 passed**; the same file against `HEAD`'s script: **13 failed** |
+| Offline suite, `.venv/bin/python -m pytest -q -m "not integration"` | **304 passed, 7 skipped, 85 deselected** (was 291 passed before the 13 cases) |
+| `ruff check .` / `ruff format --check .` | clean / 93 files already formatted |
+| `mypy` | `Success: no issues found in 43 source files` |
+| `bash scripts/pg.sh status` (this sandbox, real data directory) | `[pg] state unknown: ...`, exit **4**; no pid file created, `.local/pg/run/` still empty, `postgres.log` mtime unchanged at `2026-09-26 11:07:58` |
+
+The last row is the hazard itself, exercised read-only: in this shell the new guard refuses, exits 4 and
+touches nothing.
+
+### Not run, and why
+
+- **PostgreSQL recovery** - the cluster is confirmed stopped, but starting it requires a host shell
+  that can open a socket, and this session has none. It is the first stage of the block below.
+- **The demo baseline and the Checkout -> Payment capture** - no Docker access from here.
+- **P1-01, and any recovery measurement** - unchanged from the previous pass. **Phase 1 remains
+  PARTIAL.**
+- **The integration suite** - needs the cluster; it is stage 2 of the block, and of the read-only block
+  at the end of [the previous section](#the-one-next-action).
+
+### The one next action (host shell, one block)
+
+This is the minimal next step: establish the cluster's state, start it at most once, prove it is usable,
+start only the demo services that are missing, and refresh the endpoints. It is not the evidence run -
+that block (integration suite, per-container state, the catalog's numbers, the retained traces) is at
+the end of the previous section and should follow once this one reports OK.
+
+```bash
+( set -euo pipefail
+  cd /home/brentiburo/projects/OpsAccord
+  deactivate 2>/dev/null || true
+  source .venv/bin/activate
+  export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+  PYTHON="$PWD/.venv/bin/python"
+  TS="$(date -u +%Y%m%dT%H%M%S)"; LOGDIR=".local/user-recovery-$TS"; mkdir -p "$LOGDIR"
+  echo "interpreter: $("$PYTHON" -c 'import sys; print(sys.executable)')"
+  echo "revision: $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD)"
+  echo "evidence: $LOGDIR"
+  echo "--- 1. the cluster's state, established before anything is started ---"
+  set +e
+  bash scripts/pg.sh status 2>&1 | tee "$LOGDIR/01-pg-status.log"; pg_rc=${PIPESTATUS[0]}
+  set -e
+  echo "pg.sh status exited $pg_rc (0 running, 3 stopped, 4 unknown)"
+  case "$pg_rc" in
+    0) echo "already running: nothing is started" ;;
+    3) echo "stopped, and this shell can see that: starting once"
+       bash scripts/pg.sh start 2>&1 | tee "$LOGDIR/02-pg-start.log"
+       tail -n 40 .local/pg/postgres.log | tee "$LOGDIR/03-pg-recovery.log" ;;
+    *) echo "STOP: pg.sh status exited $pg_rc, so the cluster's state is not established and no start is safe from this shell. Send $LOGDIR/01-pg-status.log back." >&2
+       exit 1 ;;
+  esac
+  echo "--- 2. what was recovered: connectivity, the three databases, real rows ---"
+  bash scripts/pg.sh status 2>&1 | tee "$LOGDIR/04-pg-after.log"
+  set -- "$(bash scripts/pg.sh url dev)" "$(bash scripts/pg.sh url test)" "$(bash scripts/pg.sh url scenario)"
+  "$PYTHON" - "$LOGDIR" "$@" <<'PY' 2>&1 | tee "$LOGDIR/05-pg-verify.log"
+import sys
+from pathlib import Path
+import psycopg
+from opsaccord.config import to_libpq_dsn
+from opsaccord.persistence.tables import Base
+logdir = Path(sys.argv[1])
+targets = dict(zip(("dev", "test", "scenario"), sys.argv[2:5], strict=False))
+expected = set(Base.metadata.tables)
+checkpoints = {"checkpoints", "checkpoint_blobs", "checkpoint_writes"}
+failures, full_schema = [], 0
+for name, url in targets.items():
+    try:
+        with psycopg.connect(to_libpq_dsn(url), connect_timeout=10) as conn:
+            print(f"{name}: connected - {conn.execute('select version()').fetchone()[0].split(',')[0]}")
+            tables = {row[0] for row in conn.execute("select tablename from pg_tables where schemaname='public'")}
+            present = expected & tables
+            print(f"{name}: {len(tables)} public tables; {len(present)}/{len(expected)} domain tables; checkpoints {bool(checkpoints & tables)}")
+            if expected - present:
+                print(f"{name}: missing domain tables: {sorted(expected - present)}")
+            for table in ("incidents", "workflows", "tool_calls", "audit_events"):
+                if table in tables:
+                    print(f"{name}.{table}: {conn.execute(f'select count(*) from {table}').fetchone()[0]} rows")
+            full_schema += expected <= tables
+    except Exception as exc:
+        failures.append(f"{name}: {exc}"); print(f"{name}: FAILED - {exc}")
+print(f"databases reachable: {len(targets) - len(failures)}/{len(targets)}; holding the app's full schema: {full_schema}")
+if failures or not full_schema:
+    raise SystemExit(1)
+print("pg verification: OK")
+PY
+  echo "--- 3. the demo stack: start only what is missing ---"
+  if bash scripts/demo.sh health 2>&1 | tee "$LOGDIR/06-demo-health.log"; then
+    echo "every documented endpoint answers: nothing is started"
+  else
+    echo "not every endpoint answers yet; 'compose up -d' fills in only what is missing (no 'down', no volumes)"
+    bash scripts/demo.sh start 2>&1 | tee "$LOGDIR/07-demo-start.log"
+    bash scripts/demo.sh health 2>&1 | tee "$LOGDIR/08-demo-health-after.log"
+  fi
+  echo "--- 4. endpoints, scoped to this subprocess ---"
+  bash scripts/demo.sh endpoints 2>&1 | tee "$LOGDIR/09-endpoints.log"
+  test -s .local/demo-endpoints.env
+  set -a; . .local/demo-endpoints.env; set +a
+  echo "--- 5. expected final states, asserted ---"
+  bash scripts/pg.sh status >"$LOGDIR/10-pg-final.log" 2>&1 || { cat "$LOGDIR/10-pg-final.log" >&2; echo "STOP: the cluster does not report running" >&2; exit 1; }
+  failed=()
+  for probe in "prometheus|$OPSACCORD_PROMETHEUS_BASE_URL/-/healthy" "jaeger|$OPSACCORD_JAEGER_BASE_URL/api/services" "flagd|$OPSACCORD_FLAG_CONTROL_BASE_URL/api/read"; do
+    name="${probe%%|*}"; url="${probe#*|}"
+    if curl -fsS --max-time 10 "$url" -o "$LOGDIR/probe-$name.json" 2>"$LOGDIR/probe-$name.err"; then
+      echo "ok   $name -> $url"
+    else
+      echo "FAIL $name -> $url ($(head -c 200 "$LOGDIR/probe-$name.err"))"; failed+=("$name")
+    fi
+  done
+  for var in OPSACCORD_DEMO_MODE OPSACCORD_PROMETHEUS_BASE_URL OPSACCORD_JAEGER_BASE_URL OPSACCORD_FLAG_CONTROL_BASE_URL; do
+    grep -q "^$var=" .local/demo-endpoints.env || { echo "STOP: $var missing from .local/demo-endpoints.env" >&2; exit 1; }
+  done
+  if [ "${#failed[@]}" -gt 0 ]; then echo "STOP: endpoints that did not answer: ${failed[*]}" >&2; exit 1; fi
+  echo "OK: cluster running, three databases reachable, endpoints refreshed and answering"
+  echo "Next: the read-only block at the end of the previous section of docs/reports/phase1-implementation.md."
+  echo "Evidence: $LOGDIR"
+)
+```

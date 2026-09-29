@@ -4,7 +4,13 @@
 # No root, no system service, no Docker: official Ubuntu packages are extracted
 # under .local/pg/root and run as the current user against a project data dir.
 #
-# Usage: scripts/pg.sh provision|init|start|stop|status|psql|reset|env
+# Usage: scripts/pg.sh provision|init|start|stop|status|psql|reset|env|url
+#
+# Safe to source; only a direct execution dispatches. See tests/unit/test_pg_lifecycle.py.
+#
+# `status` exits 0 running, 3 stopped, 4 *unknown* - the last meaning this shell
+# cannot establish whether a server owns $PG_DATA, which `start` and `stop` treat
+# as a refusal rather than as "stopped". See the note above `pg_state`.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,6 +30,80 @@ PGBIN="$PG_ROOT/usr/lib/postgresql/18/bin"
 
 log() { printf '[pg] %s\n' "$*" >&2; }
 die() { printf '[pg] error: %s\n' "$*" >&2; exit 1; }
+
+# --- Cluster state, established from independent signals ---------------------
+#
+# `pg_ctl status` decides liveness by reading postmaster.pid and testing that PID
+# with kill(0). That test is namespace-sensitive: a shell in a different PID
+# namespace cannot see the owning process, so a *live* server reads as stopped.
+# On 2026-09-26 that is what happened here - a shell with no socket capability
+# read a live cluster as "not running", called `pg_ctl start`, and the postmaster
+# it launched overwrote the live server's postmaster.pid. The live server then
+# shut itself down: "performing immediate shutdown because data directory lock
+# file is invalid".
+#
+# So liveness is decided from signals that survive a namespace boundary, and
+# never from one failed probe:
+#
+#   1. the PID in postmaster.pid, if this shell can see that process at all;
+#   2. whether anything answers on 127.0.0.1:$PG_PORT - a probe that separates
+#      "refused" (definitively nothing listening) from "cannot probe" (this shell
+#      has no socket capability, which is NOT evidence that a server is down).
+#
+# What the two cannot agree on is reported as `unknown`, and every lifecycle
+# command refuses rather than guesses. No path here writes, deletes or renames a
+# pid file, and a stale one is never removed on the operator's behalf.
+
+# The only line here that opens a socket, kept separate so a test can replace the
+# *attempt* and still exercise the classification below it: a shell that cannot open
+# any socket cannot be made to produce a refused connection, so in such a shell the
+# two outcomes this script's safety rests on are otherwise indistinguishable.
+probe_connect() { exec 3<>/dev/tcp/127.0.0.1/"$PG_PORT"; }
+
+# 0 = a connection was accepted, 1 = definitively refused, 2 = cannot probe.
+port_reachable() {
+  local err rc=0
+  # No `set +e` here. Toggling errexit inside a function changes it for the whole
+  # script, and restoring it before returning non-zero aborts the caller that is
+  # reading this very status - which is how a stopped cluster turned into a silent
+  # `pg.sh start` failure. `|| rc=$?` captures the status without touching the option.
+  err="$(probe_connect 2>&1)" || rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  # bash words a refused connect "Connection refused" and its other failures - no
+  # socket capability, an unusable address - as something else. Only the first is
+  # evidence that nothing is listening.
+  case "${err,,}" in
+    *"connection refused"*) return 1 ;;
+  esac
+  printf '%s' "${err:-the shell gave no reason}" >&2
+  return 2
+}
+
+# running | stopped | unknown
+pg_state() {
+  local pidfile="$PG_DATA/postmaster.pid" pid="" visible=no rc=0
+  if [ -s "$pidfile" ]; then
+    pid="$(head -n 1 "$pidfile" 2>/dev/null || true)"
+    case "$pid" in
+      '' | *[!0-9]*) pid="" ;;
+      *) kill -0 "$pid" 2>/dev/null && visible=yes ;;
+    esac
+  fi
+  # A visible PID settles it, and the port is then left alone: a bare TCP connect
+  # makes the postmaster log a failed startup packet, and postgres.log is read as
+  # evidence here.
+  if [ "$visible" = yes ]; then printf 'running\n'; return 0; fi
+  port_reachable 2>/dev/null || rc=$?
+  case "$rc" in
+    0) printf 'running\n' ;;
+    1) printf 'stopped\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+pg_refuse_unknown() {
+  die "refusing to $1: $PG_DATA/postmaster.pid and the probe of 127.0.0.1:$PG_PORT do not agree with what this shell can see, so a server may be running and this shell cannot tell. A shell that cannot open a socket must not start or stop a cluster - run this from the host shell that owns it."
+}
 
 pg_env() {
   echo "export LD_LIBRARY_PATH=$PG_ROOT/usr/lib/x86_64-linux-gnu\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
@@ -75,12 +155,30 @@ cmd_ensure_dbs() {
 
 cmd_start() {
   [ -x "$PGBIN/pg_ctl" ] || die "run 'provision' first"
+  local state
+  state="$(pg_state)"
+  case "$state" in
+    running) log "already running"; cmd_ensure_dbs; return 0 ;;
+    unknown) pg_refuse_unknown start ;;
+  esac
   [ -s "$PG_DATA/PG_VERSION" ] || cmd_init
-  if "$PGBIN/pg_ctl" -D "$PG_DATA" status >/dev/null 2>&1; then
-    log "already running"
-    cmd_ensure_dbs
-    return 0
-  fi
+
+  # Serialised, because two starts against one data directory is the same hazard
+  # as a start against a live one. `flock` releases on process exit, so a crashed
+  # start cannot leave a lock behind to block the next one.
+  command -v flock >/dev/null || die "flock is required to serialise concurrent starts"
+  mkdir -p "$PG_HOME"
+  exec 9>"$PG_HOME/start.lock"
+  flock -n 9 || die "another 'pg.sh start' is already running for $PG_DATA"
+
+  # Re-checked inside the lock: the attempt that held it may already have started
+  # the very server this one was about to create.
+  state="$(pg_state)"
+  case "$state" in
+    running) log "already running"; cmd_ensure_dbs; return 0 ;;
+    unknown) pg_refuse_unknown start ;;
+  esac
+
   mkdir -p "$PG_RUN"
   "$PGBIN/pg_ctl" -D "$PG_DATA" -l "$PG_HOME/postgres.log" -w -t 30 start
   "$PGBIN/psql" -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d postgres -v ON_ERROR_STOP=1 -q \
@@ -90,28 +188,63 @@ cmd_start() {
 }
 
 cmd_stop() {
-  "$PGBIN/pg_ctl" -D "$PG_DATA" status >/dev/null 2>&1 || { log "not running"; return 0; }
+  local state
+  state="$(pg_state)"
+  case "$state" in
+    stopped) log "not running"; return 0 ;;
+    unknown) pg_refuse_unknown stop ;;
+  esac
+  # `pg_ctl stop` signals the PID in $PG_DATA/postmaster.pid and nothing else, so
+  # it cannot reach another cluster - but it is only sent once `pg_ctl` itself can
+  # identify that process, so a host shell never signals an unrelated PID that
+  # happens to sit in a stale pid file.
+  "$PGBIN/pg_ctl" -D "$PG_DATA" status >/dev/null 2>&1 \
+    || die "refusing to stop: something answers on 127.0.0.1:$PG_PORT but pg_ctl cannot identify a server in $PG_DATA. Stop it from the shell that started it."
   "$PGBIN/pg_ctl" -D "$PG_DATA" -m fast -w -t 30 stop
 }
 
 cmd_status() {
-  if "$PGBIN/pg_ctl" -D "$PG_DATA" status >/dev/null 2>&1; then
-    log "running on 127.0.0.1:$PG_PORT, data=$PG_DATA"
-    "$PGBIN/psql" -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -tAc 'select version()'
-  else
-    log "not running (data=$PG_DATA)"; return 3
-  fi
+  local state
+  state="$(pg_state)"
+  case "$state" in
+    running)
+      log "running on 127.0.0.1:$PG_PORT, data=$PG_DATA"
+      "$PGBIN/psql" -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -tAc 'select version()' ;;
+    stopped)
+      log "not running (data=$PG_DATA)"; return 3 ;;
+    *)
+      log "state unknown: cannot tell from this shell whether a server owns $PG_DATA"
+      return 4 ;;
+  esac
 }
 
 cmd_psql() { exec "$PGBIN/psql" -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d "${1:-$PG_DB}"; }
 
-cmd_reset() { cmd_stop || true; rm -rf "$PG_DATA"; cmd_init; cmd_start; }
+cmd_reset() {
+  # A reset deletes the data directory, so it may only run against a cluster this
+  # shell can prove is stopped. `cmd_stop || true` used to reach `rm -rf` even when
+  # the stop had refused or failed, which is the same "live server I cannot see"
+  # hazard in a more destructive form.
+  cmd_stop
+  [ "$(pg_state)" = stopped ] || die "refusing to reset: the cluster is not stopped"
+  rm -rf "$PG_DATA"
+  cmd_init
+  cmd_start
+}
 
 cmd_url() { echo "postgresql+psycopg://$PG_USER@127.0.0.1:$PG_PORT/${1:-$PG_DB}"; }
 
-case "${1:-}" in
-  provision|init|start|stop|status|psql|reset|env) "cmd_$1" "${@:2}" ;;
-  ensure-dbs) cmd_ensure_dbs ;;
-  url) case "${2:-dev}" in dev) cmd_url "$PG_DB" ;; test) cmd_url "$PG_TEST_DB" ;; scenario) cmd_url "$PG_SCENARIO_DB" ;; *) cmd_url "$2" ;; esac ;;
-  *) die "usage: $0 {provision|init|start|stop|status|psql|reset|env|url} [args]" ;;
-esac
+pg_main() {
+  case "${1:-}" in
+    provision|init|start|stop|status|psql|reset|env) "cmd_$1" "${@:2}" ;;
+    ensure-dbs) cmd_ensure_dbs ;;
+    url) case "${2:-dev}" in dev) cmd_url "$PG_DB" ;; test) cmd_url "$PG_TEST_DB" ;; scenario) cmd_url "$PG_SCENARIO_DB" ;; *) cmd_url "$2" ;; esac ;;
+    *) die "usage: $0 {provision|init|start|stop|status|psql|reset|env|url} [args]" ;;
+  esac
+}
+
+# Dispatch only when executed. Sourcing must not run a command: the lifecycle tests
+# source this file to replace `probe_connect` and then call the real functions.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  pg_main "$@"
+fi
