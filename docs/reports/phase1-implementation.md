@@ -27,6 +27,8 @@
 | **Trace-query status (branch tip with this report)** | **PARTIAL** - the user's `022150` run (revision `6b7fe61`) is the first to reach the trace exporter: 18 armed observations resolved to 6 `generic_caller_failure_only`, 6 `traffic_without_failure`, 6 `no_usable_observation`, 0 `attributable_failure`, with the strongest-class aggregation working live, and `paymentUnreachable` restored with a read-back. The exporter exited `0` and returned **0 PlaceOrder traces**, and suggested eviction. Auditing the request showed it was well-formed - correct base path, real service names, microsecond UTC bounds, percent-encoded operation, no credentials - while the *entry filter* was an assumption: the pinned collector rewrites span names with `set_semconv_span_name`, the registry already carries two different naming forms, and no run has ever returned this operation. The **read** was the confirmed defect: `read_traces` reported an `observation_window_start/end` it never asked for, since the request carried `lookback` and `limit=20` and no bounds, and the same capture's `charge_traces` payload changed only twice in 18 polls. This pass bounds the read, retains trace IDs and cap/out-of-window provenance, makes an API error raise instead of reading as empty, and rebuilds the exporter as a progressive read-only sequence with an explicit "cause unknown" empty-result explanation; `a686617`. Offline `242 passed, 7 skipped` in both variants; lint, format and `mypy` clean. The historical interval has still not been read, P1-01 is unverified, and Payment recovery has still never been demonstrated. See "The trace-query pass (`6b7fe61` measured)". |
 | **Recovered-trace analysis status (branch tip with this report)** | **PARTIAL** - the user's `025435` run (revision `504fbd0`) is the first to retrieve traces from the fault interval: 17 services, 8 advertised Checkout operations, 40 recent unfiltered Checkout traces, `oteldemo.CheckoutService/PlaceOrder` confirmed in a returned trace, the bounded retrieval check succeeded, and **two** historical traces came back (`ce5e79a180be61a3c87ac161b474ef1d`, `798301119dc69ac06ecc4704cf100bcc`) with the exporter exiting `0`. The extract holds **summaries only**, so the requested ancestry reconstruction cannot be completed from it, and the run's own `evidence.sufficiency: sufficient` was a statement about retrieval presented as a statement about the subject - a claim this report retracts. Reading the summaries against the code shows the confirmed classification defects: the span called the "root" was a `frontend` client span (the load generator's HTTP span above it is the actual root), `child_of_root=False` was an artefact of that selection, both frontend durations (563.9 s, 826.6 s) outlast the 344 s fault interval, and `failed: 0` was computed from one span's direct children while six and nine spans in the same traces recorded errors. This pass resolves root, attempt and edge relationship from `CHILD_OF` references, makes span status three-valued with the deciding signal named, counts errors across the whole trace, fixes the observed-range arithmetic, replaces the single "sufficiency" with a five-level ladder, and corrects the same status defect in the runtime `read_traces` adapter. Offline `256 passed, 7 skipped` in both variants; lint, format and `mypy` clean. The two traces have **not** been positioned against injection and restoration, Payment is neither shown to have served nor to have failed, recovery remains undemonstrated, and P1-01 remains unverified on this revision. See "The recovered-trace analysis pass (`504fbd0` measured)". |
 
+| **Fault-free-baseline status (branch tip with this report)** | **PARTIAL** - the user's capture-only run at `63effae` returned `baseline_verified`, exit **0**: a fresh attempt (13.6 s past the boundary), all 6 flags safe and unchanged across both readings, no competing driver, the catalog and the `payment` edge on the path, and `explicit_success` satisfied by the caller's own `frontend` client span `11fb12ab7f0934a3` (`OK(rpc.grpc.status_code)`, the attempt's own parent reference, `ancestor` 1 hop, `correlated_caller`) with the attempt's `UNSET` left as written and **ERROR 0** on 121 spans. Re-derived from the run's extract here, and falsified by breaking the parent reference. **Payment recovery is still unverified and P1-01 has not run**, so Phase 1 stays PARTIAL. See "The option-B pass". |
+
 `READY_FOR_DISCUSSION` means every executable technical gate in `docs/phase1.md`
 passed on this commit, including the four primary paths against the real isolated
 demo stack. It is **not** user acceptance, it is not permission to merge, and no
@@ -3728,6 +3730,11 @@ trace only when all of the following hold, each recorded separately with the evi
 > this revision never writes a status to. The direct path is unchanged, `UNSET` is still reported as `UNSET`
 > and the shared status classifier is untouched. See "The option-B pass" at the end of this report and
 > [D35](decisions/D35-the-baseline-s-success-may-come-from-the-caller.md).
+>
+> **Updated again 2026-10-15 (the user's live capture, `63effae`).** With that path in place the capture is
+> no longer refused: the user's run returned `baseline_verified`, satisfied by the caller's own `frontend`
+> client span `11fb12ab7f0934a3`, with the attempt's `UNSET` left as written. The fault-free baseline is now
+> demonstrated live on this revision; P1-01 and Payment recovery are not.
 
 Refusals are distinguished rather than flattened: an empty interval, a failed query, an unreached edge,
 a client-only edge span, an edge in another branch and an unread flag document each produce their own
@@ -4654,9 +4661,11 @@ stage; both corrections held, and it stopped at the capture on one clause of `ex
 pinned revision cannot satisfy - the measured operation's own server span writes no status, so a successful
 call to it reads `UNSET`. See "The live recovery-and-baseline run" below: that section is the current
 position, and the block under this paragraph is the record of what was run rather than the next action.
-**Since the option-B pass, the block to run is the last one in this document** ("The option-B pass",
-at the end): it captures the fresh baseline and nothing else, reads readiness instead of assuming it, and
-starts no container, database or flag.
+**Since the option-B pass, the block to run was the last one in this document** ("The option-B pass", at
+the end): it captures the fresh baseline and nothing else, reads readiness instead of assuming it, and
+starts no container, database or flag. **The user ran it at `63effae` and it returned
+`baseline_verified`**; the block is kept there as the reproduction command, and the next action is now the
+P1-01 live pass rather than a capture.
 
 
 ```bash
@@ -5077,6 +5086,35 @@ The other checks - freshness, both flag readings, the driver scan, the catalog's
 edge - are the same ones that passed on this payload when the user ran it; what changed is only the clause
 that refused it.
 
+### The live baseline at `63effae` - the user's capture, verified
+
+The user ran the capture-only block from this revision (committed as `63effae`) and it returned
+**`baseline_verified`**, exit **0**, in three polls and 21 seconds:
+`reports/local/baseline-checkout-20261015T094841.json` and `.log`, with the run's own staged logs under
+`.local/user-baseline-capture-20261015T094841/`. **The measurement is the user's host run**; what was done
+here is to re-derive the verdict from the extract that run wrote, which is a reading of a file.
+
+| Gate | Reading |
+| --- | --- |
+| Freshness | attempt `69759b24803b0252` began `09:49:09.620079` - **13.625 s after** the boundary `09:48:55.995107` |
+| Flag pair | all **6** fault flags on their safe variant at `09:48:55` and again at `09:49:16`, unchanged, `read: true` both times |
+| Competing driver | none found (the `/proc/<pid>/cmdline` scan for `opsaccord.cli` plus `run-live-scenarios`) |
+| Catalog | `product-catalog` **server** `GetProduct` spans on the attempt's path |
+| Edge | `payment` **server** span `eda67d5ac4168f46`, `OK(rpc.grpc.status_code)`, descendant at 2 hops |
+| Success source | `frontend` **client** span `11fb12ab7f0934a3`, `oteldemo.CheckoutService/PlaceOrder`, `OK(rpc.grpc.status_code)`, the attempt's **own parent reference** (`ancestor`, 1 hop), enclosing the attempt |
+| Attempt status | `UNSET(no status signal)` - **left exactly as written** |
+| Trace health | 121 spans, `missing_parent_ids: []`, 1 root, **ERROR 0** (OK 43, UNSET 78) |
+| Preflight | `demo.sh inspect` rc **0**; all 14 published ports and the 3 adapter APIs answered; nothing started or armed |
+
+Re-deriving the clause from the extract reproduces `satisfied_by = correlated_caller`, and breaking the
+attempt -> caller reference flips `explicit_success` to **False** - so the reference, and not the operation
+name, is what carries the verdict. The log's own `[provenance]` line names the same span, and the run
+raised one caveat: a second span carries `oteldemo.PaymentService/Charge` on another branch of the trace.
+
+**This is the fault-free baseline, not P1-01.** It shows that the measured request was clean and
+attributable under safe flags. It is one request, so it says nothing about sustained reliability, and it
+does not exercise recovery.
+
 ### Checks executed in this pass
 
 | Check | Result |
@@ -5088,28 +5126,36 @@ that refused it.
 | `bash -n` on the new block | clean |
 | The two block copies (report and runbook) | byte-identical (extracted and compared) |
 | Offline re-evaluation of the user's saved extract | verified, `success_source.satisfied_by = correlated_caller` (see above) |
+| The user's live capture at `63effae` (host run; re-derived here from its extract) | **`baseline_verified`**, exit **0**, `satisfied_by = correlated_caller` (see above) |
 
 ### Not run, and why
 
-- **The fresh baseline capture.** This sandbox reaches neither Docker nor a loopback port:
+- **The fresh baseline capture - from this sandbox.** It reaches neither Docker nor a loopback port:
   `bash scripts/demo.sh endpoints` exits **1** (`compose port` fails writing the override to the Windows
   mount - `Read-only file system` - and WSL's vsock socket fails), `bash scripts/demo.sh inspect` exits
   **1** (`the Docker engine did not answer`), `bash scripts/demo.sh health` exits **1** on every port, and a
   direct `GET http://127.0.0.1:16686/jaeger/ui/api/services` raises
   `ConnectError [Errno 1] Operation not permitted`. Nothing was started, restarted, stopped or armed, and no
-  previously rejected escalation was retried.
-- **P1-01 and the other live scenarios.**
+  previously rejected escalation was retried. **The user ran the block from this revision instead**, and
+  the result is recorded above.
+- **P1-01 and the other live scenarios** - not run. This pass was scoped to the baseline alone.
 - **The integration suite**, which needs the live stack.
 
-**Phase 1 remains PARTIAL.** The fault-free baseline is still unverified *live* on this revision - the
-offline re-evaluation above is a statement about a saved file - and Payment recovery remains unverified.
+**Phase 1 remains PARTIAL.** The fault-free baseline is now verified on this revision - by the user's live
+run, re-derived here from the extract that run wrote - and Payment recovery remains unverified. A verified
+baseline is the precondition the P1-01 pass needed, not a result of it.
 
-### The one next action (host shell, one block)
+### The baseline block, and the next action
 
-Run the block below as it stands; it is the last block in this document and the only current one. It
-**starts nothing** - no database, no container, no flag, no fault - reads the stack that is running,
-refuses to continue if a published port or an adapter API does not answer, and then captures one fresh
-baseline. The runbook's "The current next action" chapter carries the same block, byte-identically.
+**The next action is the P1-01 live pass on this revision, not another capture.** That is the runbook's
+`UV_CACHE_DIR=/tmp/uvcache scripts/validate.sh --live --scenario P1-01`, and it waits on the user's
+go-ahead: this pass was scoped to the baseline, and Payment recovery has still never been demonstrated.
+
+The block below is the one that produced the verified baseline above, and it is kept, and kept last, as the
+reproducibility command: it **starts nothing** - no database, no container, no flag, no fault - reads the
+stack that is running, refuses to continue if a published port or an adapter API does not answer, and then
+captures one fresh baseline. Re-running it re-captures the fault-free baseline; it does **not** run P1-01.
+The runbook's corresponding chapter carries the same block, byte-identically.
 
 ```bash
 ( set -euo pipefail
