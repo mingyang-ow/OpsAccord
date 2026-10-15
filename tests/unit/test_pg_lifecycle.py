@@ -261,6 +261,54 @@ def test_start_of_a_stopped_cluster_starts_once_and_verifies(tmp_path: Path) -> 
     assert not (fixture.data / "postmaster.pid").exists(), "the helper never fabricates a pid file"
 
 
+def test_ensure_refuses_an_unestablished_cluster_without_attempting_a_start(
+    tmp_path: Path,
+) -> None:
+    """``ensure`` must not become a second way to start a cluster this shell cannot see.
+
+    The state-dependent block hands the decision to this one command, so the
+    refusal it inherits from ``start``/``stop`` has to survive the new entry point:
+    an unestablished cluster means no ``pg_ctl`` call of any kind, and the pid file
+    exactly as it was found.
+    """
+    fixture = _fixture(tmp_path, probe="denied")
+    pidfile = fixture.write_pidfile(f"{INVISIBLE_PID}\n")
+    before = pidfile.read_bytes()
+
+    result = fixture.run("ensure")
+
+    assert result.returncode == 4, result.stderr
+    assert "refusing to ensure" in result.stderr
+    assert fixture.stub_calls("pg_ctl") == [], "no start, and no status call either"
+    assert pidfile.read_bytes() == before
+
+
+def test_ensure_starts_a_provably_stopped_cluster_exactly_once(tmp_path: Path) -> None:
+    """The one state that authorises a start, and it authorises exactly one."""
+    fixture = _fixture(tmp_path, probe="refused")
+
+    result = fixture.run("ensure")
+
+    assert result.returncode == 0, result.stderr
+    starts = [argv for argv in fixture.stub_calls("pg_ctl") if argv[-1] == "start"]
+    assert len(starts) == 1, fixture.stub_calls("pg_ctl")
+    assert str(fixture.data) in starts[0], starts[0]
+    assert not (fixture.data / "postmaster.pid").exists()
+
+
+def test_ensure_verifies_a_running_cluster_and_restarts_nothing(tmp_path: Path) -> None:
+    """A cluster this shell can see is *verified*, not restarted and not re-started."""
+    fixture = _fixture(tmp_path, probe="reachable")
+
+    result = fixture.run("ensure")
+
+    assert result.returncode == 0, result.stderr
+    assert "already running" in result.stderr
+    touched = [argv for argv in fixture.stub_calls("pg_ctl") if argv[-1] in {"start", "stop"}]
+    assert touched == [], touched
+    assert fixture.stub_calls("psql"), "a running cluster is verified, not assumed"
+
+
 def test_a_failed_start_and_a_failed_verification_are_both_propagated(tmp_path: Path) -> None:
     failed_start = _fixture(tmp_path / "start", probe="refused", STUB_PGCTL_START_RC="3")
     assert failed_start.run("start").returncode == 3

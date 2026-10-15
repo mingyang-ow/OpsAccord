@@ -348,33 +348,35 @@ restore.
 exporter above asks what went wrong *while a fault was armed*, which is the right question for
 a diagnosis and the wrong one for a baseline: every live entry point in the tree arms a fault
 (`scripts/validate.sh --live` runs the seven `LIVE_PLANS`, and each one injects a fault), so
-nothing could demonstrate that the unfaulted demo still completes a checkout. The capture
-queries `checkout` traces over an explicit interval, reconstructs each request path from the
-payload's own parent references, and passes a trace only when four properties hold together:
-the entry operation's own *server* span is present; `product-catalog` *served* a
+nothing could demonstrate that the unfaulted demo still completes a checkout. The capture reads
+the flag document from flagd-ui *first*, fixes a **UTC observation-start boundary**, and then
+looks only forwards: it polls the store - with bounded requests (`--deadline-seconds`, default
+180, and `--poll-interval-seconds`, default 10) so that a bounded in-memory store's ingestion
+lag is not mistaken for "no traffic" - until a qualifying *new* request appears. It reconstructs
+each request path from the payload's own parent references and accepts a trace only when five
+properties hold together: the measured Checkout attempt's own *server* span **began at or after
+the boundary** (a request already in flight is refused by name, `attempt_after_boundary`,
+however healthy it is and whenever its payload arrives); `product-catalog` *served* a
 `ProductCatalogService` call on that path; a `payment` *server* span for
 `oteldemo.PaymentService/Charge` sits on that path as a direct child or descendant of the
-attempt rather than in an unrelated branch; and the entry and edge spans both record `OK` with
-a named status source while no span on the reconstructed path records `ERROR`. A fifth gate
-reads the flag document from flagd-ui and requires every fault flag in `FLAG_SAFE_VARIANT` at
-its safe variant, because a checkout that "succeeds" with a fault armed is not a baseline - a
-document that could not be read is reported as unverified rather than as safe. Each property is
-reported separately with the evidence that decided it, so a failed capture names what was
-missing instead of returning one undifferentiated "no": unreached edge, client-only edge span,
-edge in another branch, `UNSET` status and an empty interval are five different findings. It
-writes sanitized raw spans (ids, parent references, service, span kind, start/end in
-microseconds, duration, status and its source, message, relationship and hops) to JSON and a
-human-readable log, arms no flag, starts nothing, and exits 0 only for a verified baseline.
-
-Three things are resolved from the payload's own `CHILD_OF` references rather than assumed,
-because an operation name is not a span identity: a caller's *client* span and the callee's
-*server* span for one operation carry the same name, and `frontend` and `checkout` both export
-`oteldemo.CheckoutService/PlaceOrder`. The **root** is a span whose parent is absent from the
-payload (for the Payment path, the load generator's HTTP span), the **attempt** is the measured
-operation's own server span, and the edge's **relationship** to it is a walk over parent
-references - `direct_child`, `descendant` at *n* hops, `ancestor`, `unrelated_branch`, or
-`missing_parent` when a named parent is not in the payload. Span status is three-valued:
-`ERROR` or `OK` with the signal that decided it (`otel.status_code`, legacy `status.code`, an
+attempt rather than in an unrelated branch; the entry and edge spans both record `OK` with
+a named status source while no span on the reconstructed path records `ERROR`; and the flag
+document was the safe one at *both* readings. Flags are read twice - before the boundary and
+again when a candidate appears, or at the end if none did - because a checkout that "succeeds"
+with a fault armed is not a baseline: a flag that moved, became unsafe or could not be read
+either time blocks the verdict, and a document that could not be read is reported as unverified
+rather than as safe. The extract states the guarantee for what it is: two readings bracket the
+interval, they cannot exclude a change that began and ended inside it, they are not continuous
+observation, and a separate point-in-time scan of `/proc/<pid>/cmdline` - whose method is
+recorded with its result - is what checks for a competing scenario driver that would share these
+flags. Each property is reported separately with the evidence that decided it, so a failed
+capture names what was missing instead of returning one undifferentiated "no": unreached edge,
+client-only edge span, edge in another branch, `UNSET` status, a request that began before the
+boundary, an empty interval, a changed flag and a store that answered with an error are
+different findings, and a deadline that expires is its own `not_verified_*` verdict. It writes
+sanitized raw spans (ids, parent references, service, span kind, start/end in microseconds,
+duration, status and its source, message, relationship and hops) to JSON and a human-readable
+log, arms no flag, starts nothing, and exits 0 only for a verified baseline.
 `error` tag, `error.type`/`exception.type`, `rpc.grpc.status_code`, `http.response.status_code`,
 or an exception event), and `UNSET` when the service wrote nothing - which is never reported as
 a success. Every reported span also carries its position relative to the window asked for

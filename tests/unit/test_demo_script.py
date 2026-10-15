@@ -45,7 +45,9 @@ argv0="$1"
 } >>"$STUB_ARGV_LOG"
 case "$argv0" in
   version) printf '29.7.2\\n' ;;
-  ps) printf 'product-catalog\\ncheckout\\n' ;;
+  ps)
+    if [ -n "${STUB_NO_CONTAINERS:-}" ]; then exit 0; fi
+    printf '%s\\n' "product-catalog" "checkout" ;;
   inspect)
     if [ -n "${STUB_EATS_STDIN:-}" ]; then cat >/dev/null; fi
     if [ -n "${STUB_INSPECT_RC:-}" ]; then exit "$STUB_INSPECT_RC"; fi
@@ -61,6 +63,14 @@ case "$argv0" in
         printf '[{"ExitCode":1,"Output":"failed to connect service :3550 '
         printf 'within 1s"}]\\n' ;;
       *GOMEMLIMIT*) printf 'GOMEMLIMIT=16MiB\\n' ;;
+      # `demo.sh ensure` reads each container's own state plus its compose
+      # *service* label, which is what it hands to `compose up`: upstream sets
+      # `container_name:` on several services, so the two are not the same string.
+      *State.Status*)
+        state=running; health=healthy
+        case " ${STUB_STOPPED:-} " in *" $container "*) state=exited; health=none ;; esac
+        case " ${STUB_UNHEALTHY:-} " in *" $container "*) health=unhealthy ;; esac
+        printf '/%s %s %s %s\\n' "$container" "$state" "$health" "$container" ;;
     esac ;;
   pull)
     if [ -n "${STUB_EATS_STDIN:-}" ]; then cat >/dev/null; fi
@@ -133,6 +143,35 @@ def _run(tmp_path: Path, *args: str, **extra: str) -> subprocess.CompletedProces
         timeout=60,
         check=False,
     )
+
+
+def _probe_stubs(tmp_path: Path) -> Path:
+    """A bin directory whose ``curl`` and ``timeout`` always succeed.
+
+    ``demo.sh health`` decides its verdict from two external commands: ``curl`` for
+    the HTTP checks, and ``timeout ... /dev/tcp`` for the TCP ones. This sandbox
+    denies loopback sockets outright, so the real ones cannot answer here - and what
+    is under test is the helper's *decision* (was every container already up? which
+    services did it start?), not the probe itself. Replacing the probe is the same
+    seam the docker stub already uses; nothing about Docker or compose changes.
+    """
+    bin_dir = tmp_path / "probe-bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name in ("curl", "timeout"):
+        stub = bin_dir / name
+        stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        stub.chmod(0o755)
+    return bin_dir
+
+
+def _probed(tmp_path: Path, **extra: str) -> dict[str, str]:
+    """`_run` extras that put the probe stubs first on `PATH`."""
+    return {"PATH": f"{_probe_stubs(tmp_path)}:{os.environ['PATH']}", **extra}
+
+
+def _compose_up_args(tmp_path: Path) -> list[list[str]]:
+    """Only the `up` invocations: `health` calls compose too, for `port`."""
+    return [argv[argv.index("up") :] for argv in _invocations(tmp_path, "compose") if "up" in argv]
 
 
 def test_logs_forwards_a_named_service_and_no_empty_argument(tmp_path: Path) -> None:
@@ -378,3 +417,64 @@ def test_endpoints_names_the_real_cause_when_it_cannot_resolve(tmp_path: Path) -
     assert "cannot resolve the stack" in result.stderr
     assert "exited 3" in result.stderr
     assert not (tmp_path / "demo-endpoints.env").exists()
+
+
+# --- `ensure`: three container states, three different actions ---------------
+
+
+def test_ensure_starts_the_pinned_stack_only_when_the_project_is_empty(
+    tmp_path: Path,
+) -> None:
+    """An absent stack is the one state where starting everything is the right move."""
+    result = _run(tmp_path, "ensure", **_probed(tmp_path, STUB_NO_CONTAINERS="1"))
+
+    assert result.returncode == 0, result.stderr
+    assert _compose_up_args(tmp_path) == [["up", "-d", "--no-build"]]
+    assert "no containers in project" in result.stdout
+
+
+def test_ensure_starts_only_the_stopped_services_and_names_them(tmp_path: Path) -> None:
+    """A stopped service is started by name, so nothing that already runs is touched."""
+    result = _run(tmp_path, "ensure", **_probed(tmp_path, STUB_STOPPED="checkout"))
+
+    assert result.returncode == 0, result.stderr
+    assert _compose_up_args(tmp_path) == [["up", "-d", "--no-build", "checkout"]]
+    # The per-container state it decided from, printed before it acted.
+    assert "checkout exited none checkout" in result.stdout
+    assert "product-catalog running healthy product-catalog" in result.stdout
+
+
+def test_ensure_leaves_a_healthy_project_alone(tmp_path: Path) -> None:
+    """Running and healthy means nothing to do - not even a probe of the stack."""
+    result = _run(tmp_path, "ensure", **_probed(tmp_path))
+
+    assert result.returncode == 0, result.stderr
+    assert _invocations(tmp_path, "compose") == []
+    assert "nothing was started" in result.stdout
+
+
+def test_ensure_refuses_a_running_but_unhealthy_container_without_recreating_anything(
+    tmp_path: Path,
+) -> None:
+    """A service that is *up* keeps its evidence, so it is never the one to blanket-`up`.
+
+    `compose up -d` recreates a container whose configuration or image differs, so
+    reaching for it because a probe failed would throw away the running container,
+    its restart count and its health history - exactly the readings a diagnosis is
+    made of. An unhealthy container produces its own evidence and the command stops
+    there, whatever state the other containers are in.
+    """
+    result = _run(tmp_path, "ensure", **_probed(tmp_path, STUB_UNHEALTHY="checkout"))
+
+    assert result.returncode == 1
+    assert "running but not healthy" in result.stderr
+    # The probe's own message, and a bounded log tail, for the container in question.
+    assert "failed to connect service :3550" in result.stderr
+    assert "logs --tail 80 checkout" in result.stderr
+    assert "STOP" in result.stderr
+    # Nothing was started, recreated, stopped or restarted.
+    assert _compose_up_args(tmp_path) == []
+    mutating = [
+        argv for argv in _invocations(tmp_path, "compose") if {"down", "restart"} & set(argv)
+    ]
+    assert mutating == [], mutating

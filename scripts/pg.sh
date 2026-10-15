@@ -4,7 +4,10 @@
 # No root, no system service, no Docker: official Ubuntu packages are extracted
 # under .local/pg/root and run as the current user against a project data dir.
 #
-# Usage: scripts/pg.sh provision|init|start|stop|status|psql|reset|env|url
+# Usage: scripts/pg.sh provision|init|start|stop|status|psql|reset|env|url|ensure
+#
+# `ensure` is the state-dependent one: start only if provably stopped, otherwise
+# verify (running) or refuse (unknown, exit 4).
 #
 # Safe to source; only a direct execution dispatches. See tests/unit/test_pg_lifecycle.py.
 #
@@ -102,7 +105,9 @@ pg_state() {
 }
 
 pg_refuse_unknown() {
-  die "refusing to $1: $PG_DATA/postmaster.pid and the probe of 127.0.0.1:$PG_PORT do not agree with what this shell can see, so a server may be running and this shell cannot tell. A shell that cannot open a socket must not start or stop a cluster - run this from the host shell that owns it."
+  local action="$1" status="${2:-1}"
+  log "refusing to $action: $PG_DATA/postmaster.pid and the probe of 127.0.0.1:$PG_PORT do not agree with what this shell can see, so a server may be running and this shell cannot tell. A shell that cannot open a socket must not start or stop a cluster - run this from the host shell that owns it."
+  exit "$status"
 }
 
 pg_env() {
@@ -187,6 +192,25 @@ cmd_start() {
   log "running on 127.0.0.1:$PG_PORT (dbs: $PG_DB, $PG_SCENARIO_DB, $PG_TEST_DB)"
 }
 
+# Bring the cluster up only when this shell can *prove* it is stopped.
+#
+# The recovery the handoff asks for is exactly this question, and the three states
+# need three different answers. `running` is verified rather than restarted;
+# `stopped` is started once through `cmd_start`, which does its own checks and
+# serialises with `flock`; anything else - `unknown` - is a refusal, because from a
+# shell that cannot see the owner a start is the 2026-09-26 hazard and a stop would
+# signal a PID it cannot verify. Exit 4 keeps `unknown` distinguishable from a
+# failed start (1), the way `status` already does.
+cmd_ensure() {
+  local state
+  state="$(pg_state)"
+  case "$state" in
+    running) log "already running"; cmd_ensure_dbs; return 0 ;;
+    stopped) cmd_start ;;
+    *) pg_refuse_unknown ensure 4 ;;
+  esac
+}
+
 cmd_stop() {
   local state
   state="$(pg_state)"
@@ -236,10 +260,10 @@ cmd_url() { echo "postgresql+psycopg://$PG_USER@127.0.0.1:$PG_PORT/${1:-$PG_DB}"
 
 pg_main() {
   case "${1:-}" in
-    provision|init|start|stop|status|psql|reset|env) "cmd_$1" "${@:2}" ;;
+    provision|init|start|stop|status|psql|reset|env|ensure) "cmd_$1" "${@:2}" ;;
     ensure-dbs) cmd_ensure_dbs ;;
     url) case "${2:-dev}" in dev) cmd_url "$PG_DB" ;; test) cmd_url "$PG_TEST_DB" ;; scenario) cmd_url "$PG_SCENARIO_DB" ;; *) cmd_url "$2" ;; esac ;;
-    *) die "usage: $0 {provision|init|start|stop|status|psql|reset|env|url} [args]" ;;
+    *) die "usage: $0 {provision|init|start|stop|status|psql|reset|env|url|ensure} [args]" ;;
   esac
 }
 

@@ -345,6 +345,92 @@ cmd_inspect() {
 # is in fact spinning. CPU near the core count with RSS held at the cgroup limit is
 # the signature the override in demo/compose.opsaccord.yaml was written for; a
 # restart count of 0 with OOMKilled false rules the OOM-loop reading out.
+# Bring this project's own containers to running, and touch nothing else.
+#
+# `start` is `compose up -d`, and compose does not merely fill in what is missing:
+# it also *recreates* any container whose configuration or image differs from the
+# one it would create. That is what makes a blanket `up` the wrong response to a
+# container that is already running - the running container, its restart count and
+# its health history are the evidence a diagnosis reads, and recreating it throws
+# them away. So the project's own containers are read *before* any of them is
+# touched, and the action follows from that state:
+#
+#   * nothing in the project       - `start`, and nothing else: the pinned stack;
+#   * some container not running   - `compose up -d --no-build <those services>`,
+#                                    which names only them. Compose is given the
+#                                    containers' *service* label, not their container
+#                                    name, because upstream sets `container_name:`
+#                                    on several services and the two differ. Any of
+#                                    the named ones whose configuration or image
+#                                    differs is recreated, and that is said out loud
+#                                    rather than claimed away;
+#   * all running, some unhealthy  - nothing is started, stopped or recreated. The
+#                                    health probe's own output and a bounded log tail
+#                                    are printed and the command fails, because
+#                                    choosing a repair needs that evidence first. A
+#                                    failed *endpoint* probe alone is not evidence
+#                                    about a container's own health, and it is not a
+#                                    repair plan either.
+cmd_ensure() {
+  require_docker; require_checkout
+  local names_out rc=0 name line cname cstate chealth cservice started=0
+  names_out="$("$DOCKER_BIN" ps -a --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}}')" || rc=$?
+  printf 'demo: ensure listed the project containers (exit %s)\n' "$rc"
+  [ "$rc" -eq 0 ] || return "$rc"
+  if [ -z "$names_out" ]; then
+    printf 'demo: no containers in project %s yet; starting the pinned stack\n' "$PROJECT"
+    cmd_start
+    return 0
+  fi
+  local names=() stopped_services=() unhealthy=()
+  mapfile -t names <<<"$names_out"
+  for name in "${names[@]}"; do
+    [ -n "$name" ] || continue
+    if ! line="$("$DOCKER_BIN" inspect --format \
+      '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{index .Config.Labels "com.docker.compose.service"}}' \
+      "$name" </dev/null)"; then
+      printf 'demo: inspect %s failed, so its state is unknown and nothing is started\n' "$name" >&2
+      return 1
+    fi
+    line="${line#/}"
+    printf '%s\n' "$line"
+    read -r cname cstate chealth cservice <<<"$line"
+    if [ "$cstate" != "running" ]; then
+      stopped_services+=("${cservice:-$cname}")
+    elif [ "$chealth" != "healthy" ] && [ "$chealth" != "none" ]; then
+      unhealthy+=("$cname")
+    fi
+  done
+  if [ "${#stopped_services[@]}" -gt 0 ]; then
+    printf 'demo: starting the %s stopped service(s) and nothing else: %s\n' "${#stopped_services[@]}" "${stopped_services[*]}"
+    printf 'demo: a named service whose configuration or image differs is recreated by this start; only the named services are affected\n'
+    compose up -d --no-build "${stopped_services[@]}"
+    started=1
+  fi
+  if [ "${#unhealthy[@]}" -gt 0 ]; then
+    printf 'demo: %s container(s) are running but not healthy: %s\n' "${#unhealthy[@]}" "${unhealthy[*]}" >&2
+    printf 'demo: collecting their health output and a bounded log tail; nothing else is started or recreated\n' >&2
+    for name in "${unhealthy[@]}"; do
+      printf 'demo: ---- health: %s\n' "$name" >&2
+      "$DOCKER_BIN" inspect --format '{{json .State.Health.Log}}' "$name" </dev/null >&2 \
+        || printf 'demo: health output unavailable for %s\n' "$name" >&2
+      printf 'demo: ---- bounded logs: %s\n' "$name" >&2
+      if ! cmd_logs "$name" >&2; then
+        printf 'demo: bounded log capture for %s failed; its status is on the line above\n' "$name" >&2
+      fi
+    done
+    printf 'demo: STOP: an unhealthy running container needs this evidence before a repair is chosen\n' >&2
+    return 1
+  fi
+  if [ "$started" -eq 1 ]; then
+    cmd_wait
+    printf 'demo: started the stopped service(s); the documented endpoints answer\n'
+    return 0
+  fi
+  printf 'demo: every project container is running and healthy; nothing was started\n'
+  return 0
+}
+
 cmd_stats() {
   require_docker
   local rc=0 sample
@@ -366,6 +452,7 @@ usage: scripts/demo.sh <command>
 
   pull        download every image the pinned compose model references
   start       start the core + observability stack and wait until it is healthy
+  ensure      bring the project's own containers to running without recreating what runs
   stop        stop and remove this project's containers
   restart     restart this project's containers in place (optionally: names only)
   status      show this project's containers
@@ -412,6 +499,7 @@ main() {
     restart) cmd_restart "$@" ;;
     status) cmd_status "$@" ;;
     inspect) cmd_inspect "$@" ;;
+    ensure) cmd_ensure "$@" ;;
     health) cmd_health "$@" ;;
     stats) cmd_stats "$@" ;;
     wait) cmd_wait "$@" ;;

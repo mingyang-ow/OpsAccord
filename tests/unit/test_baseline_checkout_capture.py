@@ -7,6 +7,13 @@ Payment span wrote no status at all, one where the catalog call exists only as t
 caller's own client span. Each of those must fail, must name itself, and must never
 be reported as a verified baseline.
 
+Since 2026-10-15 the gate has a second half, and it is tested the same way: the
+capture no longer queries a historical interval, so a trace is only evidence about
+the flags if its measured *attempt began* after the observation-start boundary. A
+healthy request that was already in flight is refused, a request that appears only
+after a later poll is accepted, and the flag premise is the pair of readings that
+brackets the observation rather than a single present-day one.
+
 The fixture *shape* follows ``test_fault_evidence``: a Jaeger v1-compatible payload
 whose spans carry ``traceID``/``spanID``/``operationName``/``processID``/
 ``startTime``/``duration`` with ``processes[processID].serviceName``. Service and
@@ -48,17 +55,19 @@ PROCESSES = {
         "payment",
     )
 }
-#: One fixed instant, inside the window the end-to-end tests query.
-WINDOW_START = "2026-10-15T09:29:59Z"
-WINDOW_END = "2026-10-15T09:31:00Z"
 
-
-def micros(value: str) -> int:
-    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1_000_000)
-
-
-BASE_US = micros("2026-10-15T09:30:00Z")
+#: The instant the injected clock starts at, and therefore the capture's
+#: observation-start boundary. Spans are placed relative to it, never in real time:
+#: a fixture that used "now" would pass or fail depending on when the suite ran.
+BASE_US = int(datetime.fromisoformat("2026-10-15T09:30:00+00:00").timestamp() * 1_000_000)
 SECOND_US = 1_000_000
+#: The measured attempt of a fresh fixture begins five seconds after the boundary,
+#: so it cannot be answered in the first poll's zero-width window and the test
+#: exercises the polling loop rather than bypassing it.
+FRESH_US = BASE_US + 5 * SECOND_US
+HISTORICAL_US = BASE_US - 30 * SECOND_US
+DEADLINE_SECONDS = 30.0
+POLL_SECONDS = 10.0
 
 
 def load_module() -> Any:
@@ -85,6 +94,31 @@ def module() -> Any:
 @pytest.fixture(name="capture")
 def capture_fixture() -> Any:
     return module()
+
+
+class Clock:
+    """A controllable clock: the deadline is reached without waiting for it."""
+
+    def __init__(self, start_us: int = BASE_US) -> None:
+        self.us = start_us
+
+    def now(self) -> int:
+        return self.us
+
+    def sleep(self, seconds: float) -> None:
+        self.us += int(seconds * 1_000_000)
+
+
+class CountingClock(Clock):
+    """Counts how often the loop looked at the time, so a poll count is checkable."""
+
+    def __init__(self, start_us: int = BASE_US) -> None:
+        super().__init__(start_us)
+        self.reads = 0
+
+    def now(self) -> int:
+        self.reads += 1
+        return super().now()
 
 
 def span(
@@ -130,13 +164,18 @@ def checkout_trace(
 
     Every span is a child of the one that called it, which is what makes the
     reconstruction a walk over the payload's own references rather than a guess.
+    ``start_us`` moves the *whole* trace, so the measured attempt's own start - the
+    one the freshness gate reads - is ``start_us`` too.
     """
+
+    def at(span_id: str, operation: str, process: str, **kwargs: Any) -> dict[str, Any]:
+        kwargs.setdefault("duration", 1000)
+        return span(span_id, operation, process, start_us=start_us, **kwargs)
+
     spans = [
-        span(
-            "lg-root", "user_checkout_multi", "load-generator", start_us=start_us, duration=90_000
-        ),
-        span("fpx", "POST", "frontend-proxy", parent="lg-root", kind="server", duration=80_000),
-        span(
+        at("lg-root", "user_checkout_multi", "load-generator", duration=90_000),
+        at("fpx", "POST", "frontend-proxy", parent="lg-root", kind="server", duration=80_000),
+        at(
             "fe-server",
             "POST /api/checkout",
             "frontend",
@@ -144,7 +183,7 @@ def checkout_trace(
             kind="server",
             duration=70_000,
         ),
-        span(
+        at(
             "fe-client",
             PLACE_ORDER,
             "frontend",
@@ -153,7 +192,7 @@ def checkout_trace(
             status="OK",
             duration=60_000,
         ),
-        span(
+        at(
             "ck-server",
             PLACE_ORDER,
             "checkout",
@@ -162,13 +201,13 @@ def checkout_trace(
             status=checkout_status,
             duration=50_000,
         ),
-        span("ck-cart", CART_GET, "checkout", parent="ck-server", kind="client", status="OK"),
-        span("cart-server", CART_GET, "cart", parent="ck-cart", kind="server", status="OK"),
-        span("ck-catalog", CATALOG_GET, "checkout", parent="ck-server", kind="client", status="OK"),
+        at("ck-cart", CART_GET, "checkout", parent="ck-server", kind="client", status="OK"),
+        at("cart-server", CART_GET, "cart", parent="ck-cart", kind="server", status="OK"),
+        at("ck-catalog", CATALOG_GET, "checkout", parent="ck-server", kind="client", status="OK"),
     ]
     if catalog_server:
         spans.append(
-            span(
+            at(
                 "catalog-server",
                 CATALOG_GET,
                 "product-catalog",
@@ -179,11 +218,11 @@ def checkout_trace(
         )
     if charge_client:
         spans.append(
-            span("ck-charge", CHARGE, "checkout", parent="ck-server", kind="client", status="OK")
+            at("ck-charge", CHARGE, "checkout", parent="ck-server", kind="client", status="OK")
         )
     if payment_server:
         spans.append(
-            span(
+            at(
                 "pm-server",
                 CHARGE,
                 "payment",
@@ -210,6 +249,36 @@ def flag_document(**variants: str) -> dict[str, Any]:
         assert flag in document, f"{flag} is not a flag of the pinned revision"
         document[flag] = {"defaultVariant": variant}
     return {"flags": document}
+
+
+def flag_state(read: bool = True, reason: str | None = None, **variants: str) -> dict[str, Any]:
+    """One flag reading, in the shape ``read_flag_variants`` returns it."""
+    values = dict(FLAG_SAFE_VARIANT)
+    values.update(variants)
+    return {
+        "base_url": "http://flags.test/feature",
+        "read": read,
+        "reason": None if read else (reason or "httpx.ConnectError: unreachable"),
+        "variants": values if read else {},
+        "safe_variant": dict(FLAG_SAFE_VARIANT),
+        "unsafe": (
+            [flag for flag, value in values.items() if value != FLAG_SAFE_VARIANT[flag]]
+            if read
+            else []
+        ),
+        "observed_at": "2026-10-15T09:30:00+00:00",
+    }
+
+
+def flag_reader(*states: dict[str, Any]) -> Any:
+    """A `read_flags` callable: the states in order, the last one repeating."""
+    remaining = [dict(state) for state in states]
+    assert remaining, "at least one flag reading is needed"
+
+    def read() -> dict[str, Any]:
+        return dict(remaining.pop(0)) if len(remaining) > 1 else dict(remaining[0])
+
+    return read
 
 
 def evaluate(payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
@@ -352,30 +421,124 @@ def test_the_chosen_trace_reports_spans_outside_the_window_as_a_caveat(capture: 
     verdict = capture.evaluate_summary(summary)
 
     assert verdict["verified"] is True
-    assert any("outside the requested interval" in caveat for caveat in verdict["caveats"])
+    assert any("outside the observed interval" in caveat for caveat in verdict["caveats"])
 
 
-# --- the flag document is part of the premise -------------------------------
+# --- freshness: an observation is a request that began after the boundary ----
+
+
+def test_a_fresh_attempt_is_accepted_and_a_historical_one_is_refused(capture: Any) -> None:
+    fresh = capture.summarize_trace(
+        checkout_trace(start_us=FRESH_US),
+        root_operation=PLACE_ORDER,
+        edge_operation=CHARGE,
+        window_start_us=BASE_US,
+        window_end_us=FRESH_US + SECOND_US,
+    )
+    historical = capture.summarize_trace(
+        checkout_trace(start_us=HISTORICAL_US),
+        root_operation=PLACE_ORDER,
+        edge_operation=CHARGE,
+        window_start_us=BASE_US,
+        window_end_us=FRESH_US + SECOND_US,
+    )
+
+    accepted = capture.freshness_check(fresh, boundary_us=BASE_US)
+    refused = capture.freshness_check(historical, boundary_us=BASE_US)
+
+    assert accepted["ok"] is True
+    assert "at or after the observation boundary" in accepted["detail"]
+    assert refused["ok"] is False
+    assert "already in flight when the flags were read" in refused["detail"]
+    assert refused["name"] == "attempt_after_boundary"
+
+
+def test_an_attempt_with_no_start_time_cannot_be_shown_to_be_fresh(capture: Any) -> None:
+    """An untimed attempt is unverifiable, which is not the same as fresh."""
+    summary = capture.summarize_trace(
+        checkout_trace(start_us=FRESH_US),
+        root_operation=PLACE_ORDER,
+        edge_operation=CHARGE,
+    )
+    summary["attempt"] = {**summary["attempt"], "started_at_us": None}
+
+    check = capture.freshness_check(summary, boundary_us=BASE_US)
+
+    assert check["ok"] is False
+    assert "carries no start time" in check["detail"]
+
+
+# --- the flag premise: two readings, not continuous observation --------------
 
 
 def test_an_armed_flag_is_not_a_baseline(capture: Any) -> None:
-    check = capture.flag_check(
-        {
-            "read": True,
-            "variants": {"paymentUnreachable": "on", "cartFailure": "off"},
-            "unsafe": ["paymentUnreachable"],
-        }
-    )
+    check = capture.flag_check(flag_state(paymentUnreachable="on"))
 
     assert check["ok"] is False
     assert "paymentUnreachable='on'" in check["detail"]
 
 
 def test_an_unread_flag_document_is_unverified_rather_than_safe(capture: Any) -> None:
-    check = capture.flag_check({"read": False, "reason": "no flag endpoint in the environment"})
+    check = capture.flag_check(flag_state(read=False, reason="no flag endpoint in the environment"))
 
     assert check["ok"] is False
     assert "unverified rather than true" in check["detail"]
+
+
+def test_a_flag_that_moved_during_the_observation_blocks_the_verdict(capture: Any) -> None:
+    check = capture.flag_change_check(flag_state(), flag_state(paymentUnreachable="on"))
+
+    assert check["ok"] is False
+    assert check["name"] == "fault_flags_unchanged"
+    assert "changed during the observation" in check["detail"]
+    assert "paymentUnreachable: 'off' -> 'on'" in check["detail"]
+
+
+def test_a_flag_document_that_cannot_be_re_read_blocks_the_verdict(capture: Any) -> None:
+    check = capture.flag_change_check(flag_state(), flag_state(read=False))
+
+    assert check["ok"] is False
+    assert "could not be re-read" in check["detail"]
+
+
+def test_a_flag_document_that_could_not_be_read_first_blocks_the_verdict(capture: Any) -> None:
+    """ "Unchanged" is unanswerable without the earlier reading, so it is not claimed."""
+    check = capture.flag_change_check(flag_state(read=False), flag_state())
+
+    assert check["ok"] is False
+    assert "nothing to compare" in check["detail"]
+
+
+def test_unchanged_safe_readings_pass_and_say_only_that(capture: Any) -> None:
+    check = capture.flag_change_check(flag_state(), flag_state())
+
+    assert check["ok"] is True
+    assert "unchanged" in check["detail"]
+    assert "all 6 fault flags" in check["detail"]
+
+
+def test_the_flag_guarantee_disclaims_continuous_observation(capture: Any) -> None:
+    """The wording is load-bearing: a pair of snapshots is not an interval guarantee."""
+    guarantee = capture.FLAG_GUARANTEE
+
+    assert "cannot exclude a change that began and ended inside the interval" in guarantee
+    assert "not continuous observation" in guarantee
+    assert "competing scenario driver" in guarantee
+
+
+def test_a_competing_driver_blocks_because_it_shares_the_flags(capture: Any) -> None:
+    check = capture.driver_check(
+        ["4242: python -m opsaccord.cli run-live-scenarios"], observed_at="t"
+    )
+
+    assert check["ok"] is False
+    assert check["name"] == "no_competing_driver"
+    assert "share this demo's feature flags" in check["detail"]
+
+    quiet = capture.driver_check([], observed_at="t")
+
+    assert quiet["ok"] is True
+    assert capture.COMPETING_DRIVER_METHOD in quiet["detail"]
 
 
 # --- the command's own contract ---------------------------------------------
@@ -391,11 +554,18 @@ class FakeStack:
         traces_status: int = 200,
         flags: dict[str, Any] | None = None,
         flags_status: int = 200,
+        ignore_window: bool = False,
     ) -> None:
         self.traces = list(traces or [])
         self.traces_status = traces_status
         self.flags = flags if flags is not None else flag_document()
         self.flags_status = flags_status
+        #: A store that answers with what it holds rather than with what falls in the
+        #: window. The real one is bounded and ingest-lagged, and it is precisely a
+        #: payload that *arrives during* the observation but whose request began
+        #: before it that the freshness gate has to catch, so that case is modelled
+        #: directly instead of being excluded by the fake's own filter.
+        self.ignore_window = ignore_window
 
     def client(self) -> httpx.Client:
         return httpx.Client(
@@ -405,8 +575,10 @@ class FakeStack:
 
     def matching(self, params: dict[str, str]) -> list[dict[str, Any]]:
         """``/api/traces`` as the API documents it: service, and the window."""
-        start, end = int(params["start"]), int(params["end"])
         limit = int(params["limit"])
+        if self.ignore_window:
+            return self.traces[:limit]
+        start, end = int(params["start"]), int(params["end"])
         matched = [
             trace
             for trace in self.traces
@@ -438,34 +610,236 @@ class FakeStack:
         raise AssertionError(f"unexpected request to {path}")
 
 
-def run_capture(
+def observe(
     capture: Any,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
     *,
     stack: FakeStack,
-    extra: list[str] | None = None,
-) -> tuple[int, Path, Path]:
+    reader: Any = None,
+    drivers: list[str] | None = None,
+    clock: Clock | None = None,
+    deadline_seconds: float = DEADLINE_SECONDS,
+    poll_interval_seconds: float = POLL_SECONDS,
+) -> tuple[dict[str, Any], Clock]:
+    """Run `capture.capture` against a fake store and a controllable clock."""
+    clock = clock or Clock()
+    client = stack.client()
+    if reader is None:
+        # No injected reader means the flag document comes over HTTP from the fake
+        # flagd-ui, exactly as `main` reads it - so `FakeStack(flags=...)` decides the
+        # premise in these tests rather than a Python literal standing in for it.
+        def reader() -> dict[str, Any]:
+            return capture.read_flag_variants(
+                "http://flags.test/feature", client=client, timeout_seconds=1.0
+            )
+
+    document = capture.capture(
+        capture.JaegerClient("http://jaeger.test/jaeger/ui", client=client),
+        limit=20,
+        read_flags=reader,
+        competing_driver=lambda: list(drivers or []),
+        deadline_seconds=deadline_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        now_us=clock.now,
+        sleep=clock.sleep,
+    )
+    return document, clock
+
+
+def test_a_fresh_linked_checkout_is_accepted_and_recorded_with_its_raw_spans(
+    capture: Any,
+) -> None:
+    document, clock = observe(capture, stack=FakeStack(traces=[checkout_trace(start_us=FRESH_US)]))
+
+    assert document["verdict"] == "baseline_verified"
+    assert document["exit_status"] == 0
+    assert document["blocking"] == []
+    assert document["chosen_trace_id"] == TRACE_ID
+    assert document["observation_start_us"] == BASE_US
+    # It took a poll to see it: the first query's window ended before the attempt.
+    assert document["polling"]["requests_completed"] >= 2
+    assert document["polling"]["deadline_exceeded"] is False
+    assert clock.us >= FRESH_US
+
+    chosen = next(item for item in document["candidates"] if item["trace_id"] == TRACE_ID)
+    assert chosen["fresh"] is True
+    assert chosen["started_at_us"] == FRESH_US
+    assert [check["name"] for check in chosen["checks"]] == [
+        "attempt_after_boundary",
+        "fault_flags_safe_before",
+        "fault_flags_unchanged",
+        "no_competing_driver",
+        "checkout_entry_span",
+        "product_catalog_reached",
+        "payment_charge_on_path",
+        "explicit_success",
+    ]
+
+    # The raw span fields, not only a verdict: ids, parents, services and timing.
+    spans = document["evidence"]["spans"]
+    charge = next(item for item in spans if item["span_id"] == "pm-server")
+    assert charge["parent_span_id"] == "ck-charge"
+    assert charge["service"] == "payment"
+    assert charge["status"] == "OK"
+    assert charge["status_source"] == "otel.status_code"
+    assert charge["relationship"] == "descendant"
+    assert charge["hops_from_attempt"] == 2
+    assert isinstance(charge["started_at_us"], int)
+    assert charge["ends_at_us"] > charge["started_at_us"]
+    # Both readings are kept, each with its own instant, and the guarantee is stated.
+    assert document["flags_before"]["read"] is True
+    assert document["flags_after"]["read"] is True
+    assert document["flag_guarantee"] == capture.FLAG_GUARANTEE
+
+
+def test_a_healthy_request_that_began_before_the_observation_is_refused(capture: Any) -> None:
+    """The whole point of the boundary: an old, healthy trace is not fresh evidence.
+
+    The store is answering with what it *holds* here, which is how a pre-boundary
+    request arrives during an observation at all; every other property of the trace
+    is perfect, so freshness is the only thing that can reject it.
+    """
+    stack = FakeStack(traces=[checkout_trace(start_us=HISTORICAL_US)], ignore_window=True)
+
+    document, _ = observe(capture, stack=stack)
+
+    assert document["verdict"] == "not_verified_no_fresh_attempt"
+    assert document["exit_status"] == 1
+    assert document["chosen_trace_id"] == TRACE_ID
+    assert "attempt_after_boundary" in document["blocking"]
+    assert "attempt_after_boundary" not in [
+        check["name"] for check in document["candidates"][0]["checks"] if check["ok"]
+    ]
+    # Every other property really did hold; only the boundary refused it.
+    assert document["blocking"] == ["attempt_after_boundary"]
+    assert document["polling"]["deadline_exceeded"] is True
+
+
+def test_no_traffic_at_all_ends_at_the_deadline_with_an_honest_result(capture: Any) -> None:
+    clock = CountingClock()
+
+    document, _ = observe(capture, stack=FakeStack(traces=[]), clock=clock)
+
+    assert document["verdict"] == "not_verified_no_trace_in_interval"
+    assert document["exit_status"] == 1
+    assert document["evidence"] is None
+    assert document["candidates"] == []
+    assert document["deadline_exceeded"] is True
+    assert document["polling"]["requests_completed"] >= 3
+    assert document["polling"]["payloads_observed"] == 0
+    # It waited rather than concluding from the first empty answer.
+    assert clock.us >= BASE_US + int(DEADLINE_SECONDS * SECOND_US)
+    assert any("an empty query is not health" in item for item in document["limits"])
+
+
+def test_traffic_that_appears_only_on_a_later_poll_is_accepted(capture: Any) -> None:
+    """Ingestion lags the request: "not yet" must not be read as "never"."""
+    stack = FakeStack(traces=[checkout_trace(start_us=FRESH_US + 8 * SECOND_US)])
+
+    document, _ = observe(capture, stack=stack, poll_interval_seconds=POLL_SECONDS)
+
+    assert document["verdict"] == "baseline_verified"
+    assert document["polling"]["requests_completed"] >= 2
+
+
+def test_an_unreachable_edge_is_named_in_the_extract(capture: Any) -> None:
+    stack = FakeStack(
+        traces=[checkout_trace(start_us=FRESH_US, charge_client=False, payment_server=False)]
+    )
+
+    document, _ = observe(capture, stack=stack)
+
+    assert document["verdict"] == "not_verified"
+    assert document["exit_status"] == 1
+    assert document["blocking"][0] == "payment_charge_on_path"
+    assert document["evidence"] is not None
+
+
+def test_an_ambiguous_status_cannot_become_success(capture: Any) -> None:
+    stack = FakeStack(traces=[checkout_trace(start_us=FRESH_US, payment_status="UNSET")])
+
+    document, _ = observe(capture, stack=stack)
+
+    assert document["verdict"] == "not_verified"
+    assert document["blocking"] == ["explicit_success"]
+
+
+def test_an_armed_flag_blocks_the_verdict(capture: Any) -> None:
+    stack = FakeStack(
+        traces=[checkout_trace(start_us=FRESH_US)], flags=flag_document(paymentUnreachable="on")
+    )
+
+    document, _ = observe(capture, stack=stack)
+
+    assert document["verdict"] == "not_verified"
+    # Armed before the boundary *and* still armed after it: each reading is reported,
+    # because "it was armed" and "it was still armed at the end" are both true.
+    assert document["blocking"] == ["fault_flags_safe_before", "fault_flags_unchanged"]
+
+
+def test_a_flag_that_moves_while_the_capture_waits_blocks_the_verdict(capture: Any) -> None:
+    """The second reading is what catches a flag armed between the two."""
+    stack = FakeStack(traces=[checkout_trace(start_us=FRESH_US)])
+    reader = flag_reader(flag_state(), flag_state(paymentUnreachable="on"))
+
+    document, _ = observe(capture, stack=stack, reader=reader)
+
+    assert document["verdict"] == "not_verified"
+    assert document["blocking"] == ["fault_flags_unchanged"]
+
+
+def test_a_competing_driver_blocks_the_verdict(capture: Any) -> None:
+    stack = FakeStack(traces=[checkout_trace(start_us=FRESH_US)])
+
+    document, _ = observe(
+        capture, stack=stack, drivers=["7331: python -m opsaccord.cli run-live-scenarios"]
+    )
+
+    assert document["verdict"] == "not_verified"
+    assert document["blocking"] == ["no_competing_driver"]
+    assert document["competing_driver"]["found"] == [
+        "7331: python -m opsaccord.cli run-live-scenarios"
+    ]
+
+
+def test_a_failed_query_is_recorded_rather_than_reported_as_absent(capture: Any) -> None:
+    document, _ = observe(capture, stack=FakeStack(traces_status=500))
+
+    assert document["verdict"] == "not_verified_query_failed"
+    assert document["exit_status"] == 1
+    assert "traces_for_checkout" in document["failures"]
+    assert document["traces_retrieved"] == 0
+    assert document["polling"]["requests_failed"] >= 1
+    assert document["polling"]["requests_completed"] == 0
+
+
+def test_the_extract_is_written_before_the_rendered_log(
+    capture: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sanitized spans survive even if everything after them does."""
+    stack = FakeStack(traces=[checkout_trace(start_us=FRESH_US)])
     out = tmp_path / "capture.json"
     log = tmp_path / "capture.log"
-    # Built before the patch: the script reaches httpx through the same module
-    # object the patch replaces, so constructing it afterwards would recurse.
     client = stack.client()
+    # One clock, shared by both seams: a sleeping clock that is not the reading clock
+    # would never reach the deadline, and the test would hang rather than fail.
+    clock = Clock()
     monkeypatch.setattr(capture.httpx, "Client", lambda **_: client)
+    monkeypatch.setattr(capture, "_epoch_micros", clock.now)
+    monkeypatch.setattr(capture, "_sleep", clock.sleep)
+    monkeypatch.setattr(capture, "competing_drivers", list)
     monkeypatch.setenv("OPSACCORD_JAEGER_BASE_URL", "http://jaeger.test/jaeger/ui")
     monkeypatch.setenv("OPSACCORD_FLAG_CONTROL_BASE_URL", "http://flags.test/feature")
-    argv = [
-        "--start",
-        WINDOW_START,
-        "--end",
-        WINDOW_END,
-        "--out",
-        str(out),
-        "--log",
-        str(log),
-        *(extra or []),
-    ]
-    return capture.main(argv), out, log
+
+    status = capture.main(["--out", str(out), "--log", str(log)])
+
+    assert status == 0
+    extract = json.loads(out.read_text())
+    assert extract["kind"] == "opsaccord.baseline-checkout-capture"
+    assert extract["verdict"] == "baseline_verified"
+    assert extract["evidence"]["spans"]
+    assert extract["observation_start_us"] == BASE_US
+    assert "verdict: baseline_verified" in log.read_text()
+    assert "observation start:" in log.read_text()
 
 
 def test_the_command_refuses_to_start_without_an_endpoint(
@@ -477,112 +851,19 @@ def test_the_command_refuses_to_start_without_an_endpoint(
     assert "refusing to start" in capsys.readouterr().out
 
 
-def test_the_command_rejects_an_out_of_range_limit(capture: Any) -> None:
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--limit", "0"],
+        ["--limit", "1000"],
+        ["--deadline-seconds", "0"],
+        ["--poll-interval-seconds", "0"],
+    ],
+)
+def test_the_command_rejects_arguments_that_would_unbound_the_observation(
+    capture: Any, argv: list[str]
+) -> None:
     with pytest.raises(SystemExit) as excinfo:
-        capture.main(["--limit", "0"])
+        capture.main(argv)
 
     assert excinfo.value.code == 2
-
-
-def test_a_verified_baseline_is_written_with_its_raw_span_evidence(
-    capture: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    stack = FakeStack(traces=[checkout_trace()])
-
-    status, out, log = run_capture(capture, monkeypatch, tmp_path, stack=stack)
-
-    assert status == 0
-    extract = json.loads(out.read_text())
-    assert extract["kind"] == "opsaccord.baseline-checkout-capture"
-    assert extract["verdict"] == "baseline_verified"
-    assert extract["exit_status"] == 0
-    assert extract["failures"] == {}
-    assert extract["blocking"] == []
-    assert extract["chosen_trace_id"] == TRACE_ID
-    # The raw span fields, not only a verdict: ids, parents, services and timing.
-    spans = extract["evidence"]["spans"]
-    assert [item["span_id"] for item in spans][:2] == ["lg-root", "fpx"]
-    charge = next(item for item in spans if item["span_id"] == "pm-server")
-    assert charge["parent_span_id"] == "ck-charge"
-    assert charge["service"] == "payment"
-    assert charge["status"] == "OK"
-    assert charge["status_source"] == "otel.status_code"
-    assert charge["relationship"] == "descendant"
-    assert charge["hops_from_attempt"] == 2
-    assert isinstance(charge["started_at_us"], int)
-    assert charge["ends_at_us"] > charge["started_at_us"]
-    assert extract["flags"]["read"] is True
-
-    text = log.read_text()
-    assert "verdict: baseline_verified" in text
-    assert "pm-server <- ck-charge payment/" + CHARGE in text
-
-
-def test_an_empty_interval_is_not_health(
-    capture: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    status, out, _ = run_capture(capture, monkeypatch, tmp_path, stack=FakeStack(traces=[]))
-
-    assert status == 1
-    extract = json.loads(out.read_text())
-    assert extract["verdict"] == "not_verified_no_trace_in_interval"
-    assert extract["evidence"] is None
-    assert extract["candidates"] == []
-    assert any("an empty query is not health" in item for item in extract["limits"])
-
-
-def test_an_unreachable_edge_is_named_in_the_extract(
-    capture: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    stack = FakeStack(traces=[checkout_trace(charge_client=False, payment_server=False)])
-
-    status, out, _ = run_capture(capture, monkeypatch, tmp_path, stack=stack)
-
-    assert status == 1
-    extract = json.loads(out.read_text())
-    assert extract["verdict"] == "not_verified"
-    assert extract["blocking"][0] == "payment_charge_on_path"
-    assert extract["evidence"] is not None
-
-
-def test_an_armed_flag_blocks_the_verdict(
-    capture: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    stack = FakeStack(traces=[checkout_trace()], flags=flag_document(paymentUnreachable="on"))
-
-    status, out, _ = run_capture(capture, monkeypatch, tmp_path, stack=stack)
-
-    assert status == 1
-    extract = json.loads(out.read_text())
-    assert extract["verdict"] == "not_verified"
-    assert extract["blocking"] == ["fault_flags_safe"]
-
-
-def test_a_failed_query_is_recorded_rather_than_reported_as_absent(
-    capture: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    status, out, _ = run_capture(capture, monkeypatch, tmp_path, stack=FakeStack(traces_status=500))
-
-    assert status == 1
-    extract = json.loads(out.read_text())
-    assert extract["verdict"] == "not_verified_query_failed"
-    assert "traces_for_checkout" in extract["failures"]
-    assert extract["traces_retrieved"] == 0
-
-
-def test_the_window_is_respected(
-    capture: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A trace from another interval is not evidence about this one."""
-    outside = checkout_trace(trace_id="outside", start_us=BASE_US - 3600 * SECOND_US)
-    inside = checkout_trace(trace_id="inside")
-    stack = FakeStack(traces=[outside, inside])
-
-    status, out, _ = run_capture(capture, monkeypatch, tmp_path, stack=stack)
-
-    assert status == 0
-    extract = json.loads(out.read_text())
-    # Both traces are healthy; only the one inside the queried window came back.
-    assert extract["traces_retrieved"] == 1
-    assert extract["chosen_trace_id"] == "inside"
-    assert extract["window"]["start"].startswith("2026-10-15T09:29:59")
