@@ -533,14 +533,28 @@ def test_ensure_refuses_a_running_but_unhealthy_container_without_recreating_any
     its restart count and its health history - exactly the readings a diagnosis is
     made of. An unhealthy container produces its own evidence and the command stops
     there, whatever state the other containers are in.
+
+    The two bounded samples belong to that evidence: the state a repair would replace
+    exists only while the container is in it, so a stop that hands back the health
+    output and the log tail but not the numbers that decide the repair costs the user
+    another host run - which is what the 2026-10-15 run did.
     """
-    result = _run(tmp_path, "ensure", **_probed(tmp_path, STUB_UNHEALTHY="checkout"))
+    result = _run(
+        tmp_path,
+        "ensure",
+        **_probed(tmp_path, STUB_UNHEALTHY="checkout", OPSACCORD_DEMO_STATS_SLEEP="0"),
+    )
 
     assert result.returncode == 1
     assert "running but not healthy" in result.stderr
     # The probe's own message, and a bounded log tail, for the container in question.
     assert "failed to connect service :3550" in result.stderr
     assert "logs --tail 80 checkout" in result.stderr
+    # The numbers a repair is read from, taken while the state they describe exists.
+    samples = _invocations(tmp_path, "stats")
+    assert len(samples) == 2, samples
+    assert all(argv[-1] == "checkout" for argv in samples), samples
+    assert "the sample pair exited 0" in result.stderr
     assert "STOP" in result.stderr
     # Nothing was started, recreated, stopped or restarted.
     assert _compose_up_args(tmp_path) == []
@@ -548,3 +562,28 @@ def test_ensure_refuses_a_running_but_unhealthy_container_without_recreating_any
         argv for argv in _invocations(tmp_path, "compose") if {"down", "restart"} & set(argv)
     ]
     assert mutating == [], mutating
+
+
+def test_ensure_still_refuses_when_the_sample_pair_fails(tmp_path: Path) -> None:
+    """A failed measurement must not turn into a different verdict.
+
+    `docker stats` can fail while `inspect` answers, and the refusal is about the
+    container's health, not about the helper's reading of it: the command still
+    exits 1, still prints the STOP line, reports the sample's own status, and starts,
+    stops and restarts nothing.
+    """
+    result = _run(
+        tmp_path,
+        "ensure",
+        **_probed(
+            tmp_path,
+            STUB_UNHEALTHY="checkout",
+            OPSACCORD_DEMO_STATS_SLEEP="0",
+            STUB_STATS_RC="1",
+        ),
+    )
+
+    assert result.returncode == 1
+    assert "the sample pair exited 1" in result.stderr
+    assert "STOP" in result.stderr
+    assert _compose_up_args(tmp_path) == []

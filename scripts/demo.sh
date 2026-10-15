@@ -385,14 +385,16 @@ cmd_inspect() {
 #                                    rather than claimed away;
 #   * all running, some unhealthy  - nothing is started, stopped or recreated. The
 #                                    health probe's own output and a bounded log tail
-#                                    are printed and the command fails, because
-#                                    choosing a repair needs that evidence first. A
-#                                    failed *endpoint* probe alone is not evidence
-#                                    about a container's own health, and it is not a
-#                                    repair plan either.
+#                                    are printed, together with the two bounded
+#                                    CPU/memory samples a repair decision is read
+#                                    from, and the command fails, because choosing a
+#                                    repair needs that evidence first. A failed
+#                                    *endpoint* probe alone is not evidence about a
+#                                    container's own health, and it is not a repair
+#                                    plan either.
 cmd_ensure() {
   require_docker; require_checkout
-  local names_out rc=0 name line cname cstate chealth cservice started=0
+  local names_out rc=0 name line cname cstate chealth cservice started=0 stats_rc=0
   names_out="$("$DOCKER_BIN" ps -a --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}}')" || rc=$?
   printf 'demo: ensure listed the project containers (exit %s)\n' "$rc"
   [ "$rc" -eq 0 ] || return "$rc"
@@ -428,7 +430,7 @@ cmd_ensure() {
   fi
   if [ "${#unhealthy[@]}" -gt 0 ]; then
     printf 'demo: %s container(s) are running but not healthy: %s\n' "${#unhealthy[@]}" "${unhealthy[*]}" >&2
-    printf 'demo: collecting their health output and a bounded log tail; nothing else is started or recreated\n' >&2
+    printf 'demo: collecting their health output, a bounded log tail and the two bounded samples; nothing else is started or recreated\n' >&2
     for name in "${unhealthy[@]}"; do
       printf 'demo: ---- health: %s\n' "$name" >&2
       "$DOCKER_BIN" inspect --format '{{$h := index .State "Health"}}{{if $h}}{{json $h.Log}}{{end}}' "$name" </dev/null >&2 \
@@ -438,6 +440,17 @@ cmd_ensure() {
         printf 'demo: bounded log capture for %s failed; its status is on the line above\n' "$name" >&2
       fi
     done
+    # The reading a repair decision is made from exists only while the container is
+    # *in* the state it describes: a restart in a later run would have replaced it
+    # (D29), and the 2026-10-15 run stopped here without the numbers, so the
+    # decision cost another host run to make. The samples are taken now, beside the
+    # health output and the log tail, and they stay read-only: still nothing is
+    # started, stopped or recreated. Two samples, because one non-streaming reading
+    # has no previous value to difference against and reports 0.00% for a process
+    # that is in fact spinning.
+    printf 'demo: ---- two bounded CPU/memory samples for %s\n' "${unhealthy[*]}" >&2
+    cmd_stats "${unhealthy[@]}" >&2 || stats_rc=$?
+    printf 'demo: the sample pair exited %s\n' "$stats_rc" >&2
     printf 'demo: STOP: an unhealthy running container needs this evidence before a repair is chosen\n' >&2
     return 1
   fi

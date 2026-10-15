@@ -4497,3 +4497,326 @@ PY
   exit "$cap_rc"
 )
 ```
+
+## The second live baseline-handoff run (`b0ca505` handed off; the user ran it on 2026-10-15) - the inspect fix held against the live CLI, and the run stopped by design at an unhealthy `product-catalog`
+
+Appended 2026-10-15. Everything above is left as it was. The user ran the block from "The live
+baseline-handoff pass" a second time, from revision `b0ca505`; the code change, its tests and this record
+are this pass's, and every live reading below is the **user's**.
+
+### The user's measured run (attributed to the user)
+
+Run at **2026-10-15 16:08 +08** from `b0ca505` on `phase1/baseline`, on the host. Evidence:
+`.local/user-baseline-20261015T080803/` (**stages 0-3 only**) plus the console tail the user pasted back.
+The user's `AGENTS.md` edit was still the only working-tree change when the block began.
+
+| Reading | What it measured | Source |
+| --- | --- | --- |
+| Preserved before any mutation | `M AGENTS.md`; `.local/pg/data/postmaster.pid` 163 bytes, mtime `2026-10-15T15:40:20.5738821710` - run 1's own start, untouched; the endpoint file still the 2026-09-26 one | `00-*.log`, `00-demo-endpoints.env.before` |
+| The cluster's state, as found | `[pg] running on 127.0.0.1:55432` - **exit 0** - so `pg.sh ensure` answered `[pg] already running` and started nothing. This is the precondition the previous handoff predicted: the state run 1 left behind is readable from the host shell, and stage 1's three-way case took the `running` branch | `01-pg-status.log`, `02-pg-ensure.log` |
+| Connectivity and rows | **3/3** databases reachable, **12/12** domain tables each, checkpoints present; `dev` 39/39/512/985, `test` 1/1/7/19, `scenario` 117/117/781/2081; `pg verification: OK` | `05-pg-verify.log` |
+| The engine | Docker `29.7.2` | `06-docker-engine.log` |
+| The stack, as found | 25 containers, **all of them running** - run 1 started them and nothing has stopped since - so `ensure` started, stopped and recreated nothing, and its 25 rows include all six healthcheck-less containers (`cart running none cart`) with no refusal | `07-demo-ensure.log` |
+| **`demo.sh inspect`, against the live CLI** | **exit 0, 25 rows, every row with its full per-container detail** - including `cart`, `otel-collector`, `jaeger`, `flagd`, `grafana` and `prometheus`, the six the previous run lost, now rendering `health=none ... healthcheck=none` (with `GOMEMLIMIT=160MiB` / `60MiB` where the service sets one) | `08-demo-inspect.log` |
+| The catalog | `state=running health=unhealthy restarts=0 exit=0 oom_killed=false memory_limit=20971520 nano_cpus=0 started=2026-10-15T07:40:41.431897294Z healthcheck=["CMD","/bin/grpc_health_probe","-addr=:3550"]`, `GOMEMLIMIT=16MiB` | `08b-key-containers.log` |
+| The catalog's health probes | five entries spanning `08:07:14`-`08:08:14` UTC: one `ExitCode 2` (`timeout: failed to connect service ":3550" within 1s`), then four `ExitCode -1` (`Health check exceeded timeout (5s)`) | `07-demo-ensure.log` |
+| The catalog's own output | ~40 `exporter export timeout` / `processor export timeout` / `traces export` / `failed to upload metrics` lines, every one `DeadlineExceeded`, from `07:41:04` to `08:07:36` - i.e. continuously since the process started, about 27 minutes | `07-demo-ensure.log` |
+| Where the run stopped | `demo.sh ensure` exited **1** and the block stopped by design, *after* `08-demo-inspect.log` and `08b-key-containers.log`: no `09-endpoints.log`, no `10-baseline-capture.log`, no `reports/local/baseline-checkout-*` | the evidence directory |
+
+### The `b0ca505` fix is now live-validated
+
+The previous section could only say that the row surviving a CLI refusal was pinned against a stub. This
+run is the live answer, and it is stronger than the fallback path it guarded:
+
+* `demo.sh inspect` exited **0 with all 25 rows** and full detail on every one. The fallback was never
+  reached, so `per_container_detail=missing` appears nowhere: the six containers that produced no row at
+  all in run 1 now render like the other nineteen.
+* Both commands that read optional keys (`inspect` and `ensure`) read `.State.Health`,
+  `.Config.Healthcheck` and `.Config.Labels` through `index`, and both were accepted for all 25
+  containers, including the six, now that those six are **running**. The second half of
+  [A26](../04%20Known%20Issues.md)'s open question - whether `ensure` would still read their state once
+  they were running - is answered yes.
+* The live *trigger* is still unexplained, and this run does not explain it either: the previous run's
+  contrast (the field form accepted by `ensure` for those six while stopped, rejected by `inspect` while
+  running) cannot be revisited, because the fixed script no longer reads them with a field form at all.
+  That is the intended shape of the fix - the row no longer depends on knowing why the CLI refused.
+
+### The stop was the designed one, not a defect
+
+Run 1 aborted through an unintended `set -e`/`pipefail` interaction. This run stopped because the block
+says so: `ensure` exits **1** when a running container is unhealthy (the `D31`/`D32` behaviour written at
+`6662628`), and `07-demo-ensure.log` records what that refusal is for - nothing started, stopped or
+recreated, the probe's own text, and a bounded log tail, ending in
+`demo: STOP: an unhealthy running container needs this evidence before a repair is chosen`. One was a
+defect; this is the block working.
+
+It is also why stage 4 and the capture did not run. The fault-free baseline needs `PlaceOrder` on the
+checkout -> payment path, and the capture requires `product_catalog_reached` - a catalog **server** span on
+the attempt's path, not a caller's own client span - so a wedged catalog is a property of the path itself
+rather than an incidental condition. **P1-01 was not run, and the fault-free baseline remains unmeasured
+on this revision; Phase 1 stays PARTIAL.**
+
+### What the catalog evidence does and does not settle
+
+Measured this run, for the instance started at `07:40:41` UTC: the container is **alive and listening**
+(`restarts=0`, `oom_killed=false`, and the endpoint probe for its port answers), it has been **exceeding
+its own 5 s health-probe timeout continuously**, and its OTLP exports have been failing with
+`DeadlineExceeded` since its first minute. So the half of D27's first row that excludes an OOM loop and a
+crash loop is confirmed for *this* instance.
+
+What is **not** measured for this instance is the rest of that row: there is no CPU/resident-set sample
+pair, so neither "CPU near the core count with RSS held at the 20 MiB cap" nor "CPU near idle with RSS
+well below it" can be read from this run. The two samples on file ([E28](../03%20Experiment%20Log.md):
+56.50% and 28.34% of the cap, with 159.76% and 378.74% CPU) belong to the 2026-09-25 instance; they are
+what refused the memory deviation for `product-catalog` in the first place, and that refusal stands - it
+is not overturned by anything measured here.
+
+One reading *is* new, and it is new because it was **retained** rather than because anything was sampled.
+The container was **started**, not recreated, so its own health log still holds its previous era's last
+two probes: both `ExitCode 0`, both `status: SERVING`, at `2026-09-26T04:02:30Z` and `04:02:35Z` - about
+an hour **after** the `02:57:33` in-place restart [E29](../03%20Experiment%20Log.md) measured.
+[D29](decisions/D29-a-restart-is-allowed-only-after-the-state-it-replaces-is-captured.md)'s revisit
+condition asked for exactly that reading, and E29 could not capture it (the helper ate the per-container
+state that run). It is a ring buffer of five entries, so it dates a recovery and not its extent; what it
+does not support is "the restart did nothing".
+
+### The correction this pass makes
+
+`cmd_ensure`, when it refuses over a running-but-unhealthy container, now also collects the **two bounded
+`docker stats` samples** for it, beside the health output and the log tail. This run is the reason: it
+stopped exactly as designed and handed back the probe's text and the logs, but not the numbers
+[D27](decisions/D27-a-repair-waits-for-the-measurement-that-names-its-cause.md) requires before a repair,
+so the decision had to cost a second host run - and the state those numbers describe (a process wedged
+*now*, with its restart counter and its health history intact) cannot be recovered afterwards. The
+samples are read-only and the refusal is unchanged: still exit **1**, still nothing started, stopped or
+recreated, and a failed sample pair is reported as a failed sample (`the sample pair exited N`) without
+changing the verdict. See [D33](decisions/D33-a-stop-hands-back-the-measurement.md).
+
+### Checks executed in this pass
+
+| Check | Result |
+| --- | --- |
+| `tests/unit/test_demo_script.py` | **21 passed** (20 before; +1 for a sample pair that fails without changing the verdict, and the refusal test now asserts the pair was taken) |
+| The three touched files | **72 passed** (`test_demo_script`, `test_pg_lifecycle`, `test_baseline_checkout_capture`) |
+| Offline suite, `-m "not integration"` | **349 passed, 7 skipped, 85 deselected** in **both** environment variants (348 before) |
+| `ruff check .` / `ruff format --check .` / `mypy src/opsaccord` | `All checks passed!` / 95 files already formatted / no issues in 42 source files |
+| `bash -n` on `scripts/demo.sh` and on both copies of the block | clean, and the two copies are byte-identical (extracted and `diff`ed) |
+| Falsification through `DEMO_SCRIPT_UNDER_TEST` | against `HEAD`'s `demo.sh`, exactly the two tests this pass touches **fail** - the refusal test at `the sample pair exited 0`, the new one at `the sample pair exited 1` - while the other 19 pass |
+| `bash scripts/pg.sh status` (this sandbox) | exit **4** - unchanged; this shell still cannot establish the cluster's state |
+| `bash scripts/demo.sh ensure` (this sandbox) | `the Docker engine did not answer`, exit **1**; nothing started |
+
+**These are offline tests with a stubbed CLI, and they are not host-side validation.** They pin that the
+stop collects the measurement, and that a failed measurement does not change the verdict; they do not
+reproduce the live wedge, and no live reading in this section was produced here.
+
+### Not run, and why
+
+- **The integration suite** - needs the live stack; not run here.
+- **The demo stack, the endpoint refresh and the fresh Checkout -> Payment capture** - this sandbox reaches
+  neither Docker nor a loopback port. Nothing was started, restarted, stopped or armed.
+- **P1-01** - untouched, and it cannot pass while `PlaceOrder`'s path needs the catalog to serve. **Phase 1
+  remains PARTIAL.**
+
+### The one next action (host shell, one block)
+
+Docker Desktop must already be up, and the cluster and the 25 containers are already running, so stage 1
+should verify and start nothing. The block preserves the as-found state first. When `ensure` refuses, the
+measurement that names the cause is taken **before** anything is restarted; then only `product-catalog`
+and `otel-collector` are restarted in place - the scope
+[D29](decisions/D29-a-restart-is-allowed-only-after-the-state-it-replaces-is-captured.md) allows, and the
+one whose evidence ([E28](../03%20Experiment%20Log.md), [E29](../03%20Experiment%20Log.md), and the
+retained health log above) shows the catalog serving again - the same readings are taken again, and only
+if the catalog then reports **healthy** from its own `grpc_health_probe` does the block refresh the
+endpoints and run the checkout capture. A container outside that named pair stops the run instead of
+widening the restart.
+
+```bash
+( set -euo pipefail
+  cd /home/brentiburo/projects/OpsAccord
+  deactivate 2>/dev/null || true
+  source .venv/bin/activate
+  export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+  PYTHON="$PWD/.venv/bin/python"
+  TS="$(date -u +%Y%m%dT%H%M%S)"; LOGDIR=".local/user-baseline-$TS"; mkdir -p "$LOGDIR"
+  export OPSACCORD_DOCKER_BIN="${OPSACCORD_DOCKER_BIN:-/mnt/c/Users/admin/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe}"
+  echo "interpreter: $("$PYTHON" -c 'import sys; print(sys.executable)')"
+  echo "tested revision: $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD)"
+  echo "evidence dir: $LOGDIR"
+  echo "Docker Desktop must already be running: this block starts no desktop and stops if the engine does not answer."
+  echo "The cluster and all 25 demo containers were already running when this block was written; stage 1 should verify and start nothing."
+
+  echo "--- 0. preserve what this shell sees, before anything is started ---"
+  git status --porcelain=v1 | tee "$LOGDIR/00-git-status.log"
+  if [ -e .local/pg/data/postmaster.pid ]; then
+    cp -p .local/pg/data/postmaster.pid "$LOGDIR/00-postmaster.pid.before"
+    echo "preserved .local/pg/data/postmaster.pid"
+  else
+    echo "no .local/pg/data/postmaster.pid to preserve"
+  fi
+  find .local/pg/data -maxdepth 1 -name 'postmaster.pid' -printf '%p %s bytes %TY-%Tm-%TdT%TH:%TM:%TS\n' | tee "$LOGDIR/00-pidfile.log"
+  if [ -f .local/pg/postgres.log ]; then
+    cp -p .local/pg/postgres.log "$LOGDIR/00-postgres.log.before"
+    tail -n 40 .local/pg/postgres.log | tee "$LOGDIR/00-postgres-log-tail-before.log"
+  fi
+  if [ -f .local/demo-endpoints.env ]; then
+    cp -p .local/demo-endpoints.env "$LOGDIR/00-demo-endpoints.env.before"
+    echo "preserved the endpoint file as it stands"
+  else
+    echo "no .local/demo-endpoints.env yet"
+  fi
+
+  echo "--- 1. the cluster's state, established before any lifecycle command ---"
+  set +e
+  bash scripts/pg.sh status 2>&1 | tee "$LOGDIR/01-pg-status.log"; pg_rc=${PIPESTATUS[0]}
+  set -e
+  echo "pg.sh status exited $pg_rc (0 running, 3 stopped, 4 unknown)"
+  case "$pg_rc" in
+    0) echo "running: ensure verifies it and starts nothing"
+       bash scripts/pg.sh ensure 2>&1 | tee "$LOGDIR/02-pg-ensure.log" ;;
+    3) echo "provably stopped: ensure starts it once"
+       bash scripts/pg.sh ensure 2>&1 | tee "$LOGDIR/02-pg-ensure.log"
+       echo "--- what that start logged; a clean start is not proof of data integrity ---"
+       tail -n 40 .local/pg/postgres.log | tee "$LOGDIR/03-pg-recovery.log" ;;
+    *) echo "STOP: pg.sh status exited $pg_rc (unknown), so this shell cannot establish the cluster's state and no start or stop is safe from it. Send $LOGDIR back." >&2
+       exit 1 ;;
+  esac
+
+  echo "--- 2. connectivity, the three databases, and their real rows ---"
+  bash scripts/pg.sh status 2>&1 | tee "$LOGDIR/04-pg-after.log"
+  set -- "$(bash scripts/pg.sh url dev)" "$(bash scripts/pg.sh url test)" "$(bash scripts/pg.sh url scenario)"
+  "$PYTHON" - "$LOGDIR" "$@" <<'PY' 2>&1 | tee "$LOGDIR/05-pg-verify.log"
+import sys
+from pathlib import Path
+import psycopg
+from opsaccord.config import to_libpq_dsn
+from opsaccord.persistence.tables import Base
+targets = dict(zip(("dev", "test", "scenario"), sys.argv[2:5], strict=False))
+expected = set(Base.metadata.tables)
+checkpoints = {"checkpoints", "checkpoint_blobs", "checkpoint_writes"}
+failures, full_schema = [], 0
+for name, url in targets.items():
+    try:
+        with psycopg.connect(to_libpq_dsn(url), connect_timeout=10) as conn:
+            print(f"{name}: connected - {conn.execute('select version()').fetchone()[0].split(',')[0]}")
+            tables = {row[0] for row in conn.execute("select tablename from pg_tables where schemaname='public'")}
+            present = expected & tables
+            print(f"{name}: {len(tables)} public tables; {len(present)}/{len(expected)} domain tables; checkpoints {bool(checkpoints & tables)}")
+            if expected - present:
+                print(f"{name}: missing domain tables: {sorted(expected - present)}")
+            for table in ("incidents", "workflows", "tool_calls", "audit_events"):
+                if table in tables:
+                    print(f"{name}.{table}: {conn.execute(f'select count(*) from {table}').fetchone()[0]} rows")
+            full_schema += expected <= tables
+    except Exception as exc:
+        failures.append(f"{name}: {exc}"); print(f"{name}: FAILED - {exc}")
+print(f"databases reachable: {len(targets) - len(failures)}/{len(targets)}; holding the app's full schema: {full_schema}")
+if failures or not full_schema:
+    raise SystemExit(1)
+print("pg verification: OK")
+PY
+
+  echo "--- 3. the engine, then this project's own container state ---"
+  set +e
+  "$OPSACCORD_DOCKER_BIN" version --format '{{.Server.Version}}' >"$LOGDIR/06-docker-engine.log" 2>&1
+  engine_rc=$?
+  set -e
+  cat "$LOGDIR/06-docker-engine.log"
+  if [ "$engine_rc" -ne 0 ]; then
+    echo "STOP: the Docker engine did not answer, so nothing below was run. Start Docker Desktop, wait until it reports running, then re-run this whole block." >&2
+    exit 1
+  fi
+  set +e
+  bash scripts/demo.sh ensure 2>&1 | tee "$LOGDIR/07-demo-ensure.log"; ensure_rc=${PIPESTATUS[0]}
+  bash scripts/demo.sh inspect 2>&1 | tee "$LOGDIR/08-demo-inspect.log"; inspect_rc=${PIPESTATUS[0]}
+  set -e
+  echo "demo.sh ensure exited $ensure_rc (0 nothing to do; 1 a running container is unhealthy, and its health output, bounded log tail and the two CPU/memory samples are in $LOGDIR/07-demo-ensure.log)"
+  echo "demo.sh inspect exited $inspect_rc (0 every container reported its full state; 1 at least one was reported without its per-container detail)"
+  if [ "$inspect_rc" -ne 0 ]; then
+    echo "note: that is not fatal here - the capture below reads Jaeger's and flagd's own APIs, not this snapshot - but read 08-demo-inspect.log beside the capture when you send the evidence back." >&2
+  fi
+  if grep -E 'load-generator|checkout|payment|product-catalog' "$LOGDIR/08-demo-inspect.log" >"$LOGDIR/08b-key-containers.log"; then
+    cat "$LOGDIR/08b-key-containers.log"
+  else
+    echo "none of load-generator/checkout/payment/product-catalog appears in the inspect output (see 08-demo-inspect.log)"
+  fi
+
+  if [ "$ensure_rc" -eq 0 ]; then
+    echo "every container is running and healthy, so no restart is taken and the block goes straight to the endpoints"
+  else
+    echo "--- 3b. which container(s), and whether the in-place restart is the scoped action ---"
+    unhealthy_names="$(sed -n 's/^demo: [0-9][0-9]* container(s) are running but not healthy: //p' "$LOGDIR/07-demo-ensure.log" | tr '\n' ' ')"
+    echo "unhealthy: ${unhealthy_names:-<none named>}"
+    if [ -z "$unhealthy_names" ]; then
+      echo "STOP: demo.sh ensure refused but named no unhealthy container, so the subject of a restart is not established. Send $LOGDIR back." >&2
+      exit 1
+    fi
+    unexpected=""
+    for name in $unhealthy_names; do
+      case "$name" in
+        product-catalog|otel-collector) ;;
+        *) unexpected="$unexpected $name" ;;
+      esac
+    done
+    if [ -n "$unexpected" ]; then
+      echo "STOP: unhealthy container(s) outside D29's named pair:$unexpected. This pass scopes an in-place restart to product-catalog and otel-collector only, so nothing is restarted and nothing else is widened. Send $LOGDIR back." >&2
+      exit 1
+    fi
+    echo "the as-found readings are already written (07, 08, 08b), so the restart below cannot erase them."
+    echo "this is not a repair of a named cause: the memory deviation was refused by measurement (E28/D27), and what a restart replaces is a wedged process (D29)."
+    bash scripts/demo.sh restart product-catalog otel-collector 2>&1 | tee "$LOGDIR/08c-restart.log"
+    echo "--- 3c. the same readings again, bounded: is the catalog serving now? ---"
+    catalog_health=unknown
+    for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+      catalog_health="$("$OPSACCORD_DOCKER_BIN" inspect --format '{{$h := index .State "Health"}}{{if $h}}{{$h.Status}}{{else}}none{{end}}' product-catalog </dev/null)"
+      echo "reading $attempt of 12: product-catalog health=$catalog_health"
+      if [ "$catalog_health" = healthy ]; then break; fi
+      sleep 10
+    done
+    set +e
+    bash scripts/demo.sh stats product-catalog 2>&1 | tee "$LOGDIR/08e-stats-after.log"; stats_rc=${PIPESTATUS[0]}
+    bash scripts/demo.sh inspect 2>&1 | tee "$LOGDIR/08d-inspect-after.log"; after_rc=${PIPESTATUS[0]}
+    set -e
+    echo "after the restart: demo.sh stats exited $stats_rc, demo.sh inspect exited $after_rc (1 is the degraded-row status, not fatal here)"
+    if [ "$catalog_health" != healthy ]; then
+      echo "STOP: product-catalog did not report healthy within the bounded 120 s window after an in-place restart, so the baseline cannot be captured against a serving catalog. The before/after samples are in 07 and 08e, the before/after per-container state in 08 and 08d, the restart in 08c. Send $LOGDIR back." >&2
+      exit 1
+    fi
+    echo "product-catalog reports healthy from its own grpc_health_probe, which is a serving reading - the endpoint probe alone only ever proved a listener"
+  fi
+
+  echo "--- 4. endpoints, refreshed rather than inherited ---"
+  bash scripts/demo.sh endpoints 2>&1 | tee "$LOGDIR/09-endpoints.log"
+  test -s .local/demo-endpoints.env
+  for var in OPSACCORD_DEMO_MODE OPSACCORD_PROMETHEUS_BASE_URL OPSACCORD_JAEGER_BASE_URL OPSACCORD_FLAG_CONTROL_BASE_URL; do
+    grep -q "^$var=" .local/demo-endpoints.env || { echo "STOP: $var is missing from the refreshed endpoint file" >&2; exit 1; }
+  done
+  set -a; . .local/demo-endpoints.env; set +a
+  failed=()
+  for probe in "prometheus|$OPSACCORD_PROMETHEUS_BASE_URL/-/healthy" "jaeger|$OPSACCORD_JAEGER_BASE_URL/api/services" "flagd|$OPSACCORD_FLAG_CONTROL_BASE_URL/api/read"; do
+    name="${probe%%|*}"; url="${probe#*|}"
+    if curl -fsS --max-time 10 "$url" -o "$LOGDIR/probe-$name.json" 2>"$LOGDIR/probe-$name.err"; then
+      echo "ok   $name -> $url"
+    else
+      echo "FAIL $name -> $url ($(head -c 200 "$LOGDIR/probe-$name.err"))"; failed+=("$name")
+    fi
+  done
+  if [ "${#failed[@]}" -gt 0 ]; then echo "STOP: endpoints that did not answer: ${failed[*]}" >&2; exit 1; fi
+
+  echo "--- 5. the fresh baseline: a request that begins after this point, not one already in flight ---"
+  set +e
+  "$PYTHON" scripts/capture-baseline-checkout.py \
+      --deadline-seconds 180 --poll-interval-seconds 10 \
+      --out "reports/local/baseline-checkout-$TS.json" \
+      --log "reports/local/baseline-checkout-$TS.log" 2>&1 | tee "$LOGDIR/10-baseline-capture.log"
+  cap_rc=${PIPESTATUS[0]}
+  set -e
+  echo "capture exit: $cap_rc (0 verified, 1 not verified, 3 refused to start)"
+  echo "extract: reports/local/baseline-checkout-$TS.json"
+  echo "capture log: reports/local/baseline-checkout-$TS.log"
+  if [ "$cap_rc" -ne 0 ]; then
+    echo "Not verified on this run. The capture names which property failed and keeps the raw spans it did see: if it reports no trace arrived, the load generator's row is in $LOGDIR/08b-key-containers.log. Send $LOGDIR back with the two reports/local files rather than re-running blind." >&2
+  fi
+  echo "evidence: $LOGDIR"
+  exit "$cap_rc"
+)
+```
