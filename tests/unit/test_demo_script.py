@@ -1108,20 +1108,22 @@ def test_the_capture_block_reads_readiness_before_it_captures() -> None:
         assert mutating not in block, mutating
 
 
-def test_the_handed_off_block_runs_one_live_path_and_keeps_its_status() -> None:
-    """The handed-off artifact runs the focused live path, and hands the runner's status back.
+def test_the_handed_off_block_delegates_to_the_live_runner_and_keeps_its_status() -> None:
+    """The handed-off artifact runs live paths through the runner, and hands its status back.
 
     With the fault-free baseline verified, the next action moved from capturing to the
-    P1-01 live path, and this guard follows the artifact the user is asked to run. The
-    checks differ from the capture block's on purpose: a live scenario *does* start the
-    stack and inject a fault, so what has to hold is that it delegates that to the
-    runner - one scenario, the runner's own gates, the endpoint settings inside this
-    shell only - and that the block's exit status is the runner's, not `tee`'s. It must
-    not capture a baseline, and it must not restart the stack behind the runner's back.
+    live paths, and this guard follows the artifact the user is asked to run. The checks
+    differ from the capture block's on purpose: a live scenario *does* start the stack and
+    inject a fault, so what has to hold is that the block delegates that to the runner -
+    a `--scenario` selection or the full set, the runner's own gates, the endpoint
+    settings inside this shell only - and that the block's exit status is the runner's,
+    not `tee`'s. It must not capture a baseline, and it must not restart the stack behind
+    the runner's back. The scenario list is deliberately not pinned here: which paths
+    remain is a scheduling decision, while the guarantees below are not.
     """
     block = _report_bash_blocks()[-1]
 
-    assert "scripts/validate.sh --live --scenario P1-01" in block
+    assert re.search(r"scripts/validate\.sh --live( --scenario P1-\d\d)*\b", block)
     # The runner owns the stack and the fault; the block only reads health first.
     assert "scripts/demo.sh health" in block
     assert "capture-baseline-checkout.py" not in block

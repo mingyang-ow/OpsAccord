@@ -29,6 +29,8 @@
 
 | **Fault-free-baseline status (branch tip with this report)** | **PARTIAL** - the user's capture-only run at `63effae` returned `baseline_verified`, exit **0**: a fresh attempt (13.6 s past the boundary), all 6 flags safe and unchanged across both readings, no competing driver, the catalog and the `payment` edge on the path, and `explicit_success` satisfied by the caller's own `frontend` client span `11fb12ab7f0934a3` (`OK(rpc.grpc.status_code)`, the attempt's own parent reference, `ancestor` 1 hop, `correlated_caller`) with the attempt's `UNSET` left as written and **ERROR 0** on 121 spans. Re-derived from the run's extract here, and falsified by breaking the parent reference. **Payment recovery is still unverified and P1-01 has not run**, so Phase 1 stays PARTIAL. See "The option-B pass". |
 
+| **Live P1-01 status (branch tip with this report)** | **PARTIAL** - at `335a3af` the user's focused live run exited **0** and P1-01 **PASSED**: the fault was attributed on the caller's own `checkout-service -> payment-service` client spans (error_rate **0.5** against **0.0** before arming, while `payment`'s own probe stayed `SERVING` at `error_rate 0.0`), with **1** exact approval, **1** executed `disable_feature_flag` action, 0 forbidden actions, 0 duplicate side effects, `VERIFICATION_SUCCESS` after 6 settling attempts, `resolved_without_verification: false`, `simulated_evidence: 0`, and cleanup read back `paymentUnreachable=off`. Every other stage passed in the same run (offline 389/7 in both variants, integration 85, lint/format/types, the sensitivity harness as designed, 9/9 simulated). **Ad, Cart and metrics-timeout paths are still unrun**, so Phase 1 stays PARTIAL. See "The first live P1-01 pass". |
+
 `READY_FOR_DISCUSSION` means every executable technical gate in `docs/phase1.md`
 passed on this commit, including the four primary paths against the real isolated
 demo stack. It is **not** user acceptance, it is not permission to merge, and no
@@ -5217,9 +5219,10 @@ corresponding chapter carries this block and the next one, byte-identically.
 )
 ```
 
-### The one next action (host shell, one block)
+### The P1-01 block that was run (kept as the record)
 
-**The next action is the P1-01 live pass on this revision.** It is the block below, and it differs from the
+**This block was run on this revision and passed** (see "The first live P1-01 pass" below); it is kept
+here as the record of the command, and the block after it is the next action. It differs from the
 capture block in exactly the ways a live fault path requires. `scripts/validate.sh --live --scenario P1-01`
 first runs the runner's own stages - the offline suite in both environment variants, lint, format, types,
 the integration suite, the pre-fix sensitivity harness and the nine simulated scenarios - and then one live
@@ -5287,6 +5290,112 @@ print("\n".join("%s=%s" % (name, (spec or {}).get("defaultVariant")) for name, s
 
   echo "evidence dir: $LOGDIR"
   echo "the path's own record: the newest reports/local/live-scenarios-*.json named in the runner's 13-live-paths.log"
+  echo "send back $LOGDIR, that JSON, and the runner's reports/local/validation-*/summary.log"
+  exit "$rc"
+)
+```
+
+## The first live P1-01 pass (`335a3af` measured) - the Payment path attributes, escalates, remediates and verifies
+
+The user ran the handed-off block on this revision. `scripts/validate.sh --live --scenario P1-01` exited
+**0** and every stage passed. **The measurement is the user's host run**; everything below was read from the
+evidence that run wrote (`reports/local/validation-20261015T120321/`,
+`reports/local/live-scenarios-20261015T120321.json`, and the run's own staged logs).
+
+| Stage | Result |
+| --- | --- |
+| 02 / 03 offline suite, both environment variants | **389 passed, 7 skipped, 85 deselected**, in both |
+| 04 / 05 / 06 lint, format, types | `All checks passed!` / 95 files already formatted / 42 source files clean |
+| 07 integration | **85 passed**, 396 deselected |
+| 08 sensitivity harness | as designed: **2 failed at `5cbcce2`** (the two defect tests it exists to catch), **3 passed at `HEAD`** |
+| 09 simulated scenarios | **9/9 passed** |
+| 11 demo stack | the log is empty - the health probe answered, so nothing was started or restarted |
+| 13 live path P1-01 | **PASS / RESOLVED / 1 action / 161.3 s** |
+
+The path itself, from `reports/local/live-scenarios-20261015T120321.json`:
+
+| Field | Reading |
+| --- | --- |
+| Outcome | `PASS`, `final_status: RESOLVED`, stage `complete`, incident `inc_01M4ZQ7G20EYXF7V7PEQCW48KX` |
+| Fault visibility | attribution `dependency`: the `checkout-service -> payment-service` **client** spans read **error_rate 0.5** (0.0667 calls/s) against **0.0** before arming, while the target's own probe read `SERVING` with `error_rate 0.0` **before and during** the fault; `checkout`'s own probe flipped to `NOT_SERVING` (error_rate 0.5) |
+| Approvals / actions | **1 exact approval**, **1 executed action**, 0 forbidden actions, 0 duplicate side effects |
+| Verification | `VERIFICATION_SUCCESS` after 6 settling attempts x 30 s |
+| Not simulated | `simulated: false`, `simulated_evidence: 0`, `resolved_without_verification: false` |
+| Cleanup | `paymentUnreachable restored to 'off' (was 'off'); read back 'off'`; the user's read-back shows all 18 flags `off` |
+
+**What the passing verification actually required.** Recovery is verified on the path the incident was
+diagnosed on, not on the target's own probe. `verify_service` reads the target's health and metrics *and* -
+because `DEPENDENCY_EDGES` maps `checkout-service -> payment-service` (`Charge`) - reads the caller's own
+client-span edge and classifies it: attributable, a usable window, **non-zero** calls, and a failure share
+below `TELEMETRY_ERROR_BOUND = 0.05`. A failing edge is `VERIFICATION_FAILURE` and an unproven one is
+`VERIFICATION_INCONCLUSIVE`, neither of which is `RESOLVED`. So this PASS cannot come from a target that
+merely *looks* healthy while the caller still cannot reach it - which is exactly the state this fault
+produces, since `payment`'s own probe never moved.
+
+**What this is not.** The executed remediation is `apply_remediation` with
+`remediation_id="disable_feature_flag"`, and the fault is injected by that same flag. The run therefore
+demonstrates the whole live loop - attribute from the caller's spans, diagnose, require exact approval, act
+once, verify on the edge rather than on the target, restore, read the flags back - and it does not
+demonstrate repair of a fault the controller cannot itself undo. Phase 1 still needs the Ad, Cart and
+metrics-timeout paths, and one passing path is not the phase.
+
+### The one next action (host shell, one block)
+
+**The next action is the six live paths P1-01 did not cover** (P1-02 .. P1-07), which is what the block
+below runs: one `validate.sh` invocation, the same runner stages and gates as the P1-01 pass above, and the
+runner's own status rather than the pipe's. It **starts** PostgreSQL and, if the stack is not answering, the
+stack itself, and it **injects a fault per path** - the same deliberate difference from the capture block
+described above. A path whose plan ends at a human decision reports that as its status instead of
+resolving, which is not a failure of the path. `UV_CACHE_DIR=/tmp/uvcache scripts/validate.sh --live` (the
+full seven, re-running P1-01) is the alternative once these hold.
+
+```bash
+( set -euo pipefail
+  cd /home/brentiburo/projects/OpsAccord
+  deactivate 2>/dev/null || true
+  source .venv/bin/activate
+  export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+  export UV_CACHE_DIR=/tmp/uvcache
+  PYTHON="$PWD/.venv/bin/python"
+  TS="$(date -u +%Y%m%dT%H%M%S)"; LOGDIR=".local/user-live-remaining-$TS"; mkdir -p "$LOGDIR"
+  echo "interpreter: $("$PYTHON" -c 'import sys; print(sys.executable)')"
+  echo "tested revision: $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD)"
+  echo "evidence dir: $LOGDIR"
+  echo "This block runs the six live paths P1-01 did not cover. Each arms its own fault and is expected to restore it; a path whose plan ends at a human decision reports that as its status rather than resolving, which is not a failure of the path."
+
+  echo "--- 0. what this shell already sees, and the stack as it stands ---"
+  git status --porcelain=v1 | tee "$LOGDIR/00-git-status.log"
+  set +e
+  bash scripts/demo.sh health 2>&1 | tee "$LOGDIR/00-demo-health.log"; health_rc=${PIPESTATUS[0]}
+  set -e
+  echo "demo.sh health exited $health_rc (0 every published port and adapter API answered; 1 at least one did not)"
+  echo "this preflight only reports: the runner has its own stack stage and starts the stack there if it is not answering"
+
+  echo "--- 1. the remaining live paths, P1-02..P1-07, with progress and the runner's own gates ---"
+  set +e
+  scripts/validate.sh --live --scenario P1-02 --scenario P1-03 --scenario P1-04 --scenario P1-05 --scenario P1-06 --scenario P1-07 2>&1 | tee "$LOGDIR/10-live-remaining.log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  echo "validate exit: $rc (0 every stage passed; 2 usage; 3 a competing driver; anything else is the failing stage's own status)"
+  echo "runner logs: $(sed -n 's/^logs: //p' "$LOGDIR/10-live-remaining.log" | head -1)"
+
+  echo "--- 2. cleanup, read back from the flag store (read-only GET) ---"
+  set +e
+  if [ -f .local/demo-endpoints.env ]; then
+    set -a; . .local/demo-endpoints.env; set +a
+    "$PYTHON" -c 'import json, os, urllib.request as u
+base = os.environ["OPSACCORD_FLAG_CONTROL_BASE_URL"].rstrip("/")
+doc = json.load(u.urlopen(base + "/api/read", timeout=10))
+flags = doc.get("flags", {})
+print("\n".join("%s=%s" % (name, (spec or {}).get("defaultVariant")) for name, spec in sorted(flags.items())))' 2>&1 | tee "$LOGDIR/20-flags-after.log"
+    echo "every fault flag should read off above: each path arms one and the driver restores it, so a flag left on is a finding rather than a detail"
+  else
+    echo "no .local/demo-endpoints.env; the runner's endpoints stage writes it" | tee "$LOGDIR/20-flags-after.log"
+  fi
+  set -e
+
+  echo "evidence dir: $LOGDIR"
+  echo "the paths' own records: the newest reports/local/live-scenarios-*.json named in the runner's 13-live-paths.log"
   echo "send back $LOGDIR, that JSON, and the runner's reports/local/validation-*/summary.log"
   exit "$rc"
 )
