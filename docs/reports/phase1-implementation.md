@@ -5243,6 +5243,11 @@ failed stage is neither hidden by `tee` nor reported as the block's own outcome.
 directory, the newest `reports/local/live-scenarios-*.json` and the runner's `validation-*/summary.log` is
 what makes the run reviewable here; the flag read-back is the cleanup evidence.
 
+**One note inside this record is superseded by the block that follows.** The record reads exit `2` as
+usage alone; `2` can also be the live driver's own preflight refusing to start because the demo stack did
+not answer it, which is why the block after this one decodes it. The command sequence is unchanged from the
+revision that ran it.
+
 ```bash
 ( set -euo pipefail
   cd /home/brentiburo/projects/OpsAccord
