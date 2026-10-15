@@ -344,6 +344,28 @@ read as a sufficient answer and two retrieved traces are never read as a stateme
 dependency. It issues HTTP GETs only, arms no flag, runs no scenario, and so has nothing to
 restore.
 
+`scripts/capture-baseline-checkout.py` is its fault-free counterpart, added 2026-10-15. The
+exporter above asks what went wrong *while a fault was armed*, which is the right question for
+a diagnosis and the wrong one for a baseline: every live entry point in the tree arms a fault
+(`scripts/validate.sh --live` runs the seven `LIVE_PLANS`, and each one injects a fault), so
+nothing could demonstrate that the unfaulted demo still completes a checkout. The capture
+queries `checkout` traces over an explicit interval, reconstructs each request path from the
+payload's own parent references, and passes a trace only when four properties hold together:
+the entry operation's own *server* span is present; `product-catalog` *served* a
+`ProductCatalogService` call on that path; a `payment` *server* span for
+`oteldemo.PaymentService/Charge` sits on that path as a direct child or descendant of the
+attempt rather than in an unrelated branch; and the entry and edge spans both record `OK` with
+a named status source while no span on the reconstructed path records `ERROR`. A fifth gate
+reads the flag document from flagd-ui and requires every fault flag in `FLAG_SAFE_VARIANT` at
+its safe variant, because a checkout that "succeeds" with a fault armed is not a baseline - a
+document that could not be read is reported as unverified rather than as safe. Each property is
+reported separately with the evidence that decided it, so a failed capture names what was
+missing instead of returning one undifferentiated "no": unreached edge, client-only edge span,
+edge in another branch, `UNSET` status and an empty interval are five different findings. It
+writes sanitized raw spans (ids, parent references, service, span kind, start/end in
+microseconds, duration, status and its source, message, relationship and hops) to JSON and a
+human-readable log, arms no flag, starts nothing, and exits 0 only for a verified baseline.
+
 Three things are resolved from the payload's own `CHILD_OF` references rather than assumed,
 because an operation name is not a span identity: a caller's *client* span and the callee's
 *server* span for one operation carry the same name, and `frontend` and `checkout` both export

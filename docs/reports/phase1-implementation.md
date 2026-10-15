@@ -3665,3 +3665,242 @@ PY
   echo "Evidence: $LOGDIR"
 )
 ```
+
+## The baseline-capture pass (this commit, resuming on `c33b81e`) - the fault-free baseline had no entry point, so one was built and the live run is handed off
+
+This pass resumed on `c33b81e` (the `scripts/pg.sh` lifecycle guard) and worked the task's parts 1-3
+read-only, then ran into the same wall the previous pass did: **this shell cannot start PostgreSQL and
+cannot reach Docker**, so the demo baseline and the Checkout -> Payment capture cannot be measured
+from here. What it could do is remove the reason the capture could not be *attempted* at all, which is
+a real gap in the tree rather than a limitation of the environment.
+
+### Every live entry point arms a fault, so nothing could demonstrate a baseline
+
+`src/opsaccord/scenarios/live.py` holds seven `LIVE_PLANS`, and every one injects a fault: P1-01, P1-05,
+P1-06 and P1-07 arm `paymentUnreachable`, P1-02 arms `adHighCpu`, P1-03 arms `cartFailure=100%`, and
+P1-04 makes telemetry unroutable. `scripts/validate.sh --live` runs those plans, so the documented live
+path can only answer "what does the system do when something is broken" - it has no way to answer "does
+the unfaulted path still complete a checkout". The trace exporter
+(`scripts/diagnose-payment-trace-path.py`) is fault-oriented in the same way: it is at its best
+describing a *failing* request, and its findings are about an absent or failing edge.
+
+That is the gap this pass closes, because the task's part 5 asks precisely for the fault-free case with
+raw evidence.
+
+### `scripts/capture-baseline-checkout.py` - read-only, and it refuses more than it accepts
+
+The new capture takes an explicit `--start`/`--end` (or `--lookback-minutes`) and does three things:
+it queries Jaeger for `checkout` traces in that interval, reconstructs each trace's request path from
+the payload's own parent references via `opsaccord.tools.fault_evidence.summarize_trace`, and passes a
+trace only when all of the following hold, each recorded separately with the evidence that decided it:
+
+- **`checkout_entry_span`** - the entry operation resolved to its own *server* span, not the caller's
+  identically named client span one level above it;
+- **`product_catalog_reached`** - `product-catalog` **served** a `ProductCatalogService` call on the
+  attempt's own path. A caller-side client span is recorded as exactly that: it says the call was made,
+  not that the catalog answered;
+- **`payment_charge_on_path`** - a `payment` *server* span for `oteldemo.PaymentService/Charge` whose
+  relationship to the attempt is `direct_child` or `descendant`. A Charge span in an unrelated branch,
+  or one whose ancestry is unresolved, is reported with that relationship named;
+- **`explicit_success`** - the entry and edge spans both record `OK` with a named status source
+  (`otel.status_code`, a gRPC code, and so on), and no span on the reconstructed path records `ERROR`.
+  `UNSET` is reported as `UNSET`: a span that wrote no status is not a success;
+- **`fault_flags_safe`** - the flag document read from flagd-ui holds every flag in `FLAG_SAFE_VARIANT`
+  at its safe variant. A document that could not be read is reported as *unverified*, never as safe.
+
+Refusals are distinguished rather than flattened: an empty interval, a failed query, an unreached edge,
+a client-only edge span, an edge in another branch and an unread flag document each produce their own
+named blocking reason, so the next run has something to act on. It writes sanitized **raw** spans -
+`span_id`, `parent_span_id`, service, operation, span kind, start/end in microseconds, duration, status
+and its source, message, relationship and hop count - to the JSON extract, and the same evidence as a
+human-readable log; `--out` and `--log` are the only files it writes. It arms no flag, starts no
+container, restarts nothing, and calls no service directly. What it will *not* claim is written into the
+extract's `limits`: an empty query is not health, `UNSET` is not success, and one verified trace
+describes the interval it was captured in - it is not sustained reliability and it is not a P1-01 result.
+
+### Regression coverage: `tests/unit/test_baseline_checkout_capture.py`
+
+Nineteen offline cases. The fixtures are built to be wrong one property at a time - a trace that never
+reached the edge, one whose Payment span hangs off a branch the attempt never called, one whose Payment
+span wrote no status, one where the catalog call exists only as the caller's client span, one whose
+entry resolved to a client span, one with an `ERROR` span on the path, and a stale span outside the
+window. Each must fail, must name the right reason, and must not report a verified baseline.
+
+The falsification is explicit: **`test_the_gate_would_catch_a_relationship_blind_variant`** shows that
+the *same* unrelated-branch fixture is rejected while the relationship requirement stands, and accepted
+once that requirement is patched away - so the requirement is load-bearing rather than decorative. The
+command's own contract is covered too: it refuses to start without a Jaeger endpoint (exit 3), rejects
+an out-of-range limit (exit 2), writes both artefacts on a verified baseline, reports an empty interval
+as `not_verified_no_trace_in_interval` rather than as health, records a failed query as a failure rather
+than as an empty result, respects the queried window, and lets an armed flag block the verdict.
+
+### Executed in this session
+
+| Check | Result |
+| --- | --- |
+| `tests/unit/test_baseline_checkout_capture.py` | **19 passed** |
+| Offline suite, `-m "not integration"` | **323 passed, 7 skipped, 85 deselected** (was 304 passed, 7 skipped, 85 deselected at `c33b81e`; +19 cases here) |
+| `ruff check .` / `ruff format --check .` | clean / 95 files already formatted |
+| `mypy src/opsaccord` | `Success: no issues found in 42 source files` |
+| `mypy scripts/capture-baseline-checkout.py` | `Success: no issues found in 1 source file` |
+| `bash -n` on the block below | clean |
+| The capture against an unreachable endpoint (smoke) | exits 1, verdict `not_verified_query_failed`, records three query failures and the unread flag document, writes both artefacts |
+| `bash scripts/pg.sh status` (this sandbox, real data directory) | `[pg] state unknown: ...`, exit **4**; the guard refuses, and nothing was started, stopped or written |
+
+### Not run, and why
+
+- **PostgreSQL recovery** - `pg.sh status` exits **4** here, so this shell cannot establish the cluster's
+  state and no start is safe from it. The cluster is *stopped as far as the recorded evidence goes*: the
+  last line of `.local/pg/postgres.log` is `2026-09-29 23:23:41.437 +08 [55881] LOG: received smart
+  shutdown request` with no following `shut down` line, the pid file still holds PID 55881 with mode
+  `-rw-------`, and `kill -0 55881` cannot see that process from here. So the next start will do crash
+  recovery again - which is authorized, and is *recovery-boundary* recovery, not proof of complete data
+  integrity.
+- **Docker, the demo baseline and the Checkout -> Payment capture** - `docker` is not resolvable in this
+  WSL distro at all (`The command 'docker' could not be found in this WSL 2 distro`), and every loopback
+  connect is denied (`bash: /dev/tcp/127.0.0.1/55432: Operation not permitted`), so nothing live can be
+  measured here.
+- **P1-01 and any recovery measurement** - unchanged. **Phase 1 remains PARTIAL**: the fault-free
+  baseline and the fault run are both still unmeasured on this revision.
+
+### The one next action (host shell, one block)
+
+Start Docker Desktop first - the block checks the engine before touching the demo, and the previous
+attempt died on `the Docker engine did not answer`. This block preserves the stale pid file and the log
+tail *before* anything starts, establishes the cluster's state and acts on `0`/`3`/`4`, verifies the
+three databases and their real rows, starts only the demo services that are missing (never `down`, never
+a volume), refreshes the endpoints rather than inheriting them, asserts the three HTTP endpoints answer,
+and then runs the new capture and keeps its exit status as the block's own.
+
+```bash
+( set -euo pipefail
+  cd /home/brentiburo/projects/OpsAccord
+  deactivate 2>/dev/null || true
+  source .venv/bin/activate
+  export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+  PYTHON="$PWD/.venv/bin/python"
+  TS="$(date -u +%Y%m%dT%H%M%S)"; LOGDIR=".local/user-baseline-$TS"; mkdir -p "$LOGDIR"
+  DOCKER_BIN="${OPSACCORD_DOCKER_BIN:-/mnt/c/Users/admin/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe}"
+  echo "interpreter: $("$PYTHON" -c 'import sys; print(sys.executable)')"
+  echo "tested revision: $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD)"
+  echo "evidence dir: $LOGDIR"
+  echo "Docker Desktop must already be running: this block starts no desktop and stops if the engine does not answer."
+
+  echo "--- 0. preserve what this shell sees before anything is started ---"
+  git status --porcelain=v1 | tee "$LOGDIR/00-git-status.log"
+  if [ -e .local/pg/data/postmaster.pid ]; then
+    cp -p .local/pg/data/postmaster.pid "$LOGDIR/00-postmaster.pid.before"
+    echo "preserved .local/pg/data/postmaster.pid to $LOGDIR/00-postmaster.pid.before"
+  else
+    echo "no .local/pg/data/postmaster.pid to preserve" | tee "$LOGDIR/00-postmaster.pid.before"
+  fi
+  { find .local/pg/data -maxdepth 1 -name 'postmaster.pid' -printf '%p %s bytes %TY-%Tm-%TdT%TH:%TM:%TS\n'; find .local/pg/run -maxdepth 1 -printf '%p\n'; } 2>/dev/null | tee "$LOGDIR/00-pid-and-socket.log"
+  if [ -f .local/pg/postgres.log ]; then tail -n 60 .local/pg/postgres.log | tee "$LOGDIR/00-postgres-log-tail-before.log"; fi
+
+  echo "--- 1. the cluster's state, established before anything is started ---"
+  set +e
+  bash scripts/pg.sh status 2>&1 | tee "$LOGDIR/01-pg-status.log"; pg_rc=${PIPESTATUS[0]}
+  set -e
+  echo "pg.sh status exited $pg_rc (0 running, 3 stopped, 4 unknown)"
+  case "$pg_rc" in
+    0) echo "already running: nothing is started; it is verified below" ;;
+    3) echo "stopped, and this shell can see that: starting exactly once"
+       bash scripts/pg.sh start 2>&1 | tee "$LOGDIR/02-pg-start.log"
+       tail -n 40 .local/pg/postgres.log | tee "$LOGDIR/03-pg-recovery.log" ;;
+    *) echo "STOP: pg.sh status exited $pg_rc, so this shell cannot establish the cluster's state and no start is safe from it. Send $LOGDIR/01-pg-status.log back." >&2
+       exit 1 ;;
+  esac
+
+  echo "--- 2. what was recovered: connectivity, the three databases, real rows ---"
+  bash scripts/pg.sh status 2>&1 | tee "$LOGDIR/04-pg-after.log"
+  set -- "$(bash scripts/pg.sh url dev)" "$(bash scripts/pg.sh url test)" "$(bash scripts/pg.sh url scenario)"
+  "$PYTHON" - "$LOGDIR" "$@" <<'PY' 2>&1 | tee "$LOGDIR/05-pg-verify.log"
+import sys
+from pathlib import Path
+import psycopg
+from opsaccord.config import to_libpq_dsn
+from opsaccord.persistence.tables import Base
+targets = dict(zip(("dev", "test", "scenario"), sys.argv[2:5], strict=False))
+expected = set(Base.metadata.tables)
+checkpoints = {"checkpoints", "checkpoint_blobs", "checkpoint_writes"}
+failures, full_schema = [], 0
+for name, url in targets.items():
+    try:
+        with psycopg.connect(to_libpq_dsn(url), connect_timeout=10) as conn:
+            print(f"{name}: connected - {conn.execute('select version()').fetchone()[0].split(',')[0]}")
+            tables = {row[0] for row in conn.execute("select tablename from pg_tables where schemaname='public'")}
+            present = expected & tables
+            print(f"{name}: {len(tables)} public tables; {len(present)}/{len(expected)} domain tables; checkpoints {bool(checkpoints & tables)}")
+            if expected - present:
+                print(f"{name}: missing domain tables: {sorted(expected - present)}")
+            for table in ("incidents", "workflows", "tool_calls", "audit_events"):
+                if table in tables:
+                    print(f"{name}.{table}: {conn.execute(f'select count(*) from {table}').fetchone()[0]} rows")
+            full_schema += expected <= tables
+    except Exception as exc:
+        failures.append(f"{name}: {exc}"); print(f"{name}: FAILED - {exc}")
+print(f"databases reachable: {len(targets) - len(failures)}/{len(targets)}; holding the app's full schema: {full_schema}")
+if failures or not full_schema:
+    raise SystemExit(1)
+print("pg verification: OK")
+PY
+
+  echo "--- 3. the demo stack: the engine first, then only what is missing ---"
+  if [ ! -x "$DOCKER_BIN" ] || ! "$DOCKER_BIN" version --format '{{.Server.Version}}' >"$LOGDIR/06-docker-engine.log" 2>&1; then
+    echo "STOP: the Docker engine did not answer, so nothing below was run. Start Docker Desktop, wait until it reports running, then re-run this whole block." >&2
+    tail -n 20 "$LOGDIR/06-docker-engine.log" >&2
+    exit 1
+  fi
+  set +e
+  bash scripts/demo.sh health 2>&1 | tee "$LOGDIR/07-demo-health.log"; health_rc=${PIPESTATUS[0]}
+  set -e
+  if [ "$health_rc" -eq 0 ]; then
+    echo "every documented endpoint answers: no service is started, none is restarted"
+  else
+    echo "not every endpoint answers ($health_rc): 'compose up -d --no-build' fills in only what is missing (no 'down', no volumes, no limit changes)"
+    bash scripts/demo.sh start 2>&1 | tee "$LOGDIR/08-demo-start.log"
+    bash scripts/demo.sh health 2>&1 | tee "$LOGDIR/09-demo-health-after.log"
+  fi
+  bash scripts/demo.sh inspect 2>&1 | tee "$LOGDIR/10-demo-inspect.log"
+  if grep -E 'load-generator|checkout|payment|product-catalog' "$LOGDIR/10-demo-inspect.log" >"$LOGDIR/10b-key-containers.log"; then
+    cat "$LOGDIR/10b-key-containers.log"
+  else
+    echo "none of load-generator/checkout/payment/product-catalog appears in the inspect output (see 10-demo-inspect.log)"
+  fi
+
+  echo "--- 4. endpoints, refreshed rather than inherited ---"
+  bash scripts/demo.sh endpoints 2>&1 | tee "$LOGDIR/11-endpoints.log"
+  test -s .local/demo-endpoints.env
+  for var in OPSACCORD_DEMO_MODE OPSACCORD_PROMETHEUS_BASE_URL OPSACCORD_JAEGER_BASE_URL OPSACCORD_FLAG_CONTROL_BASE_URL; do
+    grep -q "^$var=" .local/demo-endpoints.env || { echo "STOP: $var is missing from the refreshed endpoint file" >&2; exit 1; }
+  done
+  set -a; . .local/demo-endpoints.env; set +a
+  failed=()
+  for probe in "prometheus|$OPSACCORD_PROMETHEUS_BASE_URL/-/healthy" "jaeger|$OPSACCORD_JAEGER_BASE_URL/api/services" "flagd|$OPSACCORD_FLAG_CONTROL_BASE_URL/api/read"; do
+    name="${probe%%|*}"; url="${probe#*|}"
+    if curl -fsS --max-time 10 "$url" -o "$LOGDIR/probe-$name.json" 2>"$LOGDIR/probe-$name.err"; then
+      echo "ok   $name -> $url"
+    else
+      echo "FAIL $name -> $url ($(head -c 200 "$LOGDIR/probe-$name.err"))"; failed+=("$name")
+    fi
+  done
+  if [ "${#failed[@]}" -gt 0 ]; then echo "STOP: endpoints that did not answer: ${failed[*]}" >&2; exit 1; fi
+
+  echo "--- 5. the baseline: one fault-free Checkout -> Payment request, from Jaeger ---"
+  set +e
+  "$PYTHON" scripts/capture-baseline-checkout.py \
+      --lookback-minutes 30 \
+      --out "reports/local/baseline-checkout-$TS.json" \
+      --log "reports/local/baseline-checkout-$TS.log" 2>&1 | tee "$LOGDIR/12-baseline-capture.log"
+  cap_rc=${PIPESTATUS[0]}
+  set -e
+  echo "capture exit: $cap_rc (0 verified, 1 not verified, 3 refused to start)"
+  echo "extract: reports/local/baseline-checkout-$TS.json"
+  echo "capture log: reports/local/baseline-checkout-$TS.log"
+  if [ "$cap_rc" -ne 0 ]; then
+    echo "Not verified on this run. The capture names which property failed; if it says the interval held no trace, the load generator's row is in 10b-key-containers.log. Send $LOGDIR back with the two reports/local files rather than re-running blind." >&2
+  fi
+  echo "evidence: $LOGDIR"
+  exit "$cap_rc"
+)
+```
