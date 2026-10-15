@@ -49,7 +49,50 @@ case "$argv0" in
   version) printf '29.7.2\\n' ;;
   ps)
     if [ -n "${STUB_NO_CONTAINERS:-}" ]; then exit 0; fi
-    printf '%s\\n' "product-catalog" "checkout" ;;
+    # Rows are "project|service|id|name" and the --filter arguments are honoured rather
+    # than ignored: a test that puts a *second* project's container in the engine, or a
+    # second container with the same service label in this one, is only meaningful if
+    # the exclusion comes from the filter.
+    project="${OPSACCORD_DEMO_PROJECT:-opsaccord-demo}"
+    rows=(
+      "$project|product-catalog|9f2c1b7a0011|product-catalog"
+      "$project|checkout|5a1e0c9d0022|checkout"
+    )
+    if [ -n "${STUB_NAMES_DIFFER:-}" ]; then
+      rows=(
+        "$project|product-catalog|9f2c1b7a0011|demo-catalog-1"
+        "$project|checkout|5a1e0c9d0022|checkout"
+      )
+    fi
+    if [ -n "${STUB_COLLECTOR:-}" ]; then
+      rows+=("$project|otel-collector|7d3f8e2a0033|otel-collector")
+    fi
+    if [ -n "${STUB_SECOND_PROJECT:-}" ]; then
+      rows+=("$STUB_SECOND_PROJECT|product-catalog|deadbeef0044|product-catalog")
+    fi
+    if [ -n "${STUB_DUPLICATE_SERVICE:-}" ]; then
+      rows+=("$project|$STUB_DUPLICATE_SERVICE|beefca110055|second-$STUB_DUPLICATE_SERVICE")
+    fi
+    want_project=""; want_service=""; want_id=0
+    for arg in "$@"; do
+      case "$arg" in
+        label=com.docker.compose.project=*)
+          want_project="${arg#label=com.docker.compose.project=}" ;;
+        label=com.docker.compose.service=*)
+          want_service="${arg#label=com.docker.compose.service=}" ;;
+        *'{{.ID}}'*) want_id=1 ;;
+      esac
+    done
+    for row in "${rows[@]}"; do
+      IFS='|' read -r rproject rservice rid rname <<<"$row"
+      if [ -n "$want_project" ] && [ "$rproject" != "$want_project" ]; then continue; fi
+      if [ -n "$want_service" ] && [ "$rservice" != "$want_service" ]; then continue; fi
+      if [ "$want_id" = 1 ]; then
+        printf '%s %s\\n' "$rid" "$rname"
+      else
+        printf '%s\\n' "$rname"
+      fi
+    done ;;
   inspect)
     if [ -n "${STUB_EATS_STDIN:-}" ]; then cat >/dev/null; fi
     if [ -n "${STUB_INSPECT_RC:-}" ]; then exit "$STUB_INSPECT_RC"; fi
@@ -66,6 +109,30 @@ case "$argv0" in
     # `docker inspect` names a container with a leading slash; the helper is
     # expected to strip it, so the stub supplies it.
     container="$3"
+    # The caller may name a container or hand back the id a resolver returned; both
+    # are the same container, and the knobs below are written in terms of the
+    # *service*, so a test can say "the catalog is unhealthy" without having to know
+    # which of the two strings the helper chose.
+    case "$container" in
+      9f2c1b7a0011|product-catalog|demo-catalog-1) ckey=product-catalog ;;
+      5a1e0c9d0022|checkout) ckey=checkout ;;
+      7d3f8e2a0033|otel-collector) ckey=otel-collector ;;
+      *) ckey="$container" ;;
+    esac
+    # What the pinned revision configures: the catalog carries a `grpc_health_probe`
+    # check, the rest of the stack does not (`healthcheck=none` and `health=none` for
+    # the six containers the live 2026-10-15 inspect read that way).
+    case "$ckey" in
+      product-catalog) healthcheck='["CMD","/bin/grpc_health_probe","-addr=:3550"]' ;;
+      *) healthcheck=none ;;
+    esac
+    if [ -n "${STUB_HEALTHCHECK_ALL:-}" ]; then healthcheck="$STUB_HEALTHCHECK_ALL"; fi
+    case " ${STUB_NO_HEALTHCHECK:-} " in *" $ckey "*) healthcheck=none ;; esac
+    state=running
+    case "$healthcheck" in none) health=none ;; *) health=healthy ;; esac
+    case " ${STUB_STOPPED:-} " in *" $ckey "*) state=exited; health=none ;; esac
+    case " ${STUB_UNHEALTHY:-} " in *" $ckey "*) health=unhealthy ;; esac
+    case " ${STUB_HEALTH_STARTING:-} " in *" $ckey "*) health=starting ;; esac
     case "$*" in
       *HostConfig*)
         printf '/%s state=running health=unhealthy restarts=0 exit=0 ' "$container"
@@ -75,22 +142,31 @@ case "$argv0" in
       # bound with `index` (the key may be absent), so the template says `.Log`
       # rather than `.State.Health.Log`; either form answers here.
       *.Log*)
-        printf '[{"ExitCode":1,"Output":"failed to connect service :3550 '
-        printf 'within 1s"}]\\n' ;;
+        if [ -n "${STUB_HEALTH_LOG:-}" ]; then
+          printf '%s\\n' "$STUB_HEALTH_LOG"
+        else
+          printf '[{"ExitCode":1,"Output":"failed to connect service :3550 '
+          printf 'within 1s"}]\\n'
+        fi ;;
       *GOMEMLIMIT*) printf 'GOMEMLIMIT=16MiB\\n' ;;
-      # The degraded row `cmd_inspect` falls back to when the CLI refuses the
-      # per-container template: `docker inspect` cannot be asked for the fields
-      # that were just refused, so only the name and status are claimed.
-      *'state={{.State.Status}}'*)
-        printf '/%s state=running\\n' "$container" ;;
       # `demo.sh ensure` reads each container's own state plus its compose
       # *service* label, which is what it hands to `compose up`: upstream sets
       # `container_name:` on several services, so the two are not the same string.
-      *State.Status*)
-        state=running; health=healthy
-        case " ${STUB_STOPPED:-} " in *" $container "*) state=exited; health=none ;; esac
-        case " ${STUB_UNHEALTHY:-} " in *" $container "*) health=unhealthy ;; esac
+      *'index .Config "Labels"'*)
         printf '/%s %s %s %s\\n' "$container" "$state" "$health" "$container" ;;
+      # The project recheck's row: every container's state and health, by name.
+      *'index .State "Health"}}{{.Name}}'*)
+        printf '/%s %s %s\\n' "$container" "$state" "$health" ;;
+      # The degraded row `cmd_inspect` falls back to when the CLI refuses the
+      # per-container template: `docker inspect` cannot be asked for the fields
+      # that were just refused, so only the name and status are claimed.
+      *'{{.Name}} state={{.State.Status}}'*)
+        printf '/%s state=running\\n' "$container" ;;
+      # `verify-recovery` reads the configured check, the health status alone, and the
+      # state alone from the container it resolved.
+      *'index .Config "Healthcheck"'*) printf '%s\\n' "$healthcheck" ;;
+      *'index .State "Health"'*) printf '%s\\n' "$health" ;;
+      *'{{.State.Status}}'*) printf '%s\\n' "$state" ;;
     esac ;;
   pull)
     if [ -n "${STUB_EATS_STDIN:-}" ]; then cat >/dev/null; fi
@@ -105,6 +181,7 @@ case "$argv0" in
           printf 'compose: port lookup failed\\n' >&2
           exit "$STUB_COMPOSE_RC"
         fi
+        if [ -n "${STUB_NO_PORT:-}" ]; then exit 0; fi
         printf '0.0.0.0:65235\\n'
         exit 0 ;;
     esac
@@ -166,7 +243,7 @@ def _run(tmp_path: Path, *args: str, **extra: str) -> subprocess.CompletedProces
 
 
 def _probe_stubs(tmp_path: Path) -> Path:
-    """A bin directory whose ``curl`` and ``timeout`` always succeed.
+    """A bin directory whose ``curl`` and ``timeout`` stand in for the probes.
 
     ``demo.sh health`` decides its verdict from two external commands: ``curl`` for
     the HTTP checks, and ``timeout ... /dev/tcp`` for the TCP ones. This sandbox
@@ -174,13 +251,24 @@ def _probe_stubs(tmp_path: Path) -> Path:
     is under test is the helper's *decision* (was every container already up? which
     services did it start?), not the probe itself. Replacing the probe is the same
     seam the docker stub already uses; nothing about Docker or compose changes.
+
+    The curl stub answers with ``STUB_CURL_CODE`` and exits ``STUB_CURL_RC``, because
+    ``verify-recovery`` has to tell three things apart: an accepted OTLP export (200),
+    an answer that is not the documented one, and no answer at all. Its default is a
+    code no HTTP server sends, so a test that forgets to set it fails rather than
+    passing by accident.
     """
     bin_dir = tmp_path / "probe-bin"
     bin_dir.mkdir(exist_ok=True)
-    for name in ("curl", "timeout"):
-        stub = bin_dir / name
-        stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        stub.chmod(0o755)
+    curl = bin_dir / "curl"
+    curl.write_text(
+        '#!/usr/bin/env bash\nprintf \'%s\' "${STUB_CURL_CODE:-000}"\nexit "${STUB_CURL_RC:-0}"\n',
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    timeout = bin_dir / "timeout"
+    timeout.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    timeout.chmod(0o755)
     return bin_dir
 
 
@@ -587,3 +675,388 @@ def test_ensure_still_refuses_when_the_sample_pair_fails(tmp_path: Path) -> None
     assert "the sample pair exited 1" in result.stderr
     assert "STOP" in result.stderr
     assert _compose_up_args(tmp_path) == []
+
+
+# --- container identity: the compose labels, never a name ---------------------
+
+
+def test_service_container_resolves_by_project_and_service_label(tmp_path: Path) -> None:
+    """A container name is not an identity, and the block that was handed off assumed one.
+
+    The post-restart poll ran ``docker inspect ... product-catalog``. A name is global on
+    the engine: upstream pins ``container_name:`` on most services, so a second project -
+    or a differently-configured one - can hold the same string, and the poll would have
+    read *that* container's health. The identity this resolver uses is this project's
+    compose label plus ``com.docker.compose.service``, and what it hands back is the id,
+    so every later read names the container the engine resolved.
+    """
+    result = _run(tmp_path, "service-container", "product-catalog", "checkout")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "product-catalog\t9f2c1b7a0011 product-catalog",
+        "checkout\t5a1e0c9d0022 checkout",
+    ]
+    logged = _invocations(tmp_path, "ps")
+    assert len(logged) == 2, logged
+    assert "label=com.docker.compose.project=opsaccord-demo-script-test" in logged[0]
+    assert "label=com.docker.compose.service=product-catalog" in logged[0]
+    assert "label=com.docker.compose.service=checkout" in logged[1]
+
+
+def test_a_container_name_that_differs_from_its_service_still_resolves(tmp_path: Path) -> None:
+    """``container_name:`` is a deployment choice; the service label is the identity."""
+    result = _run(tmp_path, "service-container", "product-catalog", STUB_NAMES_DIFFER="1")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["product-catalog\t9f2c1b7a0011 demo-catalog-1"]
+
+
+def test_another_projects_container_with_the_same_name_is_not_a_candidate(tmp_path: Path) -> None:
+    """The project label is what makes the match unambiguous, so it is what is filtered."""
+    result = _run(
+        tmp_path,
+        "service-container",
+        "product-catalog",
+        STUB_SECOND_PROJECT="another-project",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["product-catalog\t9f2c1b7a0011 product-catalog"]
+    assert "deadbeef0044" not in result.stdout
+
+
+def test_a_service_the_project_does_not_hold_stops_instead_of_guessing(tmp_path: Path) -> None:
+    """Zero matches is not the same fact as a stopped container, and is not a fallback."""
+    result = _run(tmp_path, "service-container", "product-catalog", STUB_NO_CONTAINERS="1")
+
+    assert result.returncode == 1
+    assert "expected exactly one container for service product-catalog" in result.stderr
+    assert "found 0" in result.stderr
+    assert _invocations(tmp_path, "inspect") == []
+
+
+def test_two_matching_containers_stop_instead_of_picking_one(tmp_path: Path) -> None:
+    """The second match is exactly the ambiguity a hard-coded name hides."""
+    result = _run(
+        tmp_path,
+        "service-container",
+        "product-catalog",
+        STUB_DUPLICATE_SERVICE="product-catalog",
+    )
+
+    assert result.returncode == 1
+    assert "found 2" in result.stderr
+    assert "9f2c1b7a0011" in result.stderr
+    assert "beefca110055" in result.stderr
+    assert _invocations(tmp_path, "inspect") == []
+
+
+def test_verify_recovery_reads_the_container_the_engine_resolved(tmp_path: Path) -> None:
+    """The readings are taken from the resolved id, not from the name it resolves to."""
+    result = _run(
+        tmp_path,
+        "verify-recovery",
+        "product-catalog",
+        **_probed(tmp_path, STUB_NAMES_DIFFER="1"),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "product-catalog = container 9f2c1b7a0011, configured healthcheck" in result.stdout
+    state_reads = [
+        argv for argv in _invocations(tmp_path, "inspect") if argv[2] == "{{.State.Status}}"
+    ]
+    assert state_reads, _invocations(tmp_path, "inspect")
+    assert {argv[3] for argv in state_reads} == {"9f2c1b7a0011"}
+
+
+# --- `verify-recovery`: both restarted services, one bounded wait -------------
+
+
+def test_the_collector_is_judged_by_its_documented_surface_because_it_has_no_healthcheck(
+    tmp_path: Path,
+) -> None:
+    """The pinned revision gives ``otel-collector`` no check, and "running" is not readiness.
+
+    Read from the pinned checkout this pass: no ``healthcheck:`` stanza for the service in
+    ``compose.yaml``, ``compose.observability.yaml`` or ``demo/compose.opsaccord.yaml``; no
+    ``health_check`` extension in ``src/otel-collector/otelcol-config.yml``, so there is no
+    :13133 to ask; and the live inspect read ``healthcheck=none`` for it. What that config
+    does document is the OTLP HTTP receiver, whose port ``.env`` fixes at 4318. That is
+    what this requires, and it is only *process* readiness of the receive path.
+    """
+    result = _run(
+        tmp_path,
+        "verify-recovery",
+        "otel-collector",
+        **_probed(tmp_path, STUB_COLLECTOR="1", STUB_CURL_CODE="200"),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        "no configured healthcheck; requiring the surface the pinned configuration documents"
+        in result.stdout
+    )
+    assert "POST /v1/traces on the published 4318" in result.stdout
+    assert "POST /v1/traces on 127.0.0.1:65235 answered HTTP 200" in result.stdout
+    ports = [argv[-2:] for argv in _invocations(tmp_path, "compose") if "port" in argv]
+    assert ["otel-collector", "4318"] in ports, ports
+    assert "process readiness is not export" in result.stdout
+
+
+def test_a_configured_healthcheck_is_used_instead_of_the_documented_surface(tmp_path: Path) -> None:
+    """The documented surface is the fallback for *no* check, not a preference over one."""
+    result = _run(
+        tmp_path,
+        "verify-recovery",
+        "otel-collector",
+        **_probed(
+            tmp_path,
+            STUB_COLLECTOR="1",
+            STUB_HEALTHCHECK_ALL='["CMD","wget","-q","-O-","http://127.0.0.1:13133"]',
+            STUB_CURL_CODE="503",
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    wget_check = '["CMD","wget","-q","-O-","http://127.0.0.1:13133"]'
+    assert f"configured healthcheck {wget_check}" in result.stdout
+    assert "POST /v1/traces" not in result.stdout
+    assert not [argv for argv in _invocations(tmp_path, "compose") if "4318" in argv]
+
+
+def test_a_service_with_no_check_and_no_documented_surface_is_refused(tmp_path: Path) -> None:
+    """Neither a check nor a documented surface means readiness cannot be established."""
+    result = _run(
+        tmp_path,
+        "verify-recovery",
+        "checkout",
+        **_probed(tmp_path, OPSACCORD_DEMO_VERIFY_SLEEP="0"),
+    )
+
+    assert result.returncode == 1
+    assert "readiness cannot be established" in result.stderr
+    assert "READY" not in result.stdout
+
+
+def test_an_unready_collector_stops_the_run_though_the_catalog_came_back(
+    tmp_path: Path,
+) -> None:
+    """ "The catalog is healthy again" is not the property the capture needs."""
+    result = _run(
+        tmp_path,
+        "verify-recovery",
+        "product-catalog",
+        "otel-collector",
+        **_probed(
+            tmp_path,
+            STUB_COLLECTOR="1",
+            STUB_CURL_CODE="503",
+            OPSACCORD_DEMO_VERIFY_SLEEP="0",
+            OPSACCORD_DEMO_VERIFY_SECONDS="0",
+        ),
+    )
+
+    assert result.returncode == 1
+    assert "answered HTTP 503, which is not the documented export answer" in result.stdout
+    assert "did not come ready inside the one 0 s window" in result.stderr
+    assert "READY" not in result.stdout
+
+
+def test_an_unhealthy_catalog_stops_the_run_though_the_collector_is_ready(
+    tmp_path: Path,
+) -> None:
+    """The stop hands back the reading that decided it, not just the verdict."""
+    result = _run(
+        tmp_path,
+        "verify-recovery",
+        "product-catalog",
+        "otel-collector",
+        **_probed(
+            tmp_path,
+            STUB_COLLECTOR="1",
+            STUB_CURL_CODE="200",
+            STUB_UNHEALTHY="product-catalog",
+            STUB_HEALTH_LOG='[{"ExitCode":-1,"Output":"Health check exceeded timeout (5s)"}]',
+            OPSACCORD_DEMO_VERIFY_SLEEP="0",
+            OPSACCORD_DEMO_VERIFY_SECONDS="0",
+        ),
+    )
+
+    assert result.returncode == 1
+    unhealthy_catalog = "product-catalog (container 9f2c1b7a0011): state=running health=unhealthy"
+    assert unhealthy_catalog in result.stdout
+    assert "HTTP 200" in result.stdout
+    # What the stop hands back: the configured check's own history, and a bounded log tail.
+    assert "Health check exceeded timeout (5s)" in result.stderr
+    assert "bounded log tail" in result.stderr
+    assert "logs --tail 80 product-catalog" in result.stderr
+    assert "READY" not in result.stdout
+
+
+def test_a_dependency_that_is_unhealthy_after_the_restart_stops_the_run(tmp_path: Path) -> None:
+    """A recheck of the whole project, so a regression during the restart is not ignored."""
+    result = _run(
+        tmp_path,
+        "verify-recovery",
+        "product-catalog",
+        **_probed(tmp_path, STUB_UNHEALTHY="checkout", OPSACCORD_DEMO_VERIFY_SLEEP="0"),
+    )
+
+    assert result.returncode == 1
+    assert "recheck checkout state=running health=unhealthy" in result.stdout
+    assert "outside the verified pair are not running-and-healthy" in result.stderr
+    assert "READY" not in result.stdout
+
+
+def test_a_stopped_dependency_after_the_restart_stops_the_run(tmp_path: Path) -> None:
+    result = _run(
+        tmp_path,
+        "verify-recovery",
+        "product-catalog",
+        **_probed(tmp_path, STUB_STOPPED="checkout", OPSACCORD_DEMO_VERIFY_SLEEP="0"),
+    )
+
+    assert result.returncode == 1
+    assert "recheck checkout state=exited health=none" in result.stdout
+    assert "READY" not in result.stdout
+
+
+def test_both_services_passing_is_what_allows_the_run_to_continue(tmp_path: Path) -> None:
+    """The gate the block calls before it refreshes the endpoints and captures."""
+    result = _run(
+        tmp_path,
+        "verify-recovery",
+        "--budget-seconds",
+        "120",
+        "product-catalog",
+        "otel-collector",
+        **_probed(tmp_path, STUB_COLLECTOR="1", STUB_CURL_CODE="200"),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert 'configured healthcheck ["CMD","/bin/grpc_health_probe","-addr=:3550"]' in result.stdout
+    assert "POST /v1/traces on 127.0.0.1:65235 answered HTTP 200" in result.stdout
+    assert "every named service came ready inside the one 120 s window" in result.stdout
+    assert "recheck product-catalog state=running health=healthy" in result.stdout
+    assert "recheck otel-collector state=running health=none" in result.stdout
+    assert "recheck: every container in project" in result.stdout
+    assert "demo: READY: product-catalog otel-collector verified" in result.stdout
+
+
+def test_one_deadline_covers_every_named_service(tmp_path: Path) -> None:
+    """One overall wait, not a long wait per probe: the window is the caller's, once."""
+    result = _run(
+        tmp_path,
+        "verify-recovery",
+        "product-catalog",
+        **_probed(
+            tmp_path,
+            STUB_HEALTH_STARTING="product-catalog",
+            OPSACCORD_DEMO_VERIFY_SECONDS="1",
+            OPSACCORD_DEMO_VERIFY_SLEEP="1",
+        ),
+    )
+
+    assert result.returncode == 1
+    attempts = re.findall(r"demo: attempt (\d+):", result.stdout)
+    assert attempts == ["1", "2"], attempts
+    assert "state=running health=starting" in result.stdout
+    assert "did not come ready inside the one 1 s window" in result.stderr
+    assert "READY" not in result.stdout
+
+
+def test_an_inspection_that_fails_is_not_read_as_readiness(tmp_path: Path) -> None:
+    """`running` cannot be claimed from a command that did not answer."""
+    result = _run(
+        tmp_path,
+        "verify-recovery",
+        "product-catalog",
+        STUB_INSPECT_RC="1",
+        **_probed(tmp_path, OPSACCORD_DEMO_VERIFY_SLEEP="0"),
+    )
+
+    assert result.returncode == 1
+    assert "could not be inspected" in result.stderr
+    assert "an unknown check is not readiness" in result.stderr
+    assert "READY" not in result.stdout
+
+
+def test_a_service_with_no_published_port_is_not_read_as_ready(tmp_path: Path) -> None:
+    """The documented surface has no address, so the check cannot be established."""
+    result = _run(
+        tmp_path,
+        "verify-recovery",
+        "otel-collector",
+        **_probed(
+            tmp_path,
+            STUB_COLLECTOR="1",
+            STUB_NO_PORT="1",
+            OPSACCORD_DEMO_VERIFY_SLEEP="0",
+        ),
+    )
+
+    assert result.returncode == 1
+    assert "publishes no host port for 4318" in result.stdout
+    assert "readiness could not be read" in result.stderr
+    assert "READY" not in result.stdout
+
+
+def test_verify_recovery_refuses_an_ambiguous_service_before_reading_anything(
+    tmp_path: Path,
+) -> None:
+    result = _run(
+        tmp_path,
+        "verify-recovery",
+        "product-catalog",
+        **_probed(
+            tmp_path,
+            STUB_DUPLICATE_SERVICE="product-catalog",
+            OPSACCORD_DEMO_VERIFY_SLEEP="0",
+        ),
+    )
+
+    assert result.returncode == 1
+    assert "did not resolve to exactly one container" in result.stderr
+    assert "attempt 1" not in result.stdout
+    assert _invocations(tmp_path, "inspect") == []
+
+
+def test_the_documented_readiness_table_matches_the_pinned_revision() -> None:
+    """The guard for the table itself, because a test cannot read the pinned checkout.
+
+    The pinned checkout lives outside this repository, so what is pinned here is that the
+    table exists, names the service whose configuration has no healthcheck, and cites the
+    surfaces that decision came from: the OTLP HTTP receiver at the port `.env` fixes, and
+    the absence of a health_check extension. Without it, the next edit could delete the
+    fallback and leave the collector passing on "running" - which is exactly the reading
+    the live 2026-10-15 inspect showed proves nothing.
+    """
+    script = DEMO_SCRIPT.read_text(encoding="utf-8")
+
+    assert '"otel-collector 4318 /v1/traces"' in script
+    assert "src/otel-collector/otelcol-config.yml" in script
+    assert "health_check extension" in script
+    assert 'index .Config "Healthcheck"' in script
+
+
+def test_the_handed_off_block_verifies_before_it_captures() -> None:
+    """The block is the user-run artifact, and its order is what makes a capture valid.
+
+    The two corrections this pass makes are only worth anything if the run that follows
+    reads them: the block must resolve the two containers by label, gate on the bounded
+    verification, and reach the fresh capture only past that gate.
+    """
+    report = (REPO_ROOT / "docs" / "reports" / "phase1-implementation.md").read_text(
+        encoding="utf-8"
+    )
+    fences = re.findall(r"```bash\n(.*?)\n```", report, flags=re.DOTALL)
+    assert fences, "no bash block found in the report; this guard would be vacuous"
+    block = fences[-1]
+
+    assert "scripts/demo.sh service-container product-catalog otel-collector" in block
+    assert "scripts/demo.sh verify-recovery --budget-seconds" in block
+    verify_at = block.index("scripts/demo.sh verify-recovery")
+    capture_at = block.index("capture-baseline-checkout.py")
+    assert verify_at < capture_at
+    assert "verify_rc" in block[verify_at:capture_at]

@@ -54,6 +54,32 @@ ENDPOINTS=(
   "PRODUCT_CATALOG product-catalog 3550"
 )
 
+# The services whose pinned configuration declares no healthcheck, with the readiness
+# surface that configuration *does* document for them.
+#
+# A container with no configured check cannot be judged by one, and "running" is not
+# telemetry readiness: a collector process can be up while its receiver never bound a
+# port. For each service listed here the pinned revision documents a surface instead,
+# and it is the only thing accepted in place of a healthcheck. A service that is in
+# neither this list nor possession of a configured healthcheck has no established
+# readiness check at all, and `verify-recovery` refuses it rather than passing it on
+# "running".
+#
+# otel-collector: no `healthcheck:` stanza exists for it in `compose.yaml`,
+# `compose.observability.yaml` or `demo/compose.opsaccord.yaml`, and its configuration
+# declares no health_check extension, so there is no :13133 to ask (the live inspect on
+# 2026-10-15 read `healthcheck=none` for it). What the pinned revision does document is
+# its OTLP HTTP receiver: `src/otel-collector/otelcol-config.yml` sets
+# `receivers.otlp.protocols.http.endpoint` to
+# `${env:OTEL_COLLECTOR_HOST}:${env:OTEL_COLLECTOR_PORT_HTTP}`, and `.env` fixes that
+# port at 4318. A 200 from POST /v1/traces on that receiver means its HTTP server is up
+# and the pipeline took a payload - *process* readiness of the receive path, and
+# nothing more. It is not export, and only a fresh trace in the store shows telemetry
+# arriving.
+READINESS_PROBES=(
+  "otel-collector 4318 /v1/traces"
+)
+
 die() { printf 'demo: %s\n' "$*" >&2; exit 1; }
 
 require_docker() {
@@ -478,6 +504,321 @@ cmd_stats() {
   return "$rc"
 }
 
+# The container this project gives to a service, resolved by *label* rather than by
+# name.
+#
+# Upstream pins `container_name:` on most services, so a container name is a global
+# string that a different project on the same engine can hold too - the live 2026-10-15
+# run's `docker inspect ... product-catalog` would have resolved whatever container held
+# that name, in any project. The identity that belongs to *this* project is the label
+# pair the engine stamped on the container it created: the compose project label every
+# command here is already scoped by, plus `com.docker.compose.service`. Filtering on
+# both means another project's container of the same name is not even a candidate.
+#
+# Exactly one match is required, and the resolved **id** is what a caller gets back, so
+# every later read names the container the engine resolved rather than a string that
+# looks like it. Nothing falls back to a bare name: zero matches is not the same fact as
+# a stopped container, and two matches is exactly the ambiguity a hard-coded name hides.
+resolve_service_container() {
+  local service="$1" rc=0 listed line
+  local -a found=()
+  listed="$("$DOCKER_BIN" ps -a \
+    --filter "label=com.docker.compose.project=$PROJECT" \
+    --filter "label=com.docker.compose.service=$service" \
+    --format '{{.ID}} {{.Names}}' </dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf 'demo: listing this project\x27s containers for service %s exited %s\n' "$service" "$rc" >&2
+    return 2
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    found+=("$line")
+  done <<<"$listed"
+  if [ "${#found[@]}" -ne 1 ]; then
+    printf 'demo: expected exactly one container for service %s in project %s; found %s\n' \
+      "$service" "$PROJECT" "${#found[@]}" >&2
+    for line in "${found[@]}"; do printf 'demo:   %s\n' "$line" >&2; done
+    return 1
+  fi
+  printf '%s\t%s\n' "$service" "${found[0]}"
+  return 0
+}
+
+# The documented readiness surface for a service whose pinned configuration declares no
+# healthcheck: "<container port> <path>", empty when the revision documents none.
+readiness_probe_for() {
+  local service="$1" spec name port path
+  for spec in "${READINESS_PROBES[@]}"; do
+    read -r name port path <<<"$spec"
+    if [ "$name" = "$service" ]; then
+      printf '%s %s\n' "$port" "$path"
+      return 0
+    fi
+  done
+  return 0
+}
+
+cmd_service_container() {
+  require_docker
+  (($# > 0)) || die "service-container needs at least one service name"
+  local service
+  for service in "$@"; do
+    resolve_service_container "$service" || return 1
+  done
+}
+
+# One readiness reading for one already-resolved container, bounded so that no single
+# probe can outlast the deadline the caller set.
+#
+# Prints one line and its exit status *is* the verdict; there is no second place for the
+# reading to disagree with it: 0 ready, 1 not ready (yet), 2 could not be read. The
+# third answer exists because a failed reading is not a readiness answer in either
+# direction - "the CLI refused the template" is not "the container is up".
+readiness_reading() {
+  local service="$1" id="$2" probe="$3" host="$4"
+  local state health hp status port path
+  if ! state="$("$DOCKER_BIN" inspect --format '{{.State.Status}}' "$id" </dev/null)"; then
+    printf '%s (container %s): the container could not be inspected, so its state is unknown\n' \
+      "$service" "$id"
+    return 2
+  fi
+  if [ "$state" != running ]; then
+    printf '%s (container %s): state=%s\n' "$service" "$id" "$state"
+    return 1
+  fi
+  if [ -z "$probe" ]; then
+    if ! health="$("$DOCKER_BIN" inspect --format \
+      '{{$h := index .State "Health"}}{{if $h}}{{$h.Status}}{{else}}none{{end}}' "$id" </dev/null)"; then
+      printf '%s (container %s): state=running, but its health could not be inspected\n' "$service" "$id"
+      return 2
+    fi
+    printf '%s (container %s): state=running health=%s\n' "$service" "$id" "$health"
+    if [ "$health" != healthy ]; then return 1; fi
+    return 0
+  fi
+  read -r port path <<<"$probe"
+  hp="$(published_port "$service" "$port")"
+  if [ -z "$hp" ]; then
+    printf '%s (container %s): state=running, but this project publishes no host port for %s\n' \
+      "$service" "$id" "$port"
+    return 2
+  fi
+  if status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+      -X POST -H 'Content-Type: application/x-protobuf' --data-binary '' \
+      "http://$host:$hp$path" 2>&1)"; then
+    if [ "$status" = 200 ]; then
+      printf '%s (container %s): state=running, POST %s on %s:%s answered HTTP 200\n' \
+        "$service" "$id" "$path" "$host" "$hp"
+      return 0
+    fi
+    printf '%s (container %s): state=running, POST %s on %s:%s answered HTTP %s, which is not the documented export answer\n' \
+      "$service" "$id" "$path" "$host" "$hp" "$status"
+    return 1
+  fi
+  printf '%s (container %s): state=running, POST %s on %s:%s got no answer (%s)\n' \
+    "$service" "$id" "$path" "$host" "$hp" "$status"
+  return 1
+}
+
+# What a failed verification hands back, before anything else is decided.
+#
+# The readings a repair decision needs exist only while the container is in the state
+# that produced them (D29), and the 2026-10-15 run showed the cost of a stop that
+# omitted them (D33): the state has to be re-created on the host to be read at all. So
+# the configured check's own history and a bounded log tail are collected for the
+# container that did not come ready.
+print_recovery_evidence() {
+  local service="$1" id="$2" history
+  if history="$("$DOCKER_BIN" inspect --format \
+    '{{$h := index .State "Health"}}{{if $h}}{{json $h.Log}}{{else}}none{{end}}' "$id" </dev/null)"; then
+    printf 'demo: ---- %s (container %s) health-probe history: %s\n' "$service" "$id" "$history" >&2
+  else
+    printf 'demo: %s (container %s) health-probe history could not be read\n' "$service" "$id" >&2
+  fi
+  printf 'demo: ---- %s (container %s) bounded log tail\n' "$service" "$id" >&2
+  if ! cmd_logs "$service" >&2; then
+    printf 'demo: bounded log capture for %s failed; its status is on the line above\n' "$service" >&2
+  fi
+}
+
+# Every other container in this project, rechecked just before a run may continue.
+#
+# A restart is the one mutation that precedes the capture, so the state that follows it
+# is the state the capture would run against. Checking only the restarted services would
+# carry a dependency that became unhealthy *during* the restart into the measurement,
+# where it would read as a property of the path under test. The list is filtered by this
+# project's compose label - the same discovery the other commands use - so no other
+# project's container is read, and every row's state and health are printed rather than
+# summarised.
+recheck_project_state() {
+  local listed name line cname cstate chealth
+  local -a names=() offenders=()
+  listed="$("$DOCKER_BIN" ps -a \
+    --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}}' </dev/null)" || {
+    printf 'demo: the project\x27s container list could not be read, so the recheck did not happen\n' >&2
+    return 2
+  }
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    names+=("$name")
+  done <<<"$listed"
+  if [ "${#names[@]}" -eq 0 ]; then
+    printf 'demo: no containers in project %s, which is not a state this recheck can pass\n' "$PROJECT" >&2
+    return 1
+  fi
+  for name in "${names[@]}"; do
+    if ! line="$("$DOCKER_BIN" inspect --format \
+      '{{$h := index .State "Health"}}{{.Name}} {{.State.Status}} {{if $h}}{{$h.Status}}{{else}}none{{end}}' \
+      "$name" </dev/null)"; then
+      printf 'demo: recheck %s: could not be inspected, so its state is unknown\n' "$name" >&2
+      offenders+=("$name (uninspectable)")
+      continue
+    fi
+    line="${line#/}"
+    read -r cname cstate chealth <<<"$line"
+    printf 'demo: recheck %s state=%s health=%s\n' "$cname" "$cstate" "$chealth"
+    if [ "$cstate" != running ]; then
+      offenders+=("$cname state=$cstate")
+    elif [ "$chealth" != healthy ] && [ "$chealth" != none ]; then
+      offenders+=("$cname health=$chealth")
+    fi
+  done
+  if [ "${#offenders[@]}" -gt 0 ]; then
+    printf 'demo: STOP: %s container(s) outside the verified pair are not running-and-healthy after the restart: %s\n' \
+      "${#offenders[@]}" "${offenders[*]}" >&2
+    return 1
+  fi
+  printf 'demo: recheck: every container in project %s is running, and none reports a health status other than healthy or none\n' \
+    "$PROJECT"
+  return 0
+}
+
+# Verify what a restart was for, before the run that depends on it may continue.
+#
+# The services named here are the ones that were found unhealthy, so "the restart
+# command exited 0" cannot stand in for "they came back": each service is resolved to its
+# container by label, the reading required of it is read from that container's *own*
+# configuration, and every reading is bounded by **one** deadline shared by all of them.
+# A second long wait per service would lengthen the run's tail without making either
+# reading more decisive.
+#
+# The reading required of a service is its configured healthcheck when the pinned
+# configuration declares one; when it declares none, the documented surface in
+# READINESS_PROBES is used instead, because a running process is not a serving receiver.
+# A service with neither is refused rather than passed on "running", and a reading that
+# could not be taken at all is never reported as readiness. When the named services
+# pass, the rest of the project is rechecked, so a dependency that became unhealthy
+# during the restart is not carried into the capture.
+cmd_verify_recovery() {
+  require_docker
+  local budget="${OPSACCORD_DEMO_VERIFY_SECONDS:-120}"
+  local pace="${OPSACCORD_DEMO_VERIFY_SLEEP:-10}"
+  local arg service id name line host="" reading=""
+  local rc=0 all_ready=0 attempt=0 i=0 port path
+  local -a services=() ids=() configured=() probes=()
+  while (($# > 0)); do
+    arg="$1"; shift
+    case "$arg" in
+      --budget-seconds)
+        [ -n "${1:-}" ] || die "--budget-seconds needs a whole number of seconds"
+        budget="$1"; shift ;;
+      -*) die "unknown option for verify-recovery: $arg" ;;
+      *) services+=("$arg") ;;
+    esac
+  done
+  ((${#services[@]} > 0)) || die "verify-recovery needs at least one service name"
+  case "$budget" in ''|*[!0-9]*) die "--budget-seconds must be a whole number of seconds (got '$budget')" ;; esac
+  case "$pace" in ''|*[!0-9]*) die "OPSACCORD_DEMO_VERIFY_SLEEP must be a whole number of seconds (got '$pace')" ;; esac
+
+  for service in "${services[@]}"; do
+    if ! line="$(resolve_service_container "$service")"; then
+      printf 'demo: STOP: %s did not resolve to exactly one container of project %s, so no readiness reading for it would name the container the engine resolved\n' \
+        "$service" "$PROJECT" >&2
+      return 1
+    fi
+    read -r _ id name <<<"$line"
+    ids+=("$id")
+  done
+
+  for ((i = 0; i < ${#services[@]}; i++)); do
+    if ! line="$("$DOCKER_BIN" inspect --format \
+      '{{$hc := index .Config "Healthcheck"}}{{if $hc}}{{json $hc.Test}}{{else}}none{{end}}' \
+      "${ids[i]}" </dev/null)"; then
+      printf 'demo: STOP: %s (container %s) could not be inspected, so whether it has a configured check is unknown - and an unknown check is not readiness\n' \
+        "${services[i]}" "${ids[i]}" >&2
+      return 1
+    fi
+    configured+=("$line")
+    if [ "$line" != none ]; then
+      probes+=("")
+      printf 'demo: %s = container %s, configured healthcheck %s\n' "${services[i]}" "${ids[i]}" "$line"
+      continue
+    fi
+    line="$(readiness_probe_for "${services[i]}")"
+    probes+=("$line")
+    if [ -z "$line" ]; then
+      printf 'demo: STOP: %s (container %s) has no configured healthcheck and the pinned configuration documents no readiness surface for it, so its readiness cannot be established; a running process is not a serving one and this command will not pass it on that\n' \
+        "${services[i]}" "${ids[i]}" >&2
+      return 1
+    fi
+    read -r port path <<<"$line"
+    printf 'demo: %s = container %s, no configured healthcheck; requiring the surface the pinned configuration documents instead: POST %s on the published %s\n' \
+      "${services[i]}" "${ids[i]}" "$path" "$port"
+    if [ -z "$host" ]; then
+      host="$(resolve_host)"
+      printf 'demo: host used for that surface: %s\n' "$host"
+    fi
+  done
+
+  local deadline=$((SECONDS + budget))
+  while :; do
+    attempt=$((attempt + 1))
+    all_ready=1
+    for ((i = 0; i < ${#services[@]}; i++)); do
+      rc=0
+      reading="$(readiness_reading "${services[i]}" "${ids[i]}" "${probes[i]}" "$host")" || rc=$?
+      printf 'demo: attempt %s: %s\n' "$attempt" "$reading"
+      if [ "$rc" -eq 2 ]; then
+        printf 'demo: STOP: %s readiness could not be read (line above), and a reading that failed is not a readiness answer in either direction\n' \
+          "${services[i]}" >&2
+        return 1
+      fi
+      if [ "$rc" -ne 0 ]; then all_ready=0; fi
+    done
+    if [ "$all_ready" -eq 1 ]; then break; fi
+    if [ "$SECONDS" -ge "$deadline" ]; then break; fi
+    sleep "$pace"
+  done
+
+  if [ "$all_ready" -ne 1 ]; then
+    printf 'demo: STOP: %s did not come ready inside the one %s s window (%s readings); nothing below is treated as recovered\n' \
+      "${services[*]}" "$budget" "$attempt" >&2
+    for ((i = 0; i < ${#services[@]}; i++)); do
+      if [ -n "${probes[i]}" ]; then
+        read -r port path <<<"${probes[i]}"
+        printf 'demo: %s was required to answer POST %s on its published %s, because the pinned configuration gives it no healthcheck\n' \
+          "${services[i]}" "$path" "$port" >&2
+      else
+        printf 'demo: %s was required to report healthy from its configured healthcheck %s\n' \
+          "${services[i]}" "${configured[i]}" >&2
+      fi
+      print_recovery_evidence "${services[i]}" "${ids[i]}"
+    done
+    return 1
+  fi
+
+  printf 'demo: every named service came ready inside the one %s s window (%s readings); they were read from the containers the engine resolved for project %s\n' \
+    "$budget" "$attempt" "$PROJECT"
+  if ! recheck_project_state; then
+    printf 'demo: STOP: the named services came ready but the project recheck above did not pass, so the run that follows would measure against a state it did not establish\n' >&2
+    return 1
+  fi
+  printf 'demo: READY: %s verified; process readiness is not export, and a fresh trace in the store is still what shows telemetry arriving\n' \
+    "${services[*]}"
+  return 0
+}
+
+
 usage() {
   cat <<USAGE
 usage: scripts/demo.sh <command>
@@ -490,6 +831,8 @@ usage: scripts/demo.sh <command>
   status      show this project's containers
   inspect     per-container health, restarts, exit/OOM state and limits
   stats       two bounded CPU/memory samples for the Go services
+  service-container  resolve this project's container for a service by label, not by name
+  verify-recovery    verify named services came ready after a restart (one bounded wait)
   health      probe every published port and the three APIs the adapter uses
   override    copy demo/compose.opsaccord.yaml into the demo checkout
   wait        block until the stack is healthy
@@ -506,10 +849,24 @@ environment overrides:
   OPSACCORD_DEMO_LOG_LINES     default 80 (lines per service for logs)
   OPSACCORD_DEMO_LOG_SINCE     unset; compose --since window for logs, e.g. 20m
   OPSACCORD_DEMO_STATS_SLEEP   default 10 (seconds between stats samples)
+  OPSACCORD_DEMO_VERIFY_SECONDS    default 120 (one window for verify-recovery)
+  OPSACCORD_DEMO_VERIFY_SLEEP      default 10 (seconds between its readings)
 
 An empty logs capture is not evidence that a service was silent: this revision
 routes the Go services' slog output over OTLP, and otel-config.yml declares no
 stdout exporter, so their container logs are normally empty. Look in the collector.
+
+service-container resolves a service to the container this project gave it, through
+the compose project label plus com.docker.compose.service - never through a name,
+because upstream pins container_name: on most services and a name is a global string.
+Exactly one match is required; a missing or ambiguous one stops the caller.
+
+verify-recovery reads each named service's readiness from the container that
+resolution returned: its own configured healthcheck where the pinned revision declares
+one, and the documented surface in READINESS_PROBES where it declares none
+(otel-collector has no healthcheck; its OTLP HTTP receiver is what the pinned config
+documents). It stops rather than passing a service on "running", and it rechecks the
+rest of the project before it reports READY.
 
 Pinned revision: $REVISION. Only the frontend proxy (8080) and Prometheus (9090)
 have fixed host ports; the rest are resolved at runtime. The stack is
@@ -532,6 +889,8 @@ main() {
     status) cmd_status "$@" ;;
     inspect) cmd_inspect "$@" ;;
     ensure) cmd_ensure "$@" ;;
+    service-container) cmd_service_container "$@" ;;
+    verify-recovery) cmd_verify_recovery "$@" ;;
     health) cmd_health "$@" ;;
     stats) cmd_stats "$@" ;;
     wait) cmd_wait "$@" ;;

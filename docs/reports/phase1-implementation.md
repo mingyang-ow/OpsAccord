@@ -4626,9 +4626,15 @@ and `otel-collector` are restarted in place - the scope
 [D29](decisions/D29-a-restart-is-allowed-only-after-the-state-it-replaces-is-captured.md) allows, and the
 one whose evidence ([E28](../03%20Experiment%20Log.md), [E29](../03%20Experiment%20Log.md), and the
 retained health log above) shows the catalog serving again - the same readings are taken again, and only
-if the catalog then reports **healthy** from its own `grpc_health_probe` does the block refresh the
-endpoints and run the checkout capture. A container outside that named pair stops the run instead of
-widening the restart.
+after **both** restarted services are verified ready inside **one** bounded window does the block refresh
+the endpoints and run the checkout capture. Each service is resolved to its container through this
+project's compose labels rather than by name, and read from its own configuration: the catalog from its
+`grpc_health_probe`, the collector from the OTLP HTTP receiver the pinned configuration documents, since
+this revision gives it no healthcheck. A container outside that named pair stops the run instead of
+widening the restart, and so does anything that is not running-and-healthy when the project is rechecked
+immediately before the capture. *(Both corrections were made in the recovery-verification pass; see "The
+recovery-verification pass" below. The block under this paragraph was replaced in place, so this document
+holds one current block rather than a patch to splice.)*
 
 ```bash
 ( set -euo pipefail
@@ -4762,28 +4768,47 @@ PY
       exit 1
     fi
     echo "the as-found readings are already written (07, 08, 08b), so the restart below cannot erase them."
-    echo "this is not a repair of a named cause: the memory deviation was refused by measurement (E28/D27), and what a restart replaces is a wedged process (D29)."
-    bash scripts/demo.sh restart product-catalog otel-collector 2>&1 | tee "$LOGDIR/08c-restart.log"
-    echo "--- 3c. the same readings again, bounded: is the catalog serving now? ---"
-    catalog_health=unknown
-    for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-      catalog_health="$("$OPSACCORD_DOCKER_BIN" inspect --format '{{$h := index .State "Health"}}{{if $h}}{{$h.Status}}{{else}}none{{end}}' product-catalog </dev/null)"
-      echo "reading $attempt of 12: product-catalog health=$catalog_health"
-      if [ "$catalog_health" = healthy ]; then break; fi
-      sleep 10
-    done
+    echo "this is a targeted recovery attempt, not a repair of a named cause: the historical readings (E28, E29) are what say an in-place restart can leave this pair serving again, and nothing here rules memory pressure out - that deviation stays refused by measurement (E28/D27)."
+    echo "--- 3c. the two services, resolved by this project's compose labels rather than by name ---"
     set +e
-    bash scripts/demo.sh stats product-catalog 2>&1 | tee "$LOGDIR/08e-stats-after.log"; stats_rc=${PIPESTATUS[0]}
-    bash scripts/demo.sh inspect 2>&1 | tee "$LOGDIR/08d-inspect-after.log"; after_rc=${PIPESTATUS[0]}
+    bash scripts/demo.sh service-container product-catalog otel-collector 2>&1 | tee "$LOGDIR/08c-containers-before.log"
+    ids_before_rc=${PIPESTATUS[0]}
     set -e
-    echo "after the restart: demo.sh stats exited $stats_rc, demo.sh inspect exited $after_rc (1 is the degraded-row status, not fatal here)"
-    if [ "$catalog_health" != healthy ]; then
-      echo "STOP: product-catalog did not report healthy within the bounded 120 s window after an in-place restart, so the baseline cannot be captured against a serving catalog. The before/after samples are in 07 and 08e, the before/after per-container state in 08 and 08d, the restart in 08c. Send $LOGDIR back." >&2
+    if [ "$ids_before_rc" -ne 0 ]; then
+      echo "STOP: product-catalog and otel-collector did not each resolve to exactly one container of this project, so the subject of the restart is not established and nothing is restarted. See 08c-containers-before.log. Send $LOGDIR back." >&2
       exit 1
     fi
-    echo "product-catalog reports healthy from its own grpc_health_probe, which is a serving reading - the endpoint probe alone only ever proved a listener"
+    set +e
+    bash scripts/demo.sh restart product-catalog otel-collector 2>&1 | tee "$LOGDIR/08c-restart.log"
+    restart_rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$restart_rc" -ne 0 ]; then
+      echo "STOP: the in-place restart of product-catalog and otel-collector exited $restart_rc, so what follows is not the state a clean restart leaves. See 08c-restart.log. Send $LOGDIR back." >&2
+      exit 1
+    fi
+    echo "--- 3d. the same readings again, while the state the restart produced still exists ---"
+    set +e
+    bash scripts/demo.sh inspect 2>&1 | tee "$LOGDIR/08d-inspect-after.log"; after_rc=${PIPESTATUS[0]}
+    bash scripts/demo.sh stats product-catalog 2>&1 | tee "$LOGDIR/08e-stats-after.log"; stats_rc=${PIPESTATUS[0]}
+    set -e
+    echo "after the restart: demo.sh inspect exited $after_rc (1 means a row was reported without its per-container detail), demo.sh stats exited $stats_rc"
+    echo "--- 3e. both restarted services verified inside ONE bounded wait, before the baseline ---"
+    set +e
+    bash scripts/demo.sh verify-recovery --budget-seconds 120 product-catalog otel-collector 2>&1 | tee "$LOGDIR/08f-recovery-verify.log"
+    verify_rc=${PIPESTATUS[0]}
+    set -e
+    bash scripts/demo.sh service-container product-catalog otel-collector 2>&1 | tee "$LOGDIR/08c-containers-after.log"
+    if [ "$verify_rc" -ne 0 ]; then
+      echo "STOP: the restarted pair was not verified ready, so the baseline is not captured. 08f-recovery-verify.log names the reading that failed and holds that container's configured-check history and a bounded log tail; the as-found readings are in 07/08/08b, the post-restart state in 08d/08e, and the restart itself in 08c-restart.log. Send $LOGDIR back." >&2
+      exit 1
+    fi
+    if [ "$(cat "$LOGDIR/08c-containers-before.log")" != "$(cat "$LOGDIR/08c-containers-after.log")" ]; then
+      echo "STOP: the resolved container IDs differ across the restart, so it was not an in-place restart and the before/after readings describe different containers. Compare 08c-containers-before.log with 08c-containers-after.log. Send $LOGDIR back." >&2
+      exit 1
+    fi
+    echo "the pair is verified, and the restart stayed in place: the same container IDs resolve before and after it"
+    echo "the catalog's reading is its own grpc_health_probe; the collector has no healthcheck in this pinned revision, so its reading is its OTLP HTTP receiver answering on the published port - process readiness only, and not proof that its exports are arriving. The fresh trace captured below is what shows that."
   fi
-
   echo "--- 4. endpoints, refreshed rather than inherited ---"
   bash scripts/demo.sh endpoints 2>&1 | tee "$LOGDIR/09-endpoints.log"
   test -s .local/demo-endpoints.env
@@ -4820,3 +4845,112 @@ PY
   exit "$cap_rc"
 )
 ```
+
+## The recovery-verification pass (this commit) - the post-restart check named a container by name and verified one service of the two it restarted
+
+Appended 2026-10-15. The sections above are left as they were, with one exception: the block at the end of
+the previous section was corrected **in place**, so this document holds one current block instead of a
+patch the user has to splice. The user had **not** run that block when this pass began. Every live reading
+quoted below is the **user's**; the code, its tests and this record are this pass's.
+
+### Why the handed-off block was not runnable as written
+
+Reading the post-restart region against what it assumed found two defects, both in the part that decides
+whether the run may continue.
+
+| Defect | Why it mattered |
+| --- | --- |
+| The health poll hard-coded `docker inspect ... product-catalog` | A container *name* is global on the engine, and upstream pins `container_name:` on most services of this stack. The name would have resolved in any project holding it, or in none if the container were recreated under a different name, and the reading would still have been attributed to this project's catalog |
+| `otel-collector` was restarted and then never verified | The block restarted both services because both were unhealthy, then gated the capture on the catalog alone. The collector is where this stack's telemetry lands (`docs/astronomy-shop.md`), and the catalog's own recorded failure mode is an export *to* it (`exporter export timeout ... DeadlineExceeded`) - so a restart that left the collector unable to receive would have passed the gate |
+
+### The two corrections
+
+**1. Containers are resolved by project and service labels.**
+`scripts/demo.sh service-container <service>...` resolves each service through
+`label=com.docker.compose.project=<project>` **plus** `label=com.docker.compose.service=<service>` - the
+same project-scoped discovery `inspect` and `ensure` already use - and requires **exactly one** match.
+Zero matches and two matches both stop the caller and print the rows they found; nothing falls back to a
+container name. What it prints is the service, the resolved container **id** and the container's own name,
+and the block uses those ids for every reading. The pair is resolved *before* the restart as well as after
+it: if the ids differ, the restart was not in place and the before/after comparison
+[D29](decisions/D29-a-restart-is-allowed-only-after-the-state-it-replaces-is-captured.md) rests on would be
+between different containers, so the block stops rather than capturing.
+
+**2. Both restarted services are verified, inside one bounded window.**
+`scripts/demo.sh verify-recovery --budget-seconds 120 product-catalog otel-collector` reads each service's
+required reading from the container resolution returned, and from that container's own configuration:
+
+| Service | Configured check | Required reading |
+| --- | --- | --- |
+| `product-catalog` | `["CMD","/bin/grpc_health_probe","-addr=:3550"]` (`compose.yaml`) | `state=running` **and** its configured healthcheck reporting `healthy` |
+| `otel-collector` | **none.** No `healthcheck:` stanza for the service in `compose.yaml`, `compose.observability.yaml` or `demo/compose.opsaccord.yaml`; no `health_check` extension in `src/otel-collector/otelcol-config.yml`, so there is no `:13133` to ask; the live 2026-10-15 inspect read `healthcheck=none` | `state=running` **and** `POST /v1/traces` on the OTLP HTTP receiver that config declares (port `4318`, fixed by `.env`) answering **HTTP 200** |
+
+A service with neither a configured check nor a documented surface is **refused** rather than passed on
+"running"; a reading that could not be taken at all - a failed inspection, no published host port - stops
+the run instead of being counted in either direction. Every named service shares **one** deadline: a second
+long wait per service would lengthen the tail without making either reading more decisive. On failure the
+stop hands back the reading that decided it, the container's configured-check history and a bounded log
+tail - the same reason the previous pass moved the two `docker stats` samples into `ensure`'s refusal
+([D33](decisions/D33-a-stop-hands-back-the-measurement.md)).
+
+**What the collector's reading is, and is not.** An OTLP receiver answering HTTP 200 proves the *receive*
+path is serving; that is **process** readiness. It does not show the collector's exports reach Jaeger, and
+it does not show telemetry is arriving. The fresh trace capture is still what has to show that, and the
+block says so where it matters rather than letting the verification read as more than it is.
+
+**The project is rechecked before the capture.** Once both named services pass, every container in the
+project is read again: each must be running, with a health of `healthy` or `none`. A restart is the one
+mutation that precedes the capture, so a dependency that became unhealthy *during* it would otherwise be
+carried into the measurement and read as a property of the path under test. Stage 3b already refuses to
+restart when an unhealthy container outside the pair exists, which is what makes "unhealthy after" a new
+fact rather than a carried-over one.
+
+### Scope, and what the restart is claimed to be
+
+The block's restart is described as a **targeted recovery attempt based on historical observations**.
+[E28](../03%20Experiment%20Log.md) and [E29](../03%20Experiment%20Log.md) are what say an in-place restart
+has previously been followed by the catalog serving again, and the retained health log quoted in the
+previous section is the reading [D29](decisions/D29-a-restart-is-allowed-only-after-the-state-it-replaces-is-captured.md)
+asked for. It is **not** a repair of a named cause: no cold-start root cause is claimed and **memory
+pressure is not ruled out** - that deviation stays refused *by measurement*
+([D27](decisions/D27-a-repair-waits-for-the-measurement-that-names-its-cause.md)), not by argument. Nothing
+outside the named pair is restarted, no resource limit and no capture timeout is changed, and the
+PostgreSQL state checks and safeguards are untouched.
+
+### Checks executed in this pass
+
+| Check | Result |
+| --- | --- |
+| `tests/unit/test_demo_script.py` | **41 passed** (21 before; +20: label resolution, names differing from services, another project's container excluded, missing and ambiguous matches, the documented-surface rule and its converse, each single-service failure, the project recheck for an unhealthy and a stopped dependency, one-deadline expiry, a failed inspection, no published port, and two artifact guards) |
+| Offline suite, `-m "not integration"` | **369 passed, 7 skipped, 85 deselected** in **both** environment variants (349 before) |
+| `ruff check .` / `ruff format --check .` / `mypy src/opsaccord` | `All checks passed!` / 95 files already formatted / no issues in 42 source files |
+| `bash -n` | clean on `scripts/demo.sh` and on both copies of the block |
+| The two block copies | byte-identical (extracted and `diff`ed) |
+| Falsification through `DEMO_SCRIPT_UNDER_TEST` | against `HEAD`'s `demo.sh`, **19 of the 20** new tests **fail** - every one that exercises the new code, each on `unknown command` - while all **21** pre-existing tests pass |
+| `bash scripts/demo.sh service-container product-catalog`, `bash scripts/demo.sh verify-recovery product-catalog` (this sandbox) | `the Docker engine did not answer`, exit **1** for both; no container was started, restarted or stopped, and `.local/demo-endpoints.env` was not rewritten |
+
+**These are offline tests with a stubbed CLI, and they are not host-side validation.** They pin the
+resolution rule, the required reading per service and every failure branch - including that a collector
+with no healthcheck is judged by the documented surface and *not* by "running". They do not reproduce the
+live wedge, and no live reading in this section was produced here.
+
+### Not run, and why
+
+- **The integration suite** - needs the live stack; not run here.
+- **The demo stack, the endpoint refresh and the fresh Checkout -> Payment capture** - this sandbox reaches
+  neither Docker nor a loopback port. Nothing was started, restarted, stopped or armed.
+- **P1-01** - untouched, and it cannot pass while `PlaceOrder`'s path needs the catalog to serve.
+- **The corrected block itself.** **No live success is claimed for it, and none should be read into this
+  section: the user has not run it yet.**
+
+**Phase 1 remains PARTIAL.** The fault-free baseline is still unmeasured on this revision, and Payment
+recovery remains unverified.
+
+### The current block
+
+The block at the end of the previous section ("The one next action") is the corrected one and is what to
+run; the runbook's "The current next action" chapter carries the same block, byte-identically. It keeps
+explicit environment activation, the project directory, revision and interpreter output, timestamped logs,
+the PostgreSQL safeguards, the fresh endpoint discovery, failure propagation through every stage, and the
+fresh baseline capture - with the two corrections above in place of the name-based poll and the
+catalog-only gate.
