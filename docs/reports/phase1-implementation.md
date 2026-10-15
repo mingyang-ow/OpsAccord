@@ -4636,6 +4636,13 @@ immediately before the capture. *(Both corrections were made in the recovery-ver
 recovery-verification pass" below. The block under this paragraph was replaced in place, so this document
 holds one current block rather than a patch to splice.)*
 
+**Run on 2026-10-15 (the user's), and recorded at the end of this document.** The block below ran every
+stage; both corrections held, and it stopped at the capture on one clause of `explicit_success` that the
+pinned revision cannot satisfy - the measured operation's own server span writes no status, so a successful
+call to it reads `UNSET`. See "The live recovery-and-baseline run" below: that section is the current
+position, and the block under this paragraph is the record of what was run rather than the next action.
+
+
 ```bash
 ( set -euo pipefail
   cd /home/brentiburo/projects/OpsAccord
