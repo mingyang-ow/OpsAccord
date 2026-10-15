@@ -5127,6 +5127,7 @@ does not exercise recovery.
 | The two block copies (report and runbook) | byte-identical (extracted and compared) |
 | Offline re-evaluation of the user's saved extract | verified, `success_source.satisfied_by = correlated_caller` (see above) |
 | The user's live capture at `63effae` (host run; re-derived here from its extract) | **`baseline_verified`**, exit **0**, `satisfied_by = correlated_caller` (see above) |
+| The report-block guards (`tests/unit/test_demo_script.py`) | **42 passed** (41 before, +1): the capture block's guard now finds its block by marker instead of by position, and a new guard pins the P1-01 handoff |
 
 ### Not run, and why
 
@@ -5145,17 +5146,13 @@ does not exercise recovery.
 run, re-derived here from the extract that run wrote - and Payment recovery remains unverified. A verified
 baseline is the precondition the P1-01 pass needed, not a result of it.
 
-### The baseline block, and the next action
+### The baseline block, kept as the reproduction command
 
-**The next action is the P1-01 live pass on this revision, not another capture.** That is the runbook's
-`UV_CACHE_DIR=/tmp/uvcache scripts/validate.sh --live --scenario P1-01`, and it waits on the user's
-go-ahead: this pass was scoped to the baseline, and Payment recovery has still never been demonstrated.
-
-The block below is the one that produced the verified baseline above, and it is kept, and kept last, as the
-reproducibility command: it **starts nothing** - no database, no container, no flag, no fault - reads the
-stack that is running, refuses to continue if a published port or an adapter API does not answer, and then
-captures one fresh baseline. Re-running it re-captures the fault-free baseline; it does **not** run P1-01.
-The runbook's corresponding chapter carries the same block, byte-identically.
+The block below is the one that produced the verified baseline above, and it is kept as the reproducibility
+command: it **starts nothing** - no database, no container, no flag, no fault - reads the stack that is
+running, refuses to continue if a published port or an adapter API does not answer, and then captures one
+fresh baseline. Re-running it re-captures the fault-free baseline; it does **not** run P1-01. The runbook's
+corresponding chapter carries this block and the next one, byte-identically.
 
 ```bash
 ( set -euo pipefail
@@ -5217,5 +5214,80 @@ The runbook's corresponding chapter carries the same block, byte-identically.
     echo "Not verified on this run. The capture names the property that failed and keeps the raw spans it did see; where the measured operation's own server span is UNSET, explicit_success can now be satisfied by the caller's correlated client span, so read its [provenance] line and success_source before treating a refusal as a stack fault. Send $LOGDIR back with the two reports/local files rather than re-running blind." >&2
   fi
   exit "$cap_rc"
+)
+```
+
+### The one next action (host shell, one block)
+
+**The next action is the P1-01 live pass on this revision.** It is the block below, and it differs from the
+capture block in exactly the ways a live fault path requires. `scripts/validate.sh --live --scenario P1-01`
+first runs the runner's own stages - the offline suite in both environment variants, lint, format, types,
+the integration suite, the pre-fix sensitivity harness and the nine simulated scenarios - and then one live
+path: the driver arms `paymentUnreachable`, escalates for the approval, executes the bounded remediation,
+verifies recovery and restores the flag. Expect **minutes**, not seconds; the live path alone has taken
+about 160 s on earlier revisions.
+
+Two consequences are deliberate, and they are the opposite of the capture block's. **It starts things.**
+The runner starts PostgreSQL (`pg.sh start`), and if the stack is not answering it starts that too
+(`demo.sh health || demo.sh start`), so this block's first step only *reports* the stack's state rather than
+gating on it - the runner owns that decision, and a gate here would refuse a run the runner could complete.
+**It injects a fault**, which is the point of the path; the driver is responsible for restoring it, and the
+block reads the flag store back afterwards instead of assuming cleanup happened.
+
+The block names the project environment explicitly, scopes the endpoint settings to its own subshell, keeps
+its timestamped logs under `.local/`, and exits with the **runner's** status rather than the pipe's, so a
+failed stage is neither hidden by `tee` nor reported as the block's own outcome. Sending back the evidence
+directory, the newest `reports/local/live-scenarios-*.json` and the runner's `validation-*/summary.log` is
+what makes the run reviewable here; the flag read-back is the cleanup evidence.
+
+```bash
+( set -euo pipefail
+  cd /home/brentiburo/projects/OpsAccord
+  deactivate 2>/dev/null || true
+  source .venv/bin/activate
+  export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+  export UV_CACHE_DIR=/tmp/uvcache
+  PYTHON="$PWD/.venv/bin/python"
+  TS="$(date -u +%Y%m%dT%H%M%S)"; LOGDIR=".local/user-p1-01-$TS"; mkdir -p "$LOGDIR"
+  echo "interpreter: $("$PYTHON" -c 'import sys; print(sys.executable)')"
+  echo "tested revision: $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD)"
+  echo "evidence dir: $LOGDIR"
+  echo "This block runs one live fault path, P1-01 (payment unreachable): the driver arms paymentUnreachable, escalates for the approval, remediates and verifies, and is expected to restore the flag."
+
+  echo "--- 0. what this shell already sees, and the stack as it stands ---"
+  git status --porcelain=v1 | tee "$LOGDIR/00-git-status.log"
+  set +e
+  bash scripts/demo.sh health 2>&1 | tee "$LOGDIR/00-demo-health.log"; health_rc=${PIPESTATUS[0]}
+  set -e
+  echo "demo.sh health exited $health_rc (0 every published port and adapter API answered; 1 at least one did not)"
+  echo "this preflight only reports: the runner has its own stack stage and starts the stack there if it is not answering"
+
+  echo "--- 1. the focused live path, P1-01, with progress and its own gates ---"
+  set +e
+  scripts/validate.sh --live --scenario P1-01 2>&1 | tee "$LOGDIR/10-p1-01.log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  echo "validate exit: $rc (0 every stage passed; 2 usage; 3 a competing driver; anything else is the failing stage's own status)"
+  echo "runner logs: $(sed -n 's/^logs: //p' "$LOGDIR/10-p1-01.log" | head -1)"
+
+  echo "--- 2. cleanup, read back from the flag store (read-only GET) ---"
+  set +e
+  if [ -f .local/demo-endpoints.env ]; then
+    set -a; . .local/demo-endpoints.env; set +a
+    "$PYTHON" -c 'import json, os, urllib.request as u
+base = os.environ["OPSACCORD_FLAG_CONTROL_BASE_URL"].rstrip("/")
+doc = json.load(u.urlopen(base + "/api/read", timeout=10))
+flags = doc.get("flags", {})
+print("\n".join("%s=%s" % (name, (spec or {}).get("defaultVariant")) for name, spec in sorted(flags.items())))' 2>&1 | tee "$LOGDIR/20-flags-after.log"
+    echo "paymentUnreachable should read off above: P1-01 arms it and the driver restores it"
+  else
+    echo "no .local/demo-endpoints.env; the runner's endpoints stage writes it" | tee "$LOGDIR/20-flags-after.log"
+  fi
+  set -e
+
+  echo "evidence dir: $LOGDIR"
+  echo "the path's own record: the newest reports/local/live-scenarios-*.json named in the runner's 13-live-paths.log"
+  echo "send back $LOGDIR, that JSON, and the runner's reports/local/validation-*/summary.log"
+  exit "$rc"
 )
 ```

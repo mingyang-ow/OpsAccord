@@ -1040,8 +1040,25 @@ def test_the_documented_readiness_table_matches_the_pinned_revision() -> None:
     assert 'index .Config "Healthcheck"' in script
 
 
-def test_the_handed_off_block_reads_readiness_before_it_captures() -> None:
-    """The block is the user-run artifact, and its order is what makes a capture valid.
+def _report_bash_blocks() -> list[str]:
+    """Every bash fence in the implementation report, in document order."""
+    report = (REPO_ROOT / "docs" / "reports" / "phase1-implementation.md").read_text(
+        encoding="utf-8"
+    )
+    fences = re.findall(r"```bash\n(.*?)\n```", report, flags=re.DOTALL)
+    assert fences, "no bash block found in the report; these guards would be vacuous"
+    return fences
+
+
+def _newest_fence_containing(marker: str) -> str:
+    """The last fence that names *marker*, which is the copy a reader would take."""
+    matching = [block for block in _report_bash_blocks() if marker in block]
+    assert matching, f"no bash block in the report mentions {marker!r}"
+    return matching[-1]
+
+
+def test_the_capture_block_reads_readiness_before_it_captures() -> None:
+    """The capture artifact reads the stack it measures, and its order is what makes that valid.
 
     The shape of the *run* changed on 2026-10-15 and this guard changed with it: the
     recovery restart is no longer part of the handed-off block, because the user has
@@ -1050,13 +1067,12 @@ def test_the_handed_off_block_reads_readiness_before_it_captures() -> None:
     refresh the endpoints, probe every published port and the three adapter APIs - and
     reach the fresh capture **only** past that gate, with a failure propagating instead
     of being read as health. It must also start nothing at all.
+
+    It is no longer the *last* block in the report - the handed-off artifact is now the
+    focused live path - but it is kept there as the reproduction command for the
+    baseline, so its guarantees are still pinned rather than dropped.
     """
-    report = (REPO_ROOT / "docs" / "reports" / "phase1-implementation.md").read_text(
-        encoding="utf-8"
-    )
-    fences = re.findall(r"```bash\n(.*?)\n```", report, flags=re.DOTALL)
-    assert fences, "no bash block found in the report; this guard would be vacuous"
-    block = fences[-1]
+    block = _newest_fence_containing("capture-baseline-checkout.py")
 
     assert "scripts/demo.sh endpoints" in block
     assert "scripts/demo.sh health" in block
@@ -1090,3 +1106,37 @@ def test_the_handed_off_block_reads_readiness_before_it_captures() -> None:
         "run-live-scenarios",
     ):
         assert mutating not in block, mutating
+
+
+def test_the_handed_off_block_runs_one_live_path_and_keeps_its_status() -> None:
+    """The handed-off artifact runs the focused live path, and hands the runner's status back.
+
+    With the fault-free baseline verified, the next action moved from capturing to the
+    P1-01 live path, and this guard follows the artifact the user is asked to run. The
+    checks differ from the capture block's on purpose: a live scenario *does* start the
+    stack and inject a fault, so what has to hold is that it delegates that to the
+    runner - one scenario, the runner's own gates, the endpoint settings inside this
+    shell only - and that the block's exit status is the runner's, not `tee`'s. It must
+    not capture a baseline, and it must not restart the stack behind the runner's back.
+    """
+    block = _report_bash_blocks()[-1]
+
+    assert "scripts/validate.sh --live --scenario P1-01" in block
+    # The runner owns the stack and the fault; the block only reads health first.
+    assert "scripts/demo.sh health" in block
+    assert "capture-baseline-checkout.py" not in block
+    # Explicit environment, and endpoint settings scoped to this subshell.
+    assert 'UV_PROJECT_ENVIRONMENT="$PWD/.venv"' in block
+    assert "source .venv/bin/activate" in block
+    assert "set -a; . .local/demo-endpoints.env; set +a" in block
+    # The runner's status is the block's status, and the failure survives the pipe.
+    assert "rc=${PIPESTATUS[0]}" in block
+    assert 'exit "$rc"' in block
+    # Cleanup is read back from the flag store rather than assumed.
+    assert "/api/read" in block
+    for behind_its_back in (
+        "scripts/demo.sh restart",
+        "scripts/pg.sh start",
+        "scripts/pg.sh ensure",
+    ):
+        assert behind_its_back not in block, behind_its_back
