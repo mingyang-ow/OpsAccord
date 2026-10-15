@@ -3710,11 +3710,24 @@ trace only when all of the following hold, each recorded separately with the evi
 - **`payment_charge_on_path`** - a `payment` *server* span for `oteldemo.PaymentService/Charge` whose
   relationship to the attempt is `direct_child` or `descendant`. A Charge span in an unrelated branch,
   or one whose ancestry is unresolved, is reported with that relationship named;
-- **`explicit_success`** - the entry and edge spans both record `OK` with a named status source
-  (`otel.status_code`, a gRPC code, and so on), and no span on the reconstructed path records `ERROR`.
-  `UNSET` is reported as `UNSET`: a span that wrote no status is not a success;
+- **`explicit_success`** - an affirmative success with a named status source (`otel.status_code`, a gRPC
+  code, and so on) and no span on the reconstructed path recording `ERROR`. Either the entry and edge
+  spans both record `OK`, or - where the measured operation's own *server* span records `UNSET`, which is
+  what this revision's Go services write on a successful call - the **caller's** client span for that same
+  operation records `OK` from a named source and is tied to this exact attempt by the attempt's own
+  parent reference. `UNSET` is reported as `UNSET` in both cases: a span that wrote no status is not a
+  success, and the caller's record is not read back into the attempt's own status;
 - **`fault_flags_safe`** - the flag document read from flagd-ui holds every flag in `FLAG_SAFE_VARIANT`
   at its safe variant. A document that could not be read is reported as *unverified*, never as safe.
+
+- **`fault_flags_safe`** - the flag document read from flagd-ui holds every flag in `FLAG_SAFE_VARIANT`
+  at its safe variant. A document that could not be read is reported as *unverified*, never as safe.
+
+> **Updated 2026-10-15 (the option-B pass).** `explicit_success` gained the correlated-caller path described
+> above, at the user's direction, after the live run showed the clause refusing a healthy baseline on a span
+> this revision never writes a status to. The direct path is unchanged, `UNSET` is still reported as `UNSET`
+> and the shared status classifier is untouched. See "The option-B pass" at the end of this report and
+> [D35](decisions/D35-the-baseline-s-success-may-come-from-the-caller.md).
 
 Refusals are distinguished rather than flattened: an empty interval, a failed query, an unreached edge,
 a client-only edge span, an edge in another branch and an unread flag document each produce their own
@@ -3972,7 +3985,7 @@ from one already in flight when it was made. The gate now has a second half:
 | A UTC observation-start boundary | recorded as `observation_start` (microsecond precision) and `observation_start_us` |
 | A **new** Checkout attempt | the measured attempt's own `started_at_us` must be `>=` the boundary; a request that began earlier is refused by name (`attempt_after_boundary`) however healthy it is |
 | Catalog and Payment on *that* attempt | the ancestry walk in `summarize_trace`: the catalog's `server` span and Payment's `server` span must be `direct_child`/`descendant`/`same_span` of the attempt |
-| Explicit success | the attempt and the Charge span both `OK` with a named status source and no `ERROR` on the reconstructed path; `UNSET` is reported as `UNSET` |
+| Explicit success | the attempt and the Charge span both `OK` with a named status source and no `ERROR` on the reconstructed path; where the attempt itself is `UNSET` (this revision's Go services write no status on a successful call) the caller's client span for the same operation, linked through the attempt's own parent reference, may carry the `OK` instead - and `UNSET` is still reported as `UNSET` |
 | Bounded ingestion polling | repeated bounded requests (explicit `limit`, explicit `start`/`end`, 10s timeout) until a documented overall deadline (default 180s), both reported under `polling` |
 | Flags re-read, refusal on change | a second reading is taken when the first payload arrives (or at the end, if none did); a relevant flag that moved, became unsafe or could not be read either time blocks the verdict |
 | Sanitized spans, promptly | every observed payload's sanitized spans and both timestamps go into the extract, which is written before the rendered log |
@@ -4641,6 +4654,9 @@ stage; both corrections held, and it stopped at the capture on one clause of `ex
 pinned revision cannot satisfy - the measured operation's own server span writes no status, so a successful
 call to it reads `UNSET`. See "The live recovery-and-baseline run" below: that section is the current
 position, and the block under this paragraph is the record of what was run rather than the next action.
+**Since the option-B pass, the block to run is the last one in this document** ("The option-B pass",
+at the end): it captures the fresh baseline and nothing else, reads readiness instead of assuming it, and
+starts no container, database or flag.
 
 
 ```bash
@@ -4961,3 +4977,199 @@ explicit environment activation, the project directory, revision and interpreter
 the PostgreSQL safeguards, the fresh endpoint discovery, failure propagation through every stage, and the
 fresh baseline capture - with the two corrections above in place of the name-based poll and the
 catalog-only gate.
+
+## The option-B pass (this commit) - `explicit_success` may read the caller's own record of the measured call, and the attempt's `UNSET` is left exactly as it was written
+
+Appended 2026-10-15 at the user's explicit direction, on top of `727c890`. What it answers is **the user's
+live run**, recorded in "The live recovery-and-baseline run" above: the corrected recovery block ran every
+stage, the in-place restart held, both restarted services verified READY, and the capture then returned
+`not_verified` on one property - `explicit_success` - because the measured operation's own *server* span is
+`UNSET(no status signal)`. **No new live reading is claimed in this section.** Every live measurement quoted
+here is the user's; the code, its tests and these records are this pass's.
+
+### Why the clause refused a healthy baseline
+
+The clause asked the measured attempt's own server span to record `OK` from a named source. The captured
+payloads are what show that this revision stores a *successful* call to that operation as `UNSET(no status
+signal)`: five fresh candidates, five times the same reading on the attempt, while the spans whose
+instrumentation does write a status read `OK` from a named source in the very same payloads (`frontend` and
+`payment`: `rpc.grpc.status_code`; `cart` and `shipping`: `http.response.status_code`; `currency`:
+`otel.status_code`). The pinned instrumentation is consistent with that - the `checkout` service registers
+`otelgrpc.NewServerHandler` and its `PlaceOrder` handler records attributes only, with
+`SetStatus(otelcodes.Error, ...)` confined to the Kafka producer's failure paths - but it is the captured
+evidence that establishes what a successful call is *stored* as. The absence of a `SetStatus` call is not,
+by itself, a proof about every status this operation can emit, and this report does not claim it is.
+
+Two things were deliberately **not** done. `UNSET` was not redefined as success, and the shared status
+classifier (`opsaccord.tools.fault_evidence.span_status`) was not touched: a span that wrote no status still
+reads `UNSET(no status signal)` everywhere, and the extract still carries that reading verbatim for the
+attempt.
+
+### What the clause accepts now
+
+`explicit_success` has two paths, and the second is narrow by construction. The direct path is unchanged:
+the attempt records `OK`, the measured edge's own `payment` server span records `OK`, and no span on the
+reconstructed path records `ERROR`. The added path applies **only where the attempt itself records
+`UNSET`** - a callee that wrote a status is never second-guessed by its caller - and requires all of:
+
+| Condition | How it is met |
+| --- | --- |
+| The right span | a `frontend` span, `client` kind, carrying exactly `oteldemo.CheckoutService/PlaceOrder` |
+| An affirmative RPC status | `OK` with a **named** source (`rpc.grpc.status_code` in the captured payload). A span whose status has no source is never read as success |
+| The association | the attempt's **own** `parent_span_id` names that span, and the reconstructed walk agrees (`ancestor`, 1 hop). A shared trace id, matching operation text, time proximity and "the longest span" are each explicitly insufficient, and the code says so |
+| Unambiguous | exactly **one** such span. Two - a payload holding the caller's id twice - is ambiguous and is refused rather than picked between |
+| Complete, consistent timing | both spans have a start and an end, start < end, and the caller **encloses** the attempt (starts no later than it, ends no earlier). A caller with inverted or missing timing, or one that does not enclose the attempt, is refused |
+| On the path, inside the observation | the caller span is on the attempt's reconstructed path, and the attempt still has to have begun after the observation boundary - the freshness gate is untouched and still decides that |
+| The measured edge, on that same attempt | the `payment` server span for `Charge` must still be on the path and record `OK`: the caller's `OK` never stands in for the edge |
+| No contradiction | no span on the reconstructed path may record `ERROR`; an attempt that itself records `ERROR` is refused before any caller evidence is consulted, and a caller that recorded a failure is refused |
+
+When the caller's span satisfies the clause, the extract gains a machine-readable `success_source` beside
+the checks and the human log prints a `[provenance]` line: the basis (`server` or `correlated_caller`), the
+source span's id, parent, service, operation, kind, status and status source, its relationship to the
+attempt and its hop count, and **the attempt's own status**, so a reader can see that a caller's `OK` never
+rewrote an `UNSET`. Everything else is unchanged: the safe flag pair, the competing-driver check and its
+stated limits, the bounded fresh-request polling, the explicit catalog and Payment requirements, and the
+rule that missing data, incomplete ancestry and ambiguity stay unverified.
+
+### Regression coverage
+
+`tests/unit/test_baseline_checkout_capture.py` goes from **35** to **54** tests; the fixture helper now
+writes a status in the spelling its own source uses (`rpc.grpc.status_code` is a number, `otel.status_code`
+is a word), because the frontend writes the former and a fixture using the other spelling would test a
+payload the demo never emits. The added cases follow the user's list, one condition at a time:
+
+| Case | Test |
+| --- | --- |
+| The live shape passes: attempt `UNSET` plus the correlated caller `OK` | `test_an_unset_server_span_with_its_correlated_caller_span_can_pass` (also pins `success_source` in full and that the attempt's own `UNSET` is untouched) |
+| `UNSET` without affirmative caller evidence | `test_a_unset_server_span_without_affirmative_caller_evidence_is_not_success`, `test_a_unset_server_span_with_no_caller_span_at_all_is_not_success` |
+| A successful outer HTTP response alone | `test_a_successful_outer_http_response_alone_is_not_success` (the HTTP span is shown reading `OK` and still refused) |
+| A successful unrelated RPC, or another attempt in the same trace | `test_a_successful_call_to_the_same_operation_elsewhere_cannot_satisfy_it` |
+| A successful retry cannot conceal the measured failed attempt | `test_a_successful_retry_cannot_conceal_the_measured_failed_attempt` |
+| Client RPC failure, or a contradiction on the path | `test_a_caller_span_that_recorded_a_failure_is_not_success`, `test_contradictory_error_evidence_on_the_path_refuses_the_caller_path`, `test_a_caller_that_recorded_a_failure_contradicts_a_successful_callee` |
+| Missing, ambiguous or invalid references | `test_a_caller_span_this_attempt_does_not_name_is_refused`, `test_two_spans_carrying_the_callers_id_are_ambiguous_and_not_success` |
+| Incomplete spans or invalid timing | `test_a_caller_span_with_incomplete_or_inverted_timing_cannot_pass`, `test_a_caller_span_that_does_not_enclose_the_attempt_cannot_pass` |
+| Historical requests cannot satisfy the fresh boundary | `test_the_caller_path_cannot_rescue_a_historical_attempt` (the clause passes and the boundary still refuses the run) |
+| Direct server success still works | `test_a_direct_server_success_remains_its_own_path` |
+| Catalog, Payment and flag requirements still enforced | `test_the_caller_path_never_weakens_the_catalog_or_edge_requirements`, `test_an_armed_flag_still_blocks_a_caller_satisfied_baseline` |
+| Provenance reported | `test_the_extract_and_the_log_report_which_span_satisfied_the_clause` |
+
+The falsification is explicit: `test_the_gate_would_accept_an_unrelated_caller_without_the_reference_check`
+builds a call tree where the caller's client span sits two hops above the attempt, shows it refused, then
+patches the reference predicate away and shows the same payload accepted - so the parent reference, and not
+the operation name, is what ties the evidence to the attempt.
+
+### The user's saved evidence, re-evaluated offline
+
+The classifier as it now stands was re-run **over the file the user's run wrote**,
+`reports/local/baseline-checkout-20261015T084616.json` - no service was queried, no container or flag was
+touched. **This is an offline reading of a saved payload, not a live baseline and not a P1-01 result.**
+On the chosen trace it now returns verified, with the success clause satisfied by the caller's own span:
+
+| Field | Value |
+| --- | --- |
+| Attempt | `checkout` **server** span `96c0499435831911`, `oteldemo.CheckoutService/PlaceOrder`, `UNSET(no status signal)` - unchanged |
+| Success source | `frontend` **client** span `c5404aaa93c9d5ba`, same operation, `OK(rpc.grpc.status_code)`, the attempt's parent reference (`ancestor`, 1 hop) |
+| Basis | `correlated_caller` |
+| Edge | `payment` server span `f0e74c60b9b78b4f`, `OK(rpc.grpc.status_code)`, descendant at 2 hops; no `ERROR` on the path |
+| Artifact | `reports/local/baseline-reevaluation-20261015T084616.json` (local, untracked) |
+
+The other checks - freshness, both flag readings, the driver scan, the catalog's served `GetProduct` and the
+edge - are the same ones that passed on this payload when the user ran it; what changed is only the clause
+that refused it.
+
+### Checks executed in this pass
+
+| Check | Result |
+| --- | --- |
+| `tests/unit/test_baseline_checkout_capture.py` | **54 passed** (35 before; +19) |
+| Offline suite, `-m "not integration"` | **388 passed, 7 skipped, 85 deselected** (369 before) |
+| `ruff check .` / `ruff format --check .` | `All checks passed!` / 95 files already formatted |
+| `mypy src/opsaccord` / `mypy scripts/capture-baseline-checkout.py` / `mypy` on the test file | no issues in 42 source files / clean / clean |
+| `bash -n` on the new block | clean |
+| The two block copies (report and runbook) | byte-identical (extracted and compared) |
+| Offline re-evaluation of the user's saved extract | verified, `success_source.satisfied_by = correlated_caller` (see above) |
+
+### Not run, and why
+
+- **The fresh baseline capture.** This sandbox reaches neither Docker nor a loopback port:
+  `bash scripts/demo.sh endpoints` exits **1** (`compose port` fails writing the override to the Windows
+  mount - `Read-only file system` - and WSL's vsock socket fails), `bash scripts/demo.sh inspect` exits
+  **1** (`the Docker engine did not answer`), `bash scripts/demo.sh health` exits **1** on every port, and a
+  direct `GET http://127.0.0.1:16686/jaeger/ui/api/services` raises
+  `ConnectError [Errno 1] Operation not permitted`. Nothing was started, restarted, stopped or armed, and no
+  previously rejected escalation was retried.
+- **P1-01 and the other live scenarios.**
+- **The integration suite**, which needs the live stack.
+
+**Phase 1 remains PARTIAL.** The fault-free baseline is still unverified *live* on this revision - the
+offline re-evaluation above is a statement about a saved file - and Payment recovery remains unverified.
+
+### The one next action (host shell, one block)
+
+Run the block below as it stands; it is the last block in this document and the only current one. It
+**starts nothing** - no database, no container, no flag, no fault - reads the stack that is running,
+refuses to continue if a published port or an adapter API does not answer, and then captures one fresh
+baseline. The runbook's "The current next action" chapter carries the same block, byte-identically.
+
+```bash
+( set -euo pipefail
+  cd /home/brentiburo/projects/OpsAccord
+  deactivate 2>/dev/null || true
+  source .venv/bin/activate
+  export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+  PYTHON="$PWD/.venv/bin/python"
+  TS="$(date -u +%Y%m%dT%H%M%S)"; LOGDIR=".local/user-baseline-capture-$TS"; mkdir -p "$LOGDIR"
+  export OPSACCORD_DOCKER_BIN="${OPSACCORD_DOCKER_BIN:-/mnt/c/Users/admin/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe}"
+  echo "interpreter: $("$PYTHON" -c 'import sys; print(sys.executable)')"
+  echo "tested revision: $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD)"
+  echo "evidence dir: $LOGDIR"
+  echo "This block starts nothing: no database, no container and no flag. It reads the stack that is already running, stops if it cannot, and then captures one fresh baseline."
+
+  echo "--- 0. what this shell already sees, preserved before anything is read ---"
+  git status --porcelain=v1 | tee "$LOGDIR/00-git-status.log"
+  if [ -f .local/demo-endpoints.env ]; then cp -p .local/demo-endpoints.env "$LOGDIR/00-demo-endpoints.env.before"; fi
+  if [ -e .local/pg/data/postmaster.pid ]; then cp -p .local/pg/data/postmaster.pid "$LOGDIR/00-postmaster.pid.before"; fi
+
+  echo "--- 1. the stack as it stands, read rather than assumed ---"
+  set +e
+  bash scripts/demo.sh inspect 2>&1 | tee "$LOGDIR/01-demo-inspect.log"; inspect_rc=${PIPESTATUS[0]}
+  set -e
+  echo "demo.sh inspect exited $inspect_rc (0 every container reported its full state; 1 at least one was reported without its per-container detail)"
+  if grep -E 'load-generator|checkout|payment|product-catalog|otel-collector' "$LOGDIR/01-demo-inspect.log" >"$LOGDIR/01b-key-containers.log"; then
+    cat "$LOGDIR/01b-key-containers.log"
+  else
+    echo "none of load-generator/checkout/payment/product-catalog/otel-collector appears in the inspect output" >&2
+  fi
+
+  echo "--- 2. endpoints, refreshed read-only, and every published port and adapter API probed ---"
+  bash scripts/demo.sh endpoints 2>&1 | tee "$LOGDIR/02-endpoints.log"
+  test -s .local/demo-endpoints.env
+  for var in OPSACCORD_DEMO_MODE OPSACCORD_PROMETHEUS_BASE_URL OPSACCORD_JAEGER_BASE_URL OPSACCORD_FLAG_CONTROL_BASE_URL; do
+    grep -q "^$var=" .local/demo-endpoints.env || { echo "STOP: $var is missing from the refreshed endpoint file" >&2; exit 1; }
+  done
+  set -a; . .local/demo-endpoints.env; set +a
+  set +e
+  bash scripts/demo.sh health 2>&1 | tee "$LOGDIR/03-demo-health.log"; health_rc=${PIPESTATUS[0]}
+  set -e
+  if [ "$health_rc" -ne 0 ]; then
+    echo "STOP: at least one published port or adapter API did not answer, so the capture is not started. See 03-demo-health.log; nothing was started, restarted or armed. Send $LOGDIR back." >&2
+    exit 1
+  fi
+  echo "every published port and the three adapter APIs answered; the endpoint settings above are exported inside this subshell only"
+
+  echo "--- 3. the fresh baseline: a request that begins after this point, not one already in flight ---"
+  OUT="reports/local/baseline-checkout-$TS.json"; LOG="reports/local/baseline-checkout-$TS.log"
+  set +e
+  "$PYTHON" scripts/capture-baseline-checkout.py --deadline-seconds 180 --poll-interval-seconds 10 --out "$OUT" --log "$LOG" 2>&1 | tee "$LOGDIR/10-baseline-capture.log"
+  cap_rc=${PIPESTATUS[0]}
+  set -e
+  echo "capture exit: $cap_rc (0 verified, 1 not verified, 3 refused to start)"
+  echo "extract: $OUT"
+  echo "capture log: $LOG"
+  echo "evidence dir: $LOGDIR"
+  if [ "$cap_rc" -ne 0 ]; then
+    echo "Not verified on this run. The capture names the property that failed and keeps the raw spans it did see; where the measured operation's own server span is UNSET, explicit_success can now be satisfied by the caller's correlated client span, so read its [provenance] line and success_source before treating a refusal as a stack fault. Send $LOGDIR back with the two reports/local files rather than re-running blind." >&2
+  fi
+  exit "$cap_rc"
+)
+```

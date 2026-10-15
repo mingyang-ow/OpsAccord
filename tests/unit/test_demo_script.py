@@ -1040,12 +1040,16 @@ def test_the_documented_readiness_table_matches_the_pinned_revision() -> None:
     assert 'index .Config "Healthcheck"' in script
 
 
-def test_the_handed_off_block_verifies_before_it_captures() -> None:
+def test_the_handed_off_block_reads_readiness_before_it_captures() -> None:
     """The block is the user-run artifact, and its order is what makes a capture valid.
 
-    The two corrections this pass makes are only worth anything if the run that follows
-    reads them: the block must resolve the two containers by label, gate on the bounded
-    verification, and reach the fresh capture only past that gate.
+    The shape of the *run* changed on 2026-10-15 and this guard changed with it: the
+    recovery restart is no longer part of the handed-off block, because the user has
+    already performed it and repeating it would replace the state being measured with a
+    new one. What the artifact must still do is read the stack it is about to measure -
+    refresh the endpoints, probe every published port and the three adapter APIs - and
+    reach the fresh capture **only** past that gate, with a failure propagating instead
+    of being read as health. It must also start nothing at all.
     """
     report = (REPO_ROOT / "docs" / "reports" / "phase1-implementation.md").read_text(
         encoding="utf-8"
@@ -1054,9 +1058,35 @@ def test_the_handed_off_block_verifies_before_it_captures() -> None:
     assert fences, "no bash block found in the report; this guard would be vacuous"
     block = fences[-1]
 
-    assert "scripts/demo.sh service-container product-catalog otel-collector" in block
-    assert "scripts/demo.sh verify-recovery --budget-seconds" in block
-    verify_at = block.index("scripts/demo.sh verify-recovery")
+    assert "scripts/demo.sh endpoints" in block
+    assert "scripts/demo.sh health" in block
+    assert "capture-baseline-checkout.py" in block
+    endpoints_at = block.index("scripts/demo.sh endpoints")
+    health_at = block.index("scripts/demo.sh health")
     capture_at = block.index("capture-baseline-checkout.py")
-    assert verify_at < capture_at
-    assert "verify_rc" in block[verify_at:capture_at]
+    assert endpoints_at < health_at < capture_at
+    # The probe's own status decides whether the capture runs, and the run's status is
+    # the capture's: an ungated probe would let a stack that is not answering be
+    # measured, and a swallowed status would report the block's exit as the tee's.
+    gate = block[health_at:capture_at]
+    assert "health_rc=${PIPESTATUS[0]}" in gate
+    assert 'if [ "$health_rc" -ne 0 ]' in gate
+    assert "exit 1" in gate
+    assert "cap_rc=${PIPESTATUS[0]}" in block[capture_at:]
+    assert 'exit "$cap_rc"' in block[capture_at:]
+    # The endpoint settings are scoped to the subshell, and the project environment is
+    # named explicitly rather than inherited from whatever shell the user is in.
+    assert "set -a; . .local/demo-endpoints.env; set +a" in block
+    assert 'UV_PROJECT_ENVIRONMENT="$PWD/.venv"' in block
+    # It reads. It starts nothing: no database, no container, no scenario, no fault.
+    for mutating in (
+        "scripts/demo.sh start",
+        "scripts/demo.sh ensure",
+        "scripts/demo.sh restart",
+        "scripts/demo.sh pull",
+        "scripts/pg.sh start",
+        "scripts/pg.sh ensure",
+        "validate.sh --live",
+        "run-live-scenarios",
+    ):
+        assert mutating not in block, mutating

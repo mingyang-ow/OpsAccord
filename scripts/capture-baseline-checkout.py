@@ -46,6 +46,19 @@ in ``--out`` and the human-readable log in ``--log``, and the extract - which ca
 every observed payload's sanitized spans and timestamps, not a summary of them - is
 written before the log is rendered.
 
+The success clause has two paths, and the second one is deliberately narrow. A direct
+success is the measured operation's own *server* span recording ``OK`` from a named
+source. Where that span records ``UNSET`` - which is what the pinned revision's Go
+services do, and what the captured evidence shows - the property can still be
+satisfied by the **caller's** client span for the same RPC: the same operation, the
+frontend's ``client`` kind, an affirmative RPC status from a named source, and linked
+to this exact attempt by the payload's own parent reference (the attempt's
+``parent_span_id`` - not the shared trace id, the operation text, proximity in time,
+or the longest span), with both spans complete and time-consistent and the caller
+enclosing the attempt. That does not rewrite ``UNSET`` into success: the attempt's own
+status stays ``UNSET`` in the evidence, ``UNSET`` stays unknown, and the extract
+reports which path satisfied the property and the span it came from.
+
 An empty answer is not health, ``UNSET`` is not success, a pre-boundary request is
 not a fresh observation, and one verified trace is a statement about the request it
 came from: not about sustained reliability, and not a P1-01 result.
@@ -74,6 +87,7 @@ from opsaccord.tools.fault_evidence import (
     POSITION_UNKNOWN,
     SPAN_STATUS_ERROR,
     SPAN_STATUS_OK,
+    SPAN_STATUS_UNSET,
     summarize_trace,
 )
 from opsaccord.tools.live_environment import FLAG_SAFE_VARIANT, JaegerClient
@@ -91,6 +105,21 @@ CATALOG_OPERATION_TOKEN = "ProductCatalog"
 #: (``server`` and ``SPAN_KIND_SERVER``) to the semantic-convention word, so the
 #: comparison is made on that word rather than on either spelling.
 SERVER_KIND = "server"
+
+#: The caller whose own client span carries the RPC's view of the call, and the kind
+#: that span has to be. For the measured operation the caller is the demo's web
+#: frontend: its ``oteldemo.CheckoutService/PlaceOrder`` *client* span is the call
+#: whose completion the measured *server* span is the callee's side of, and it sits
+#: directly above the attempt as the attempt's own ``parent_span_id``.
+CALLER_SERVICE = "frontend"
+CLIENT_KIND = "client"
+
+#: How the caller's client span is tied to the attempt: the attempt names it as its
+#: parent, so the caller is the attempt's ancestor at one hop. Written out because the
+#: association has to be a reference relationship - a shared trace id, an identical
+#: operation name, or a nearby timestamp would each match a retry, a sibling branch or
+#: an unrelated request that happens to share the trace.
+CALLER_RELATIONSHIP = "ancestor"
 
 #: Relationships that put a span *below* the measured attempt: the attempt itself,
 #: its direct children, and anything further down its own subtree. ``ancestor``,
@@ -161,6 +190,16 @@ def iso(seconds: float) -> str:
 def iso_us(micros: int) -> str:
     """A UTC instant at the resolution the query API reports spans in."""
     return datetime.fromtimestamp(micros / 1_000_000, tz=UTC).isoformat(timespec="microseconds")
+
+
+def _us(value: Any) -> int | None:
+    """One microsecond field as an integer, or ``None`` when it was not written."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _epoch_micros() -> int:
@@ -466,6 +505,143 @@ def competing_drivers() -> list[str]:
     return found
 
 
+def caller_names_this_attempt(span: Mapping[str, Any], attempt: Mapping[str, Any]) -> bool:
+    """Whether the payload ties one client span to *this* attempt.
+
+    The only reference used: the attempt names the caller as its ``parent_span_id``.
+    It is a function of its own so the check can be falsified - with it removed, a
+    span that merely shares the trace and the operation name would be accepted, which
+    is exactly the association this clause must not make.
+    """
+    parent = attempt.get("parent_span_id")
+    return parent is not None and span.get("span_id") == parent
+
+
+def caller_success_candidates(
+    summary: Mapping[str, Any],
+    attempt: Mapping[str, Any],
+    path_ids: set[Any],
+) -> tuple[list[Mapping[str, Any]], list[str]]:
+    """The caller's own client spans that could carry this attempt's success.
+
+    Two conditions do different work here and are kept apart. The operation name and
+    the ``client`` kind only *narrow* the search to "a call to the measured
+    operation"; what ties a candidate to *this* attempt is the payload's own
+    reference - the caller is the span *the attempt names as its parent*, so the walk
+    from the attempt reports it as ``ancestor`` at one hop. A shared trace id, the
+    operation text alone, or a nearby timestamp would each also match a retry, a
+    sibling branch of the same trace, or a second request that the store happened to
+    keep beside this one, so none of them is used.
+
+    Everything else is a condition the evidence has to meet rather than a preference:
+    an affirmative RPC status from a *named* source (a status with no source is not
+    read as success anywhere in this code), the span on the attempt's reconstructed
+    path, and both spans complete with the caller starting no later than the attempt
+    and ending no earlier than it - the caller enclosing the attempt, with the attempt
+    carrying the timing to compare against. Enclosure is also what keeps the caller's
+    span straddling the observation boundary: the attempt begins after it, so a caller
+    that encloses the attempt was still in flight across it rather than before it.
+
+    Returns the candidates in payload order and, separately, why each near miss was
+    refused, so a failed capture can say what was looked for instead of only that
+    nothing was found.
+    """
+    spans = [span for span in (summary.get("spans") or []) if isinstance(span, Mapping)]
+    attempt_id = attempt.get("span_id")
+    attempt_parent = attempt.get("parent_span_id")
+    attempt_started = _us(attempt.get("started_at_us"))
+    attempt_ended = _us(attempt.get("ends_at_us"))
+    candidates: list[Mapping[str, Any]] = []
+    refused: list[str] = []
+    for span in spans:
+        if span.get("operation") != CHECKOUT_OPERATION or span.get("span_kind") != CLIENT_KIND:
+            continue
+        where = (
+            f"{span.get('service')}/{span.get('span_kind')} span {span.get('span_id')} "
+            f"({span.get('operation')})"
+        )
+        if span.get("service") != CALLER_SERVICE:
+            refused.append(f"{where} is not the {CALLER_SERVICE} caller")
+            continue
+        if not caller_names_this_attempt(span, attempt):
+            refused.append(
+                f"{where} is not the span this attempt names as its parent "
+                f"({attempt_parent or '(nothing)'}), so no reference ties it to the attempt "
+                f"{attempt_id} rather than to another call in the same payload"
+            )
+            continue
+        if span.get("relationship") != CALLER_RELATIONSHIP:
+            refused.append(
+                f"{where} is the attempt's parent reference but the reconstructed walk calls it "
+                f"{span.get('relationship')!r}, not {CALLER_RELATIONSHIP!r}"
+            )
+            continue
+        if span.get("status") != SPAN_STATUS_OK or not span.get("status_source"):
+            refused.append(
+                f"{where} records {span.get('status')}({span.get('status_source')}), which is not "
+                "an affirmative RPC status from a named source"
+            )
+            continue
+        if span.get("span_id") not in path_ids:
+            refused.append(f"{where} is not on the attempt's reconstructed path")
+            continue
+        if attempt_started is None or attempt_ended is None:
+            refused.append(
+                "the attempt carries no complete timing, so no caller span can be shown to "
+                "enclose it"
+            )
+            continue
+        started = _us(span.get("started_at_us"))
+        ended = _us(span.get("ends_at_us"))
+        if started is None or ended is None or started >= ended:
+            refused.append(
+                f"{where} has incomplete or inverted timing, so it cannot be shown to have been "
+                "in flight for the attempt"
+            )
+            continue
+        if not (started <= attempt_started and ended >= attempt_ended):
+            refused.append(
+                f"{where} ran {iso_us(started)}..{iso_us(ended)}, which does not enclose the "
+                f"attempt's {iso_us(attempt_started)}..{iso_us(attempt_ended)}"
+            )
+            continue
+        candidates.append(span)
+    return candidates, refused
+
+
+def success_provenance(
+    *,
+    basis: str,
+    satisfied_by: str,
+    span: Mapping[str, Any],
+    attempt: Mapping[str, Any],
+    relationship: str,
+) -> dict[str, Any]:
+    """Which span satisfied ``explicit_success``, and how it is tied to the attempt.
+
+    The property is about one request, so the answer is recorded against that
+    attempt: the attempt's own status is kept verbatim beside the span that
+    satisfied the clause, so a reader can see that a caller's ``OK`` never rewrote an
+    ``UNSET`` entry span.
+    """
+    return {
+        "basis": basis,
+        "satisfied_by": satisfied_by,
+        "attempt_span_id": attempt.get("span_id"),
+        "attempt_status": attempt.get("status"),
+        "attempt_status_source": attempt.get("status_source"),
+        "span_id": span.get("span_id"),
+        "parent_span_id": span.get("parent_span_id"),
+        "service": span.get("service"),
+        "operation": span.get("operation"),
+        "span_kind": span.get("span_kind"),
+        "status": span.get("status"),
+        "status_source": span.get("status_source"),
+        "relationship_to_attempt": relationship,
+        "hops_from_attempt": span.get("hops_from_attempt"),
+    }
+
+
 def evaluate_summary(
     summary: Mapping[str, Any],
     *,
@@ -592,28 +768,118 @@ def evaluate_summary(
     attempt_source = attempt.get("status_source") if attempt else None
     charge_status = charge_served[0].get("status") if charge_served else None
     charge_source = charge_served[0].get("status_source") if charge_served else None
-    if attempt_status != SPAN_STATUS_OK:
+    callers, caller_refusals = (
+        caller_success_candidates(summary, attempt, path_ids) if attempt is not None else ([], [])
+    )
+    success_source: dict[str, Any] | None = None
+    if attempt is None:
+        record(
+            "explicit_success",
+            False,
+            "no entry span was resolved in this payload, so no attempt has a success record "
+            "and no caller span can be tied to one",
+        )
+    elif attempt_status == SPAN_STATUS_ERROR:
+        record(
+            "explicit_success",
+            False,
+            f"the entry span's own status is {SPAN_STATUS_ERROR}"
+            f"({attempt_source or 'no status source'}), which contradicts any success: the "
+            "measured attempt itself recorded the failure, and a caller's own span cannot "
+            "outweigh the callee's",
+        )
+    elif attempt_status == SPAN_STATUS_OK:
+        # The direct path: the callee's own span says it completed the request, so no
+        # caller evidence is consulted - a weaker second opinion cannot replace it.
+        if not charge_served:
+            record(
+                "explicit_success",
+                False,
+                "the entry span is OK, but no Charge status can be read: the measured edge's own "
+                "server span is not on the attempt's path, so this attempt carries no affirmative "
+                "success signal for it",
+            )
+        elif charge_status != SPAN_STATUS_OK:
+            record(
+                "explicit_success",
+                False,
+                f"the entry span is OK but the {payment_service} Charge span's status is "
+                f"{charge_status}, so the measured edge carries no success signal",
+            )
+        elif failing_on_path:
+            record(
+                "explicit_success",
+                False,
+                f"{len(failing_on_path)} span(s) on the attempt's path recorded ERROR: "
+                f"{brief_spans(failing_on_path[:3])}",
+            )
+        else:
+            record(
+                "explicit_success",
+                True,
+                "the entry span and the "
+                f"{payment_service} Charge span both record OK with a named status source "
+                f"({attempt_source} / {charge_source}), and no "
+                "span on the reconstructed path recorded ERROR",
+            )
+            success_source = success_provenance(
+                basis="the measured operation's own server span",
+                satisfied_by="server",
+                span={**attempt, "relationship": "same_span", "hops_from_attempt": 0},
+                attempt=attempt,
+                relationship="same_span",
+            )
+    elif attempt_status != SPAN_STATUS_UNSET:
         record(
             "explicit_success",
             False,
             f"the entry span's own status is {attempt_status}"
-            f"({attempt_source or 'no attempt'}), which is not an "
-            "affirmative success",
+            f"({attempt_source or 'no status source'}), which is neither a success nor a span that "
+            "recorded nothing: only a callee that wrote no status at all can be helped by the "
+            "caller's own record of the call",
+        )
+    elif len(callers) > 1:
+        record(
+            "explicit_success",
+            False,
+            f"the entry span's own status is {attempt_status}({attempt_source}) and "
+            f"{len(callers)} caller client spans each qualify as this attempt's caller "
+            f"({brief_spans(callers)}): an ambiguous caller is not evidence that this attempt "
+            "succeeded",
+        )
+    elif not callers:
+        why = (
+            "; ".join(caller_refusals)
+            if caller_refusals
+            else (
+                f"no {CALLER_SERVICE} {CLIENT_KIND} span carries {CHECKOUT_OPERATION!r} in this "
+                "payload at all"
+            )
+        )
+        record(
+            "explicit_success",
+            False,
+            f"the entry span's own status is {attempt_status}({attempt_source}), which is not an "
+            "affirmative success, and no caller client span supplies one: "
+            f"{why}. {CALLER_SERVICE} is asked because its client span for this operation is the "
+            "caller's own record of the call; a span with no status source is never read as "
+            "success",
         )
     elif not charge_served:
         record(
             "explicit_success",
             False,
-            "the entry span is OK, but no Charge status can be read: the measured edge's own "
-            "server span is not on the attempt's path, so this attempt carries no affirmative "
-            "success signal for it",
+            "the caller client span records the call as successful, but no Charge status can be "
+            "read: the measured edge's own server span is not on the attempt's path, so this "
+            "attempt carries no affirmative success signal for the edge it is measured on",
         )
     elif charge_status != SPAN_STATUS_OK:
         record(
             "explicit_success",
             False,
-            f"the entry span is OK but the {payment_service} Charge span's status is "
-            f"{charge_status}, so the measured edge carries no success signal",
+            f"the caller client span records the call as successful but the {payment_service} "
+            f"Charge span's status is {charge_status}, so the measured edge carries no success "
+            "signal",
         )
     elif failing_on_path:
         record(
@@ -623,13 +889,29 @@ def evaluate_summary(
             f"{brief_spans(failing_on_path[:3])}",
         )
     else:
+        caller = callers[0]
         record(
             "explicit_success",
             True,
-            "the entry span and the "
-            f"{payment_service} Charge span both record OK with a named status source "
-            f"({attempt_source} / {charge_source}), and no "
-            "span on the reconstructed path recorded ERROR",
+            f"the entry span's own status is {attempt_status}({attempt_source}) and the property "
+            f"is satisfied instead by the caller's own client span for the same operation: "
+            f"{caller.get('service')}/{caller.get('span_kind')} span {caller.get('span_id')} "
+            f"({caller.get('operation')}), status {caller.get('status')}"
+            f"({caller.get('status_source')}) from a named source, the attempt's own parent "
+            f"reference (relationship {caller.get('relationship')}, "
+            f"{caller.get('hops_from_attempt')} hop), complete and enclosing the attempt "
+            f"{iso_us(_us(attempt.get('started_at_us')) or 0)}.."
+            f"{iso_us(_us(attempt.get('ends_at_us')) or 0)}; the {payment_service} Charge span is "
+            f"{charge_status}({charge_source}) on that path, and no span on it recorded ERROR. "
+            f"The attempt's own status stays {attempt_status}: the caller's record of the call is "
+            "not a status the measured span wrote",
+        )
+        success_source = success_provenance(
+            basis="the caller's correlated client span for the same operation",
+            satisfied_by="correlated_caller",
+            span=caller,
+            attempt=attempt,
+            relationship=caller.get("relationship") or CALLER_RELATIONSHIP,
         )
 
     caveats: list[str] = []
@@ -658,6 +940,7 @@ def evaluate_summary(
         "verified": all(check["ok"] for check in checks),
         "blocking": [check["name"] for check in checks if not check["ok"]],
         "caveats": caveats,
+        "success_source": success_source,
     }
 
 
@@ -709,6 +992,7 @@ def candidate(
         "blocking": [check["name"] for check in checks if not check["ok"]],
         "checks": checks,
         "caveats": verdict["caveats"],
+        "success_source": verdict["success_source"],
         "summary": summary,
     }
 
@@ -925,7 +1209,12 @@ def capture(
             "service in that interval, or rotated it out, or the collector never kept it",
             "one verified trace describes the request it came from; it is not sustained "
             "reliability, and it is not a P1-01 result",
-            "UNSET is reported as UNSET: a span that wrote no status is not a success",
+            "UNSET is reported as UNSET: a span that wrote no status is not a success. Where the "
+            "measured operation's own server span is UNSET, explicit_success can be satisfied "
+            "only by the caller's client span for that same operation, tied to this attempt by "
+            "the attempt's own parent reference and carrying an affirmative RPC status from a "
+            "named source; which span satisfied the clause is reported as success_source, and "
+            "the attempt's own status is never rewritten",
             FLAG_GUARANTEE,
             "a request that began before the observation boundary is rejected however healthy it "
             "is, and ingestion delay means the newest traffic may still be missing from a query",
@@ -978,6 +1267,17 @@ def render(document: Mapping[str, Any]) -> str:
             lines.append(f"  [{mark}] {check['name']}: {check['detail']}")
         for caveat in item["caveats"]:
             lines.append(f"  [note] {caveat}")
+        source = item.get("success_source")
+        if source:
+            lines.append(
+                f"  [provenance] explicit_success from {source['satisfied_by']} "
+                f"({source['basis']}): {source['service']}/{source['operation']} span "
+                f"{source['span_id']} kind={source['span_kind']} "
+                f"status={source['status']}({source['status_source']}) is the "
+                f"{source['relationship_to_attempt']} of attempt {source['attempt_span_id']} "
+                f"at {source['hops_from_attempt']} hop(s), and the attempt's own status is "
+                f"{source['attempt_status']}({source['attempt_status_source']})"
+            )
 
     evidence = document.get("evidence")
     if evidence:

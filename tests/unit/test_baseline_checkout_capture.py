@@ -14,6 +14,15 @@ healthy request that was already in flight is refused, a request that appears on
 after a later poll is accepted, and the flag premise is the pair of readings that
 brackets the observation rather than a single present-day one.
 
+The same day gave ``explicit_success`` a second path, and that is tested the same way
+too. The captured payload showed a *successful* PlaceOrder stored as ``UNSET`` - the
+pinned checkout service writes no status on its server span - beside the caller's own
+client span for that RPC, which does carry one. So the clause can also be satisfied by
+that caller span, and only when the attempt names it as its parent: an unrelated call
+to the same operation, a shared trace, a successful retry, a span that wrote nothing,
+an HTTP response above the RPC, or a caller span with broken timing must each still
+fail, and ``UNSET`` must still be reported as ``UNSET``.
+
 The fixture *shape* follows ``test_fault_evidence``: a Jaeger v1-compatible payload
 whose spans carry ``traceID``/``spanID``/``operationName``/``processID``/
 ``startTime``/``duration`` with ``processes[processID].serviceName``. Service and
@@ -129,12 +138,21 @@ def span(
     parent: str | None = None,
     kind: str = "internal",
     status: str = "UNSET",
+    status_source: str = "otel.status_code",
     duration: int = 1000,
     start_us: int = BASE_US,
 ) -> dict[str, Any]:
+    """One span in the payload's own v1 shape.
+
+    ``status_source`` decides how the status is *written*, because the sources are not
+    interchangeable in the payload: ``otel.status_code`` carries the word, and
+    ``rpc.grpc.status_code`` - the one the demo's frontend writes for the PlaceOrder
+    call - carries a number, ``0`` for a completed call. A fixture that wrote the
+    wrong spelling would test a payload the demo never emits.
+    """
     tags: list[dict[str, str]] = [{"key": "span.kind", "value": kind}]
     if status != "UNSET":
-        tags.append({"key": "otel.status_code", "value": status})
+        tags.append(status_tag(status_source, status))
     return {
         "traceID": TRACE_ID,
         "spanID": span_id,
@@ -150,11 +168,20 @@ def span(
     }
 
 
+def status_tag(source: str, status: str) -> dict[str, Any]:
+    """One status attribute in the spelling its own source uses."""
+    if source == "rpc.grpc.status_code":
+        return {"key": source, "value": 0 if status == "OK" else 2}
+    return {"key": source, "value": status}
+
+
 def checkout_trace(
     *,
     trace_id: str = TRACE_ID,
     start_us: int = BASE_US,
     checkout_status: str = "OK",
+    caller_status: str = "OK",
+    caller_source: str = "rpc.grpc.status_code",
     charge_client: bool = True,
     payment_server: bool = True,
     payment_status: str = "OK",
@@ -166,6 +193,11 @@ def checkout_trace(
     reconstruction a walk over the payload's own references rather than a guess.
     ``start_us`` moves the *whole* trace, so the measured attempt's own start - the
     one the freshness gate reads - is ``start_us`` too.
+
+    ``caller_status``/``caller_source`` describe the frontend's own *client* span for
+    the PlaceOrder RPC - the caller's side of the measured edge. They default to the
+    captured payload's shape (``OK`` from ``rpc.grpc.status_code``), which the direct
+    path ignores whenever the checkout server span itself records ``OK``.
     """
 
     def at(span_id: str, operation: str, process: str, **kwargs: Any) -> dict[str, Any]:
@@ -189,7 +221,8 @@ def checkout_trace(
             "frontend",
             parent="fe-server",
             kind="client",
-            status="OK",
+            status=caller_status,
+            status_source=caller_source,
             duration=60_000,
         ),
         at(
@@ -282,15 +315,28 @@ def flag_reader(*states: dict[str, Any]) -> Any:
 
 
 def evaluate(payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-    capture = module()
-    summary = capture.summarize_trace(
+    return module().evaluate_summary(summarise(payload), **kwargs)
+
+
+def summarise(payload: dict[str, Any]) -> dict[str, Any]:
+    """The reconstruction ``evaluate`` gates on, for tests that read the spans too."""
+    return module().summarize_trace(
         payload,
         root_operation=PLACE_ORDER,
         edge_operation=CHARGE,
         window_start_us=BASE_US - SECOND_US,
         window_end_us=BASE_US + 60 * SECOND_US,
     )
-    return capture.evaluate_summary(summary, **kwargs)
+
+
+def span_of(payload: dict[str, Any], span_id: str) -> dict[str, Any]:
+    return next(item for item in payload["spans"] if item["spanID"] == span_id)
+
+
+def without_span(payload: dict[str, Any], span_id: str) -> dict[str, Any]:
+    """The payload with one span removed, as a store that never kept it would be."""
+    payload["spans"] = [item for item in payload["spans"] if item["spanID"] != span_id]
+    return payload
 
 
 def checks_of(verdict: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -381,6 +427,366 @@ def test_an_error_span_on_the_path_is_not_success() -> None:
     assert verdict["verified"] is False
     assert verdict["blocking"] == ["explicit_success"]
     assert "recorded ERROR" in checks_of(verdict)["explicit_success"]["detail"]
+
+
+# --- explicit_success: the caller's own record of the measured call ----------
+#
+# The captured baseline on 2026-10-15 is why this clause has a second path. The pinned
+# revision's checkout service writes attributes on its PlaceOrder server span and no
+# status, so a *successful* PlaceOrder is stored as ``UNSET(no status signal)`` - the
+# captured payload is what establishes that, not the absence of a ``SetStatus`` call in
+# source. The caller, the demo's frontend, writes ``rpc.grpc.status_code`` for the same
+# RPC. The fixtures below are that payload's shape: the callee wrote nothing, the
+# caller wrote its own result, and the attempt names the caller's client span as its
+# parent. ``UNSET`` is never rewritten into success by any of them.
+
+
+def test_an_unset_server_span_with_its_correlated_caller_span_can_pass(capture: Any) -> None:
+    """The live shape: the callee recorded nothing and the caller recorded the call."""
+    payload = checkout_trace(checkout_status="UNSET")
+    summary = summarise(payload)
+
+    verdict = capture.evaluate_summary(summary)
+
+    assert verdict["verified"] is True
+    assert verdict["blocking"] == []
+    # The attempt's own status is untouched: the caller's OK did not rewrite it.
+    assert summary["attempt"]["status"] == "UNSET"
+    assert summary["attempt"]["status_source"] == "no status signal"
+    source = verdict["success_source"]
+    assert source["satisfied_by"] == "correlated_caller"
+    assert source["basis"] == "the caller's correlated client span for the same operation"
+    assert source["span_id"] == "fe-client"
+    assert source["service"] == "frontend"
+    assert source["operation"] == PLACE_ORDER
+    assert source["span_kind"] == "client"
+    assert source["status"] == "OK"
+    assert source["status_source"] == "rpc.grpc.status_code"
+    assert source["relationship_to_attempt"] == "ancestor"
+    assert source["hops_from_attempt"] == 1
+    assert source["attempt_span_id"] == summary["attempt"]["span_id"]
+    assert source["attempt_status"] == "UNSET"
+    # And the detail a reader sees says whose record satisfied it.
+    detail = checks_of(verdict)["explicit_success"]["detail"]
+    assert "the caller's own client span" in detail
+    assert "rpc.grpc.status_code" in detail
+    assert "stays UNSET" in detail
+
+
+def test_a_direct_server_success_remains_its_own_path(capture: Any) -> None:
+    """The callee's own OK is still sufficient, and is not re-attributed to the caller."""
+    verdict = evaluate(checkout_trace(checkout_status="OK"))
+
+    assert verdict["verified"] is True
+    source = verdict["success_source"]
+    assert source["satisfied_by"] == "server"
+    assert source["span_id"] == "ck-server"
+    assert source["service"] == "checkout"
+    assert source["span_kind"] == "server"
+    assert source["status_source"] == "otel.status_code"
+    assert source["relationship_to_attempt"] == "same_span"
+    assert source["hops_from_attempt"] == 0
+
+
+def test_a_caller_that_recorded_a_failure_contradicts_a_successful_callee(capture: Any) -> None:
+    """Contradiction on the path is refused however the callee's own span reads."""
+    verdict = evaluate(checkout_trace(checkout_status="OK", caller_status="ERROR"))
+
+    assert verdict["verified"] is False
+    assert verdict["blocking"] == ["explicit_success"]
+    assert "recorded ERROR" in checks_of(verdict)["explicit_success"]["detail"]
+    assert verdict["success_source"] is None
+
+
+def test_a_unset_server_span_without_affirmative_caller_evidence_is_not_success(
+    capture: Any,
+) -> None:
+    """A caller span that wrote nothing is as uninformative as the callee's own silence."""
+    payload = checkout_trace(checkout_status="UNSET", caller_status="UNSET")
+    verdict = evaluate(payload)
+
+    assert verdict["verified"] is False
+    assert verdict["blocking"] == ["explicit_success"]
+    detail = checks_of(verdict)["explicit_success"]["detail"]
+    assert "is not an affirmative success" in detail
+    assert "not an affirmative RPC status from a named source" in detail
+    assert verdict["success_source"] is None
+
+
+def test_a_unset_server_span_with_no_caller_span_at_all_is_not_success() -> None:
+    payload = without_span(checkout_trace(checkout_status="UNSET"), "fe-client")
+
+    verdict = evaluate(payload)
+
+    assert verdict["verified"] is False
+    assert verdict["blocking"] == ["explicit_success"]
+    assert "no caller client span supplies one" in checks_of(verdict)["explicit_success"]["detail"]
+    assert "no frontend client span carries" in checks_of(verdict)["explicit_success"]["detail"]
+    assert verdict["success_source"] is None
+
+
+def test_a_successful_outer_http_response_alone_is_not_success(capture: Any) -> None:
+    """HTTP 200 above the RPC is context: it is neither side's RPC status."""
+    payload = without_span(checkout_trace(checkout_status="UNSET"), "fe-client")
+    frontend_server = span_of(payload, "fe-server")
+    frontend_server["tags"].append({"key": "http.response.status_code", "value": 200})
+    reparent(payload, "ck-server", "fe-server")
+    summary = summarise(payload)
+
+    verdict = capture.evaluate_summary(summary)
+
+    assert verdict["verified"] is False
+    assert verdict["blocking"] == ["explicit_success"]
+    assert verdict["success_source"] is None
+    # The HTTP span really does read OK, and it is still not the RPC's success.
+    http_span = next(item for item in summary["spans"] if item["span_id"] == "fe-server")
+    assert http_span["status"] == "OK"
+    assert http_span["status_source"] == "http.response.status_code"
+    assert (
+        "no caller client span supplies one" in (checks_of(verdict)["explicit_success"]["detail"])
+    )
+
+
+def test_a_successful_call_to_the_same_operation_elsewhere_cannot_satisfy_it() -> None:
+    """A second PlaceOrder - another caller, another attempt - is not this one's caller."""
+    payload = checkout_trace(checkout_status="UNSET")
+    reparent(payload, "ck-server", "fe-server")
+    payload["spans"].append(
+        span(
+            "unrelated-fe-client",
+            PLACE_ORDER,
+            "frontend",
+            parent="fe-server",
+            kind="client",
+            status="OK",
+        )
+    )
+
+    verdict = evaluate(payload)
+
+    assert verdict["verified"] is False
+    assert verdict["blocking"] == ["explicit_success"]
+    assert (
+        "is not the span this attempt names as its parent"
+        in (checks_of(verdict)["explicit_success"]["detail"])
+    )
+    assert verdict["success_source"] is None
+
+
+def test_a_successful_retry_cannot_conceal_the_measured_failed_attempt() -> None:
+    """The trace holds a retry that worked; the measured attempt is the one that failed."""
+    payload = checkout_trace(checkout_status="ERROR")
+    payload["spans"].append(
+        span(
+            "retry-fe-client",
+            PLACE_ORDER,
+            "frontend",
+            parent="fe-client",
+            kind="client",
+            status="OK",
+            duration=30_000,
+        )
+    )
+    payload["spans"].append(
+        span(
+            "retry-ck-server",
+            PLACE_ORDER,
+            "checkout",
+            parent="retry-fe-client",
+            kind="server",
+            status="OK",
+            duration=20_000,
+        )
+    )
+
+    summary = summarise(payload)
+    verdict = evaluate(payload)
+
+    # The measured attempt is still the one the reconstruction picked: the longer
+    # server span, which is the one that records the failure.
+    assert summary["attempt"]["span_id"] == "ck-server"
+    assert summary["attempt"]["status"] == "ERROR"
+    assert verdict["verified"] is False
+    assert verdict["blocking"] == ["explicit_success"]
+    assert "contradicts any success" in checks_of(verdict)["explicit_success"]["detail"]
+    assert verdict["success_source"] is None
+
+
+def test_a_caller_span_that_recorded_a_failure_is_not_success() -> None:
+    payload = checkout_trace(checkout_status="UNSET", caller_status="ERROR")
+
+    verdict = evaluate(payload)
+
+    assert verdict["verified"] is False
+    assert verdict["blocking"] == ["explicit_success"]
+    assert (
+        "not an affirmative RPC status from a named source"
+        in (checks_of(verdict)["explicit_success"]["detail"])
+    )
+    assert verdict["success_source"] is None
+
+
+def test_contradictory_error_evidence_on_the_path_refuses_the_caller_path() -> None:
+    payload = checkout_trace(checkout_status="UNSET")
+    span_of(payload, "cart-server")["tags"].append({"key": "otel.status_code", "value": "ERROR"})
+
+    verdict = evaluate(payload)
+
+    assert verdict["verified"] is False
+    assert verdict["blocking"] == ["explicit_success"]
+    assert "recorded ERROR" in checks_of(verdict)["explicit_success"]["detail"]
+    assert verdict["success_source"] is None
+
+
+def test_a_caller_span_this_attempt_does_not_name_is_refused() -> None:
+    """The reference is missing, so the client span could belong to any other call."""
+    payload = checkout_trace(checkout_status="UNSET")
+    reparent(payload, "ck-server", "a-parent-the-payload-does-not-hold")
+
+    verdict = evaluate(payload)
+
+    assert verdict["verified"] is False
+    assert verdict["blocking"] == ["explicit_success"]
+    assert (
+        "is not the span this attempt names as its parent"
+        in (checks_of(verdict)["explicit_success"]["detail"])
+    )
+    assert verdict["success_source"] is None
+
+
+def test_two_spans_carrying_the_callers_id_are_ambiguous_and_not_success() -> None:
+    """Two spans with one id: which of them is the caller is not decidable from the payload."""
+    payload = checkout_trace(checkout_status="UNSET")
+    duplicate = dict(span_of(payload, "fe-client"))
+    duplicate["duration"] = 61_000
+    payload["spans"].append(duplicate)
+
+    verdict = evaluate(payload)
+
+    assert verdict["verified"] is False
+    assert verdict["blocking"] == ["explicit_success"]
+    assert "ambiguous caller is not evidence" in checks_of(verdict)["explicit_success"]["detail"]
+    assert verdict["success_source"] is None
+
+
+def test_a_caller_span_with_incomplete_or_inverted_timing_cannot_pass() -> None:
+    for break_it in ("inverted", "untimed"):
+        payload = checkout_trace(checkout_status="UNSET")
+        caller = span_of(payload, "fe-client")
+        if break_it == "inverted":
+            caller["duration"] = 0
+        else:
+            caller["startTime"] = None
+
+        verdict = evaluate(payload)
+
+        assert verdict["verified"] is False, break_it
+        assert verdict["blocking"] == ["explicit_success"], break_it
+        assert (
+            "incomplete or inverted timing" in (checks_of(verdict)["explicit_success"]["detail"])
+        ), break_it
+        assert verdict["success_source"] is None, break_it
+
+
+def test_a_caller_span_that_does_not_enclose_the_attempt_cannot_pass() -> None:
+    payload = checkout_trace(checkout_status="UNSET")
+    span_of(payload, "fe-client")["startTime"] = BASE_US + 10_000
+
+    verdict = evaluate(payload)
+
+    assert verdict["verified"] is False
+    assert verdict["blocking"] == ["explicit_success"]
+    assert "does not enclose the attempt" in checks_of(verdict)["explicit_success"]["detail"]
+    assert verdict["success_source"] is None
+
+
+def test_the_gate_would_accept_an_unrelated_caller_without_the_reference_check(
+    capture: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Falsification: without the reference, a client span higher up the call tree passes.
+
+    The caller sits two hops above the attempt here, behind an internal span the
+    checkout service opened. The direct-parent reference is the only thing that
+    refuses it, so removing that check is what makes the difference visible.
+    """
+    payload = checkout_trace(checkout_status="UNSET")
+    payload["spans"].append(
+        span("ck-fanout", "prepareOrderItems", "checkout", parent="fe-client", kind="internal")
+    )
+    reparent(payload, "ck-server", "ck-fanout")
+
+    assert evaluate(payload)["blocking"] == ["explicit_success"]
+
+    monkeypatch.setattr(capture, "caller_names_this_attempt", lambda span, attempt: True)
+
+    assert evaluate(payload)["verified"] is True
+
+
+def test_the_caller_path_never_weakens_the_catalog_or_edge_requirements(capture: Any) -> None:
+    """The other three properties are untouched: the second success path adds nothing."""
+    no_catalog = evaluate(checkout_trace(checkout_status="UNSET", catalog_server=False))
+    assert no_catalog["verified"] is False
+    assert no_catalog["blocking"] == ["product_catalog_reached"]
+
+    no_edge = evaluate(checkout_trace(checkout_status="UNSET", payment_status="UNSET"))
+    assert no_edge["verified"] is False
+    assert no_edge["blocking"] == ["explicit_success"]
+    assert "Charge span's status is UNSET" in (checks_of(no_edge)["explicit_success"]["detail"])
+    assert no_edge["success_source"] is None
+
+    unreached = evaluate(
+        checkout_trace(checkout_status="UNSET", charge_client=False, payment_server=False)
+    )
+    assert unreached["blocking"] == ["payment_charge_on_path", "explicit_success"]
+    assert "no Charge status can be read" in (checks_of(unreached)["explicit_success"]["detail"])
+
+
+def test_the_caller_path_cannot_rescue_a_historical_attempt(capture: Any) -> None:
+    """A pre-boundary request is refused even though its own success clause is satisfied."""
+    stack = FakeStack(
+        traces=[checkout_trace(checkout_status="UNSET", start_us=HISTORICAL_US)],
+        ignore_window=True,
+    )
+
+    document, _ = observe(capture, stack=stack)
+
+    assert document["verdict"] == "not_verified_no_fresh_attempt"
+    assert document["blocking"] == ["attempt_after_boundary"]
+    chosen = next(item for item in document["candidates"] if item["trace_id"] == TRACE_ID)
+    assert "explicit_success" not in chosen["blocking"]
+    assert chosen["success_source"]["satisfied_by"] == "correlated_caller"
+
+
+def test_an_armed_flag_still_blocks_a_caller_satisfied_baseline(capture: Any) -> None:
+    stack = FakeStack(
+        traces=[checkout_trace(checkout_status="UNSET", start_us=FRESH_US)],
+        flags=flag_document(paymentUnreachable="on"),
+    )
+
+    document, _ = observe(capture, stack=stack)
+
+    assert document["verdict"] == "not_verified"
+    assert "fault_flags_safe_before" in document["blocking"]
+    chosen = next(item for item in document["candidates"] if item["trace_id"] == TRACE_ID)
+    assert "explicit_success" not in chosen["blocking"]
+
+
+def test_the_extract_and_the_log_report_which_span_satisfied_the_clause(capture: Any) -> None:
+    stack = FakeStack(traces=[checkout_trace(checkout_status="UNSET", start_us=FRESH_US)])
+
+    document, _ = observe(capture, stack=stack)
+
+    assert document["verdict"] == "baseline_verified"
+    assert document["exit_status"] == 0
+    chosen = next(item for item in document["candidates"] if item["trace_id"] == TRACE_ID)
+    assert chosen["success_source"]["span_id"] == "fe-client"
+    assert chosen["success_source"]["status_source"] == "rpc.grpc.status_code"
+    # The evidence still carries the attempt's own silence, verbatim.
+    assert document["evidence"]["attempt"]["status"] == "UNSET"
+    text = capture.render(document)
+    assert "[provenance] explicit_success from correlated_caller" in text
+    assert "kind=client status=OK(rpc.grpc.status_code)" in text
+    assert "the attempt's own status is UNSET(no status signal)" in text
 
 
 def test_a_caller_client_span_is_not_the_catalog_answering() -> None:
