@@ -313,9 +313,28 @@ cmd_inspect() {
   mapfile -t names <<<"$names_out"
   for name in "${names[@]}"; do
     [ -n "$name" ] || continue
-    line="$("$DOCKER_BIN" inspect --format \
-      '{{.Name}} state={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} restarts={{.RestartCount}} exit={{.State.ExitCode}} oom_killed={{.State.OOMKilled}} memory_limit={{.HostConfig.Memory}} nano_cpus={{.HostConfig.NanoCpus}} started={{.State.StartedAt}} healthcheck={{if .Config.Healthcheck}}{{json .Config.Healthcheck.Test}}{{else}}none{{end}}' \
-      "$name" </dev/null)" || { printf 'demo: inspect %s failed\n' "$name" >&2; rc=1; continue; }
+    # The optional keys are read with `index`, never with `.Field`. On 2026-10-15
+    # the live CLI (29.7.2) rejected the field form for the six containers that
+    # have no healthcheck - `template: :1:52: executing "" at <.State.Health>:
+    # map has no entry for key "Health"` - so those six produced no row at all
+    # while the other nineteen did. `index` is the builtin and is not subject to
+    # the CLI's missing-key policy.
+    if ! line="$("$DOCKER_BIN" inspect --format \
+      '{{$h := index .State "Health"}}{{$hc := index .Config "Healthcheck"}}{{.Name}} state={{.State.Status}} health={{if $h}}{{$h.Status}}{{else}}none{{end}} restarts={{.RestartCount}} exit={{.State.ExitCode}} oom_killed={{.State.OOMKilled}} memory_limit={{.HostConfig.Memory}} nano_cpus={{.HostConfig.NanoCpus}} started={{.State.StartedAt}} healthcheck={{if $hc}}{{json $hc.Test}}{{else}}none{{end}}' \
+      "$name" </dev/null)"; then
+      # A container the CLI will not render still gets a row. Dropping it is how
+      # the 2026-09-26 captures came to report one container out of twenty-five
+      # and exit 0; only the two always-present fields are claimed here, and the
+      # missing detail is marked rather than left to look like a whole row.
+      printf 'demo: inspect %s failed: the CLI rejected the per-container template\n' "$name" >&2
+      rc=1
+      if brief="$("$DOCKER_BIN" inspect --format '{{.Name}} state={{.State.Status}}' "$name" </dev/null)"; then
+        printf '%s per_container_detail=missing <per-container template rejected by the CLI>\n' "${brief#/}"
+      else
+        printf 'demo: %s could not be inspected at all, so it has no row here\n' "$name" >&2
+      fi
+      continue
+    fi
     # `docker inspect` reports the name with a leading slash. The template
     # functions that strip it (`trimPrefix`) need Go 1.19 and the Windows
     # interop binary answered `template parsing error: function "trimPrefix" not
@@ -326,7 +345,7 @@ cmd_inspect() {
     # Only for a container that is not healthy: the probe's own message is what
     # separates "connect timed out" from "the server answered not-serving".
     probe="$("$DOCKER_BIN" inspect --format \
-      '{{if .State.Health}}{{if ne .State.Health.Status "healthy"}}{{json .State.Health.Log}}{{end}}{{end}}' \
+      '{{$h := index .State "Health"}}{{if $h}}{{if ne $h.Status "healthy"}}{{json $h.Log}}{{end}}{{end}}' \
       "$name" </dev/null)" || rc=1
     if [ -n "$probe" ]; then printf '  health_log=%s\n' "$probe"; fi
     # The Go memory policy is the value under test when a service is wedged, so it
@@ -387,7 +406,7 @@ cmd_ensure() {
   for name in "${names[@]}"; do
     [ -n "$name" ] || continue
     if ! line="$("$DOCKER_BIN" inspect --format \
-      '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{index .Config.Labels "com.docker.compose.service"}}' \
+      '{{$h := index .State "Health"}}{{$l := index .Config "Labels"}}{{.Name}} {{.State.Status}} {{if $h}}{{$h.Status}}{{else}}none{{end}} {{if $l}}{{index $l "com.docker.compose.service"}}{{end}}' \
       "$name" </dev/null)"; then
       printf 'demo: inspect %s failed, so its state is unknown and nothing is started\n' "$name" >&2
       return 1
@@ -412,7 +431,7 @@ cmd_ensure() {
     printf 'demo: collecting their health output and a bounded log tail; nothing else is started or recreated\n' >&2
     for name in "${unhealthy[@]}"; do
       printf 'demo: ---- health: %s\n' "$name" >&2
-      "$DOCKER_BIN" inspect --format '{{json .State.Health.Log}}' "$name" </dev/null >&2 \
+      "$DOCKER_BIN" inspect --format '{{$h := index .State "Health"}}{{if $h}}{{json $h.Log}}{{end}}' "$name" </dev/null >&2 \
         || printf 'demo: health output unavailable for %s\n' "$name" >&2
       printf 'demo: ---- bounded logs: %s\n' "$name" >&2
       if ! cmd_logs "$name" >&2; then

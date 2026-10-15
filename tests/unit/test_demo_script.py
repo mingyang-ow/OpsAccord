@@ -30,7 +30,9 @@ from pathlib import Path
 
 from opsaccord.config import REPO_ROOT
 
-DEMO_SCRIPT = REPO_ROOT / "scripts" / "demo.sh"
+#: The script under test. Overridable so a pre-fix copy can be run against the same
+#: tests; the default is the real one.
+DEMO_SCRIPT = Path(os.environ.get("DEMO_SCRIPT_UNDER_TEST") or REPO_ROOT / "scripts" / "demo.sh")
 SEPARATOR = "\x1f"
 
 STUB = """#!/usr/bin/env bash
@@ -51,6 +53,16 @@ case "$argv0" in
   inspect)
     if [ -n "${STUB_EATS_STDIN:-}" ]; then cat >/dev/null; fi
     if [ -n "${STUB_INSPECT_RC:-}" ]; then exit "$STUB_INSPECT_RC"; fi
+    if [ -n "${STUB_RICH_INSPECT_FAILS:-}" ]; then
+      case "$*" in
+        *HostConfig*)
+          # What the live CLI answered on 2026-10-15 for each of the six
+          # containers that have no healthcheck, verbatim.
+          printf 'template parsing error: template: :1:52: executing "" at ' >&2
+          printf '<.State.Health>: map has no entry for key "Health"\\n' >&2
+          exit 1 ;;
+      esac
+    fi
     # `docker inspect` names a container with a leading slash; the helper is
     # expected to strip it, so the stub supplies it.
     container="$3"
@@ -59,10 +71,18 @@ case "$argv0" in
         printf '/%s state=running health=unhealthy restarts=0 exit=0 ' "$container"
         printf 'oom_killed=false memory_limit=20971520 nano_cpus=0 '
         printf 'started=2026-09-25T11:23:30Z healthcheck=[]\\n' ;;
-      *Health.Log*)
+      # `cmd_inspect` and `cmd_ensure` read the probe's log through a variable
+      # bound with `index` (the key may be absent), so the template says `.Log`
+      # rather than `.State.Health.Log`; either form answers here.
+      *.Log*)
         printf '[{"ExitCode":1,"Output":"failed to connect service :3550 '
         printf 'within 1s"}]\\n' ;;
       *GOMEMLIMIT*) printf 'GOMEMLIMIT=16MiB\\n' ;;
+      # The degraded row `cmd_inspect` falls back to when the CLI refuses the
+      # per-container template: `docker inspect` cannot be asked for the fields
+      # that were just refused, so only the name and status are claimed.
+      *'state={{.State.Status}}'*)
+        printf '/%s state=running\\n' "$container" ;;
       # `demo.sh ensure` reads each container's own state plus its compose
       # *service* label, which is what it hands to `compose up`: upstream sets
       # `container_name:` on several services, so the two are not the same string.
@@ -243,6 +263,56 @@ def test_inspect_and_pull_keep_their_name_list_out_of_docker_stdin(tmp_path: Pat
     assert pulled.returncode == 0, pulled.stderr
     images = [argv[-1] for argv in _invocations(tmp_path, "pull")]
     assert images == ["ghcr.io/example/a:1.0", "ghcr.io/example/b:1.0", "ghcr.io/example/c:1.0"]
+
+
+def test_a_container_the_cli_will_not_render_still_gets_a_row(tmp_path: Path) -> None:
+    """Six of twenty-five containers vanished this way on the live 2026-10-15 run.
+
+    The host's Docker CLI answered
+    ``template parsing error: template: :1:52: executing "" at <.State.Health>:
+    map has no entry for key "Health"`` for each of the six containers that have no
+    healthcheck - ``cart``, ``otel-collector``, ``jaeger``, ``flagd``, ``grafana`` and
+    ``prometheus`` - so those six had no row while the other nineteen did, and a
+    container with no row reads exactly like a container that is not there. The live
+    trigger is per-container and is **not** explained by "the field form is always
+    rejected": ``cmd_ensure`` reads ``.State.Health`` the same way and was accepted for
+    those same six containers in the same run. The stub therefore stands in for "the CLI
+    refuses this container's rich row" and drives the fallback, rather than modelling the
+    rule. The helper now falls back to the two always-present fields and marks the rest
+    missing, so the row survives the refusal; the exit status still reports it.
+    """
+    result = _run(tmp_path, "inspect", STUB_RICH_INSPECT_FAILS="1")
+
+    assert result.returncode == 1
+    assert "the CLI rejected the per-container template" in result.stderr
+    assert "product-catalog state=running per_container_detail=missing" in result.stdout
+    assert "checkout state=running per_container_detail=missing" in result.stdout
+
+
+def test_optional_inspect_keys_are_read_with_index_not_with_a_field() -> None:
+    """`.State.Health` is absent for a container that has no healthcheck.
+
+    A `.Field` access on a map is what the live CLI rejected on 2026-10-15, and the
+    keys that may be absent are exactly the ones a container can be missing: its
+    health, its healthcheck configuration and its labels. They are read with the
+    ``index`` builtin and bound to a variable, which is not subject to the CLI's
+    missing-key policy; the fields read *from* that variable are then safe, because
+    the variable is only non-empty when the key was there. This test fails on a
+    dotted access to an optional key so the next one is caught here rather than by a
+    live run that quietly loses six containers.
+    """
+    script = DEMO_SCRIPT.read_text(encoding="utf-8")
+    templates = re.findall(r"'({{[^']*}})'", script)
+    assert templates, "no --format template found; this guard would be vacuous"
+
+    optional = (r"\.State\.Health", r"\.Config\.Healthcheck", r"\.Config\.Labels")
+    offending = [
+        f"{pattern} in {template}"
+        for template in templates
+        for pattern in optional
+        if re.search(pattern, template)
+    ]
+    assert not offending, offending
 
 
 def test_a_failing_pull_is_reported_rather_than_only_the_last_one(tmp_path: Path) -> None:

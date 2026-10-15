@@ -4200,3 +4200,300 @@ PY
   exit "$cap_rc"
 )
 ```
+
+## The live baseline-handoff pass (`6662628` handed off; the user ran it on 2026-10-15) - the cluster recovered, but the helper dropped six of twenty-five containers and that failure cost the run its remaining stages
+
+Appended 2026-10-15. Everything above is left as it was; the corrections below are marked rather than
+written over. The user ran the block from "The recovery/baseline-handoff pass" in their own terminal from
+revision `6662628`; the code changes, the tests and this record are this pass's.
+
+### The user's measured run (attributed to the user)
+
+Run at **2026-10-15 15:40:20 +08** from `6662628` on `phase1/baseline`. Evidence:
+`.local/user-baseline-20261015T074020/` (**stages 0-3 only**) and the live log `.local/pg/postgres.log`.
+The user's `AGENTS.md` edit was still the only working-tree change when the block began.
+
+| Reading | What it measured | Source |
+| --- | --- | --- |
+| Preserved before any mutation | `M AGENTS.md`; `postmaster.pid` 163 bytes, mtime `2026-09-29T23:23:41.437`; the endpoint file still the 2026-09-26 one | `00-*.log`, `00-demo-endpoints.env.before` |
+| The cluster's state, as found | `[pg] not running` - **exit 3**, a proven stop, so `ensure` started it **once** | `01-pg-status.log` |
+| The start | `pg_ctl: another server might be running; trying to start server anyway` -> `server started` -> `[pg] running on 127.0.0.1:55432 (dbs: opsaccord, opsaccord_scenarios, opsaccord_test)` | `02-pg-ensure.log` |
+| **Recovery, which did run** | `database system was interrupted; last known up at 2026-09-29 10:31:49 +08`; **`database system was not properly shut down; automatic recovery in progress`**; `redo starts at 0/1A96AF70`; `redo done at 0/1A96B040`; `checkpoint complete` (wrote 0 buffers); `database system is ready to accept connections` (PID 87113) | `03-pg-recovery.log`, `.local/pg/postgres.log` |
+| Connectivity and rows | **3/3** databases, **12/12** domain tables each, checkpoints present; `dev` 39/39/512/985, `test` 1/1/7/19, `scenario` 117/117/781/2081 rows; `pg verification: OK` | `05-pg-verify.log` |
+| The engine | Docker `29.7.2` | `06-docker-engine.log` |
+| Container state, as found | 25 containers in the project, **24 of them `exited`**; `ensure` started those 24 and nothing else; every documented endpoint answered, including `PRODUCT_CATALOG product-catalog:3550 -> 51876` and `PAYMENT payment:50051 -> 51872`; `demo.sh ensure exited 0` | `07-demo-ensure.log` |
+| The catalog, moments after that start | `health=starting`, `memory_limit=20971520`, `GOMEMLIMIT=16MiB`, and its last three health checks all `ExitCode -1`, `Health check exceeded timeout (5s)` at 07:40:46, 07:40:57 and 07:41:07 UTC; the only `SERVING` checks in its log are the two from 2026-09-26 04:02 (the container was **started**, not recreated, so its health log spans both eras) | `08-demo-inspect.log` |
+| Per-container state | **19 rows for 25 containers**: `cart`, `otel-collector`, `jaeger`, `flagd`, `grafana` and `prometheus` produced none - see the defect below | `08-demo-inspect.log` |
+| Where the run stopped | after `08-demo-inspect.log`: no `08b-key-containers.log`, no `09-endpoints.log`, no `reports/local/baseline-checkout-*` | the evidence directory |
+
+The **UNKNOWN** reading the previous pass insisted on is not withdrawn by this. From *this* sandbox the
+cluster's state was genuinely undeterminable (`bash scripts/pg.sh status` still exits **4** here), and the
+host's own shell - which can see the pid file's process and open the socket - is what resolved it to
+`stopped` (**3**). That distinction is what made the resolution possible without a guess, and the two
+readings are consistent rather than contradictory.
+
+**What the recovery lines establish, and what they do not.** The cluster *was* left not-properly-shut-down:
+the `received smart shutdown request` of 2026-09-29 23:23:41 has no matching `shut down` line, so the
+request never completed. Recovery therefore ran, from exactly the redo position the last clean checkpoint
+(2026-09-29 10:31:49 +08, `redo lsn=0/1A96AF70`) had recorded, and ended with a checkpoint that wrote
+nothing. That is a short, clean redo. It is **not** proof of complete data integrity and not evidence that
+nothing was lost; it shows the cluster reached a consistent state, which is what the three databases and
+their row counts then confirm.
+
+### The defect: `demo.sh inspect` dropped every container the CLI would not render
+
+`08-demo-inspect.log` holds **19 rows for 25 containers**. For each of the other six the live CLI answered,
+verbatim:
+
+```
+template parsing error: template: :1:52: executing "" at <.State.Health>: map has no entry for key "Health"
+demo: inspect <name> failed
+```
+
+`cmd_inspect` printed that to stderr, printed **no row**, set `rc=1` and continued to the next name. The
+six are exactly the six containers that have no healthcheck - a container with no row reads exactly like a
+container that is not there, which is the same class of loss as the 2026-09-25 run (`trimPrefix` undefined)
+and the 2026-09-26 run (stdin consumed by the first `inspect`, 1 container of 25). It is the third run to
+lose per-container evidence, by a third distinct cause.
+
+**The trigger is per-container, and this evidence does not explain it.** `cmd_ensure` reads
+`.State.Health` with the same field form and was **accepted** for all 25 containers, including those same
+six, minutes earlier in the same run (`cart exited none cart`). So the rejection is not simply "the field
+form is rejected"; what differs between the two commands includes the containers' state (the six were
+`exited` then and `running` now), so a state-dependent difference in the JSON is the likeliest
+explanation - and it is **not** verified here. What is established is the observation, and that the
+correction removes any dependence on the CLI's missing-key policy, so the trigger no longer has to be
+known for the row to survive.
+
+### The correction
+
+* **All four optional-key reads use `index` and bind to a variable** - `.State.Health`,
+  `.Config.Healthcheck` and `.Config.Labels` in `cmd_inspect` and `cmd_ensure`, and the probe-log read.
+  `index` is a builtin and is not subject to the missing-key policy, and the fields read *from* the bound
+  variable are safe because the variable is non-empty only when the key was there.
+* **`cmd_inspect` always emits a row.** On refusal it prints the failure to stderr, sets `rc=1`, re-runs a
+  brief `{{.Name}} state={{.State.Status}}` template and prints the two fields it can still claim, marked
+  `per_container_detail=missing`; if even that fails it says so instead of vanishing. Dropping a row is how
+  the 2026-09-26 captures came to report one container of twenty-five while exiting 0, so the row is no
+  longer optional and the non-zero status still reports the degradation.
+* **A guard test forbids the three dotted optional accesses** in any `--format` template in the script, so
+  the next one is caught offline rather than by a live run that quietly loses containers.
+
+The stub gained a branch that answers the **verbatim** live error and the degraded template, so the
+fallback is exercised rather than assumed. The regression tests are pointed at the script through
+`DEMO_SCRIPT_UNDER_TEST`, the same falsification hook `test_pg_lifecycle.py` uses: against `HEAD`'s
+`demo.sh` both new tests **fail** (the container's row is absent), and against the fixed script all 20
+pass. The stub stands in for "the CLI refuses this container's rich row"; it does not model the per-container
+rule the live evidence leaves unexplained.
+
+The correction also protects the *next* `ensure`, where those six containers will be **running**:
+`cmd_ensure`'s old read would refuse the whole command (`inspect <name> failed, so its state is unknown and
+nothing is started`) rather than merely omit a row, if the CLI's rejection is state-dependent as this run
+suggests it may be.
+
+### The block no longer treats an unrenderable container as fatal
+
+The run did not stop because of the six missing rows alone: stage 3 ran
+`bash scripts/demo.sh inspect 2>&1 | tee ...` as a bare pipeline under `set -euo pipefail`, `demo.sh
+inspect` exits **1** when a row cannot be rendered (deliberately, since the 2026-09-26 pass), and `pipefail`
+therefore made the pipeline non-zero, so `set -e` aborted the block immediately after
+`08-demo-inspect.log` was written. That is why `08b`, `09` and the capture do not exist.
+
+That was an unintended interaction rather than a designed stop: the block's own `08b` step already prints a
+**warning** when the key containers are missing from the inspect output and continues. The block now
+captures that status explicitly (`inspect_rc=${PIPESTATUS[0]}`, exactly as it already does for `ensure_rc`)
+and says out loud that it is not fatal, because the capture below reads Jaeger's and flagd's own APIs and
+does not depend on that snapshot. Both copies of the block (this report and the runbook) carry the same
+text.
+
+### Checks executed in this pass
+
+| Check | Result |
+| --- | --- |
+| `tests/unit/test_demo_script.py` | **20 passed** (18 before; +2 for the row that survives a refusal and the dotted-access guard) |
+| The three touched files | **71 passed** (`test_demo_script`, `test_pg_lifecycle`, `test_baseline_checkout_capture`) |
+| Offline suite, `-m "not integration"` | **348 passed, 7 skipped, 85 deselected** (346 before) |
+| `ruff check .` / `ruff format --check .` | clean / 95 files already formatted |
+| `mypy src/opsaccord` | `Success: no issues found in 42 source files` |
+| `bash -n scripts/demo.sh scripts/pg.sh` | clean |
+| Both copies of the next-action block | extracted and `bash -n` clean; the two copies are byte-identical |
+| Falsification: `DEMO_SCRIPT_UNDER_TEST` at `HEAD`'s `demo.sh` | both new tests **fail** - `test_a_container_the_cli_will_not_render_still_gets_a_row` fails at its first assertion because the row is absent, and `test_optional_inspect_keys_are_read_with_index_not_with_a_field` reports `\.State\.Health` in two templates; against the fixed script all 20 pass |
+| `bash scripts/pg.sh status` (this sandbox) | exit **4** - unchanged; this shell still cannot establish the cluster's state |
+| `bash scripts/demo.sh ensure` (this sandbox) | `the Docker engine did not answer`, exit **1**; nothing started |
+
+**These are offline tests with a stubbed CLI, and they are not host-side validation.** They pin the
+decisions the helper makes when a container's rich row is refused; they do not reproduce the live
+per-container trigger, and no live reading in this section was produced here - every live number above is
+the user's.
+
+### Not run, and why
+
+- **The integration suite** - needs the live stack; not run here.
+- **PostgreSQL recovery, the demo stack and the fresh Checkout -> Payment capture** - this sandbox reaches
+  neither Docker nor a loopback port (`pg.sh status` exits 4, `demo.sh ensure` refuses). The recovery that
+  *did* run is the user's, read from their logs and from `.local/pg/postgres.log`.
+- **P1-01, and the fault-free baseline** - both untouched. No fault was armed and no scenario ran. **Phase 1
+  remains PARTIAL**: the fault-free baseline and the fault run are both still unmeasured on this revision.
+
+### The one next action (host shell, one block)
+
+**A precondition now holds that did not before: the cluster was started and verified on 2026-10-15 15:40 +08,
+so `pg.sh status` should now exit 0 and `pg.sh ensure` should only verify it; the demo containers were
+started by the same run.** The block is kept whole rather than shortened, because stages 0-3 are what
+preserve the prior evidence and read the state before anything is touched - and because it adapts: a
+`running` cluster is verified and nothing is started. Start Docker Desktop first; the block stops if the
+engine does not answer. It refreshes the endpoints before the capture, and it now reports `demo.sh inspect`'s
+status without letting it end the run.
+
+```bash
+( set -euo pipefail
+  cd /home/brentiburo/projects/OpsAccord
+  deactivate 2>/dev/null || true
+  source .venv/bin/activate
+  export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+  PYTHON="$PWD/.venv/bin/python"
+  TS="$(date -u +%Y%m%dT%H%M%S)"; LOGDIR=".local/user-baseline-$TS"; mkdir -p "$LOGDIR"
+  export OPSACCORD_DOCKER_BIN="${OPSACCORD_DOCKER_BIN:-/mnt/c/Users/admin/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe}"
+  echo "interpreter: $("$PYTHON" -c 'import sys; print(sys.executable)')"
+  echo "tested revision: $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD)"
+  echo "evidence dir: $LOGDIR"
+  echo "Docker Desktop must already be running: this block starts no desktop and stops if the engine does not answer."
+  echo "The cluster was started and verified on 2026-10-15 15:40 +08, so stage 1 should report it running and start nothing."
+
+  echo "--- 0. preserve what this shell sees, before anything is started ---"
+  git status --porcelain=v1 | tee "$LOGDIR/00-git-status.log"
+  if [ -e .local/pg/data/postmaster.pid ]; then
+    cp -p .local/pg/data/postmaster.pid "$LOGDIR/00-postmaster.pid.before"
+    echo "preserved .local/pg/data/postmaster.pid"
+  else
+    echo "no .local/pg/data/postmaster.pid to preserve"
+  fi
+  find .local/pg/data -maxdepth 1 -name 'postmaster.pid' -printf '%p %s bytes %TY-%Tm-%TdT%TH:%TM:%TS\n' | tee "$LOGDIR/00-pidfile.log"
+  if [ -f .local/pg/postgres.log ]; then
+    cp -p .local/pg/postgres.log "$LOGDIR/00-postgres.log.before"
+    tail -n 40 .local/pg/postgres.log | tee "$LOGDIR/00-postgres-log-tail-before.log"
+  fi
+  if [ -f .local/demo-endpoints.env ]; then
+    cp -p .local/demo-endpoints.env "$LOGDIR/00-demo-endpoints.env.before"
+    echo "preserved the endpoint file as it stands"
+  else
+    echo "no .local/demo-endpoints.env yet"
+  fi
+
+  echo "--- 1. the cluster's state, established before any lifecycle command ---"
+  set +e
+  bash scripts/pg.sh status 2>&1 | tee "$LOGDIR/01-pg-status.log"; pg_rc=${PIPESTATUS[0]}
+  set -e
+  echo "pg.sh status exited $pg_rc (0 running, 3 stopped, 4 unknown)"
+  case "$pg_rc" in
+    0) echo "running: ensure verifies it and starts nothing"
+       bash scripts/pg.sh ensure 2>&1 | tee "$LOGDIR/02-pg-ensure.log" ;;
+    3) echo "provably stopped: ensure starts it once"
+       bash scripts/pg.sh ensure 2>&1 | tee "$LOGDIR/02-pg-ensure.log"
+       echo "--- what that start logged; a clean start is not proof of data integrity ---"
+       tail -n 40 .local/pg/postgres.log | tee "$LOGDIR/03-pg-recovery.log" ;;
+    *) echo "STOP: pg.sh status exited $pg_rc (unknown), so this shell cannot establish the cluster's state and no start or stop is safe from it. Send $LOGDIR back." >&2
+       exit 1 ;;
+  esac
+
+  echo "--- 2. connectivity, the three databases, and their real rows ---"
+  bash scripts/pg.sh status 2>&1 | tee "$LOGDIR/04-pg-after.log"
+  set -- "$(bash scripts/pg.sh url dev)" "$(bash scripts/pg.sh url test)" "$(bash scripts/pg.sh url scenario)"
+  "$PYTHON" - "$LOGDIR" "$@" <<'PY' 2>&1 | tee "$LOGDIR/05-pg-verify.log"
+import sys
+from pathlib import Path
+import psycopg
+from opsaccord.config import to_libpq_dsn
+from opsaccord.persistence.tables import Base
+targets = dict(zip(("dev", "test", "scenario"), sys.argv[2:5], strict=False))
+expected = set(Base.metadata.tables)
+checkpoints = {"checkpoints", "checkpoint_blobs", "checkpoint_writes"}
+failures, full_schema = [], 0
+for name, url in targets.items():
+    try:
+        with psycopg.connect(to_libpq_dsn(url), connect_timeout=10) as conn:
+            print(f"{name}: connected - {conn.execute('select version()').fetchone()[0].split(',')[0]}")
+            tables = {row[0] for row in conn.execute("select tablename from pg_tables where schemaname='public'")}
+            present = expected & tables
+            print(f"{name}: {len(tables)} public tables; {len(present)}/{len(expected)} domain tables; checkpoints {bool(checkpoints & tables)}")
+            if expected - present:
+                print(f"{name}: missing domain tables: {sorted(expected - present)}")
+            for table in ("incidents", "workflows", "tool_calls", "audit_events"):
+                if table in tables:
+                    print(f"{name}.{table}: {conn.execute(f'select count(*) from {table}').fetchone()[0]} rows")
+            full_schema += expected <= tables
+    except Exception as exc:
+        failures.append(f"{name}: {exc}"); print(f"{name}: FAILED - {exc}")
+print(f"databases reachable: {len(targets) - len(failures)}/{len(targets)}; holding the app's full schema: {full_schema}")
+if failures or not full_schema:
+    raise SystemExit(1)
+print("pg verification: OK")
+PY
+
+  echo "--- 3. the engine, then this project's own container state ---"
+  set +e
+  "$OPSACCORD_DOCKER_BIN" version --format '{{.Server.Version}}' >"$LOGDIR/06-docker-engine.log" 2>&1
+  engine_rc=$?
+  set -e
+  cat "$LOGDIR/06-docker-engine.log"
+  if [ "$engine_rc" -ne 0 ]; then
+    echo "STOP: the Docker engine did not answer, so nothing below was run. Start Docker Desktop, wait until it reports running, then re-run this whole block." >&2
+    exit 1
+  fi
+  set +e
+  bash scripts/demo.sh ensure 2>&1 | tee "$LOGDIR/07-demo-ensure.log"; ensure_rc=${PIPESTATUS[0]}
+  set -e
+  echo "demo.sh ensure exited $ensure_rc"
+  set +e
+  bash scripts/demo.sh inspect 2>&1 | tee "$LOGDIR/08-demo-inspect.log"; inspect_rc=${PIPESTATUS[0]}
+  set -e
+  echo "demo.sh inspect exited $inspect_rc (0 every container reported its full state; 1 at least one container was reported without its per-container detail)"
+  if [ "$inspect_rc" -ne 0 ]; then
+    echo "note: that is not fatal here - the capture below reads Jaeger's and flagd's own APIs, not this snapshot - but read 08-demo-inspect.log beside the capture when you send the evidence back." >&2
+  fi
+  if grep -E 'load-generator|checkout|payment|product-catalog' "$LOGDIR/08-demo-inspect.log" >"$LOGDIR/08b-key-containers.log"; then
+    cat "$LOGDIR/08b-key-containers.log"
+  else
+    echo "none of load-generator/checkout/payment/product-catalog appears in the inspect output (see 08-demo-inspect.log)"
+  fi
+  if [ "$ensure_rc" -ne 0 ]; then
+    echo "STOP: demo.sh ensure exited $ensure_rc. Either a running container is unhealthy - its health output and a bounded log tail are in $LOGDIR/07-demo-ensure.log - or the start it chose did not answer. No repair is guessed here: send $LOGDIR back and the next action will be chosen from that evidence." >&2
+    exit 1
+  fi
+
+  echo "--- 4. endpoints, refreshed rather than inherited ---"
+  bash scripts/demo.sh endpoints 2>&1 | tee "$LOGDIR/09-endpoints.log"
+  test -s .local/demo-endpoints.env
+  for var in OPSACCORD_DEMO_MODE OPSACCORD_PROMETHEUS_BASE_URL OPSACCORD_JAEGER_BASE_URL OPSACCORD_FLAG_CONTROL_BASE_URL; do
+    grep -q "^$var=" .local/demo-endpoints.env || { echo "STOP: $var is missing from the refreshed endpoint file" >&2; exit 1; }
+  done
+  set -a; . .local/demo-endpoints.env; set +a
+  failed=()
+  for probe in "prometheus|$OPSACCORD_PROMETHEUS_BASE_URL/-/healthy" "jaeger|$OPSACCORD_JAEGER_BASE_URL/api/services" "flagd|$OPSACCORD_FLAG_CONTROL_BASE_URL/api/read"; do
+    name="${probe%%|*}"; url="${probe#*|}"
+    if curl -fsS --max-time 10 "$url" -o "$LOGDIR/probe-$name.json" 2>"$LOGDIR/probe-$name.err"; then
+      echo "ok   $name -> $url"
+    else
+      echo "FAIL $name -> $url ($(head -c 200 "$LOGDIR/probe-$name.err"))"; failed+=("$name")
+    fi
+  done
+  if [ "${#failed[@]}" -gt 0 ]; then echo "STOP: endpoints that did not answer: ${failed[*]}" >&2; exit 1; fi
+
+  echo "--- 5. the fresh baseline: a request that begins after this point, not one already in flight ---"
+  set +e
+  "$PYTHON" scripts/capture-baseline-checkout.py \
+      --deadline-seconds 180 --poll-interval-seconds 10 \
+      --out "reports/local/baseline-checkout-$TS.json" \
+      --log "reports/local/baseline-checkout-$TS.log" 2>&1 | tee "$LOGDIR/10-baseline-capture.log"
+  cap_rc=${PIPESTATUS[0]}
+  set -e
+  echo "capture exit: $cap_rc (0 verified, 1 not verified, 3 refused to start)"
+  echo "extract: reports/local/baseline-checkout-$TS.json"
+  echo "capture log: reports/local/baseline-checkout-$TS.log"
+  if [ "$cap_rc" -ne 0 ]; then
+    echo "Not verified on this run. The capture names which property failed and keeps the raw spans it did see: if it reports no trace arrived, the load generator's row is in $LOGDIR/08b-key-containers.log. Send $LOGDIR back with the two reports/local files rather than re-running blind." >&2
+  fi
+  echo "evidence: $LOGDIR"
+  exit "$cap_rc"
+)
+```
