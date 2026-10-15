@@ -5295,6 +5295,36 @@ print("\n".join("%s=%s" % (name, (spec or {}).get("defaultVariant")) for name, s
 )
 ```
 
+**What was checked here before the block was handed over.** The block is this pass's own artifact, so its
+claims were read off the code rather than assumed:
+
+- **The six `--scenario` ids are real.** `LIVE_PLANS` holds `P1-01` .. `P1-07` (the `P1-08`/`P1-09` specs are
+  simulated only), the CLI's `--scenario` is an `append` option, so six repetitions parse, and
+  `run_live_suite` resolves each id through `LIVE_PLANS` and `SCENARIOS`.
+- **Every one of the six can return `PASS`.** `evaluate` scores a trace against its own plan's conditions,
+  not against "resolved": `P1-02` asserts `expect_resolved` and one executed action, while `P1-03` .. `P1-07`
+  assert `expect_handoff` / `expect_escalated` (with `expect_collection_error` and
+  `expect_verification_failure` where they apply). A path that reaches its designed
+  `READY_FOR_HUMAN`/`ESCALATED_INCOMPLETE` status passes, so **0** is the expected exit here, and a
+  correctly-designed handoff is not a failure.
+- **The exit decoder is the commands' own.** `cmd_run_live_scenarios` returns **1** for a path that did not
+  `PASS`, a run that stopped early, an evidence record that could not be written, or simulator evidence in a
+  live result; **2** when its own preflight cannot reach the demo stack - a second meaning of 2 the first
+  version of the block's one-line note missed; **3** for a competing live driver (`validate.sh`, not the
+  CLI); **130** on an interrupt. `validate.sh` runs the live stage last under `set -euo pipefail`, so its
+  exit status is that driver's, not `tee`'s.
+- **The status survives the pipe.** The block was executed against a stub stack - a `scripts/validate.sh`
+  that exits 0, then 7, and a `demo.sh health` that fails while the runner still answers - and it exited
+  **0**, **7** and **0**: it reports a failing health probe without adopting it as its own status, and it
+  never replaces the runner's status with the pipe's.
+- **The cleanup read-back fits this selection.** Three of the six arm a feature flag (`adHighCpu`,
+  `cartFailure`, `paymentUnreachable`), so reading every flag back from the store is the right shape: all
+  of them should read `off`.
+- Offline `389 passed, 7 skipped` (unchanged from the pass above), `ruff check` / `ruff format --check` /
+  `mypy src/opsaccord` clean, `bash -n` clean, and `tests/unit/test_demo_script.py` **42 passed**. The
+  handed-off-block guard needed no change: it pins delegation, status propagation and the read-back, not
+  any of the prose corrected above.
+
 ## The first live P1-01 pass (`335a3af` measured) - the Payment path attributes, escalates, remediates and verifies
 
 The user ran the handed-off block on this revision. `scripts/validate.sh --live --scenario P1-01` exited
@@ -5346,8 +5376,11 @@ below runs: one `validate.sh` invocation, the same runner stages and gates as th
 runner's own status rather than the pipe's. It **starts** PostgreSQL and, if the stack is not answering, the
 stack itself, and it **injects a fault per path** - the same deliberate difference from the capture block
 described above. A path whose plan ends at a human decision reports that as its status instead of
-resolving, which is not a failure of the path. `UV_CACHE_DIR=/tmp/uvcache scripts/validate.sh --live` (the
-full seven, re-running P1-01) is the alternative once these hold.
+resolving, which is not a failure of the path: `PASS` means every condition the plan asserts held, so five
+of the six (`P1-03` .. `P1-07`) pass by reaching their designed terminal status and only `P1-02` has to
+resolve. The expected exit status is therefore **0**, and the block decodes any other one rather than
+leaving it to be guessed at. `UV_CACHE_DIR=/tmp/uvcache scripts/validate.sh --live` (the full seven,
+re-running P1-01) is the alternative once these hold.
 
 ```bash
 ( set -euo pipefail
@@ -5361,7 +5394,7 @@ full seven, re-running P1-01) is the alternative once these hold.
   echo "interpreter: $("$PYTHON" -c 'import sys; print(sys.executable)')"
   echo "tested revision: $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD)"
   echo "evidence dir: $LOGDIR"
-  echo "This block runs the six live paths P1-01 did not cover. Each arms its own fault and is expected to restore it; a path whose plan ends at a human decision reports that as its status rather than resolving, which is not a failure of the path."
+  echo "This block runs the six live paths P1-01 did not cover. Each puts the demo into its own starting state and is expected to restore it before the next path starts; five of the six (P1-03..P1-07) are designed to end at a human decision or an escalation rather than resolving, and the runner scores that as the path's own result, not as a failure of the run."
 
   echo "--- 0. what this shell already sees, and the stack as it stands ---"
   git status --porcelain=v1 | tee "$LOGDIR/00-git-status.log"
@@ -5376,7 +5409,9 @@ full seven, re-running P1-01) is the alternative once these hold.
   scripts/validate.sh --live --scenario P1-02 --scenario P1-03 --scenario P1-04 --scenario P1-05 --scenario P1-06 --scenario P1-07 2>&1 | tee "$LOGDIR/10-live-remaining.log"
   rc=${PIPESTATUS[0]}
   set -e
-  echo "validate exit: $rc (0 every stage passed; 2 usage; 3 a competing driver; anything else is the failing stage's own status)"
+  echo "validate exit: $rc"
+  echo "  0 is the expected result: PASS means every condition the plan asserts held, so a path that ends at a human decision or an escalation (P1-03..P1-07) passes by reaching that status, and only P1-02 has to resolve"
+  echo "  1 a stage failed - for the live stage that is a path that did not PASS, a run that stopped early, an evidence record that could not be written, or simulator evidence in a live result; 2 usage, or the live driver's own preflight refusing to start because the demo stack did not answer it; 3 a competing live driver; 130 interrupted"
   echo "runner logs: $(sed -n 's/^logs: //p' "$LOGDIR/10-live-remaining.log" | head -1)"
 
   echo "--- 2. cleanup, read back from the flag store (read-only GET) ---"
