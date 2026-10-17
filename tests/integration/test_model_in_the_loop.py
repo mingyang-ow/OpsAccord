@@ -156,3 +156,28 @@ def test_the_harness_scores_and_attributes_what_each_model_proposed(
     assert summary["scripted/shell"]["proposals_refused"] == {"validation": 2}
     table = render_markdown(records, title="t")
     assert "shell_exec -> payment-service" in table
+
+
+def test_a_fix_proposed_without_telemetry_never_reaches_a_human_for_approval(
+    db: Database, settings: Settings
+) -> None:
+    """Replays deepseek-flash on P1-04: every metric and trace read timed out, and the model
+    still proposed the Payment fix. Policy now refuses it before an approval is requested."""
+    eager = Scripted(
+        "eager",
+        ActionProposal(
+            tool_name="apply_remediation",
+            target="payment-service",
+            arguments={"remediation_id": "disable_feature_flag", "flag_id": "paymentUnreachable"},
+            rationale="the runbook links Charge failures to paymentUnreachable",
+        ),
+    )
+    records = run_eval(db=db, settings=settings, providers=[eager], scenario_ids=["P1-04"])
+
+    (record,) = records
+    assert record.refused_by == "policy"
+    assert "INSUFFICIENT_EVIDENCE" in (record.refusal or "") or "no successful metric" in (
+        record.refusal or ""
+    )
+    assert record.final_status != "WAITING_FOR_APPROVAL"
+    assert record.executed_actions == 0

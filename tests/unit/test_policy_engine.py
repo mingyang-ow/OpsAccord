@@ -236,3 +236,48 @@ def test_terminal_statuses_are_recognised() -> None:
     assert engine.is_terminal(IncidentStatus.RESOLVED)
     assert engine.is_terminal(IncidentStatus.READY_FOR_HUMAN)
     assert not engine.is_terminal(IncidentStatus.INVESTIGATING)
+
+
+def test_a_write_without_telemetry_about_its_target_is_refused() -> None:
+    """Phase 2a, P1-04: a hosted model proposed the Payment fix with every metric and
+    trace read timed out. Evidence sufficiency is now policy, not the model's judgment."""
+    decision = engine.evaluate(policy_request(target_telemetry=0))
+
+    assert not decision.allowed
+    assert decision.matched_rule == "INSUFFICIENT_EVIDENCE"
+    assert engine.refusal_cause(decision) is engine.RefusalCause.POLICY
+
+
+def test_one_telemetry_read_is_enough_for_the_approval_path() -> None:
+    decision = engine.evaluate(policy_request(target_telemetry=1))
+
+    assert decision.allowed and decision.requires_approval
+
+
+def test_a_human_rejection_is_reported_before_missing_evidence() -> None:
+    """The most specific applicable reason wins: a human already said no."""
+    from opsaccord.domain.models import Action
+
+    request = policy_request(target_telemetry=0)
+    digest = Action.compute_intent_digest(
+        request.proposal.tool_name, request.proposal.target, request.proposal.arguments
+    )
+    decision = engine.evaluate(
+        policy_request(target_telemetry=0, rejected_intents=frozenset({digest}))
+    )
+
+    assert decision.matched_rule == "REJECTED_INTENT"
+
+
+def test_reads_never_need_prior_telemetry() -> None:
+    from opsaccord.domain.models import ActionProposal
+
+    read = ActionProposal(
+        tool_name="read_metrics",
+        target="payment-service",
+        arguments={"target": "payment-service", "metric": "error_rate"},
+        rationale="investigate",
+    )
+    decision = engine.evaluate(policy_request(proposal=read, target_telemetry=0))
+
+    assert decision.allowed and decision.matched_rule == "ALLOW_READ_ONLY"

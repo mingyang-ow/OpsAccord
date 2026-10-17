@@ -131,6 +131,7 @@ def policy_request(
     constraints: tuple[Constraint, ...] = (),
     rejected_intents: frozenset[str] = frozenset(),
     settings: object | None = None,
+    target_telemetry: int = 1,
 ) -> PolicyRequest:
     from opsaccord.config import Settings
 
@@ -155,6 +156,9 @@ def policy_request(
         rejected_intents=rejected_intents,
         budget=budget_state or budget(),
         settings=resolved_settings,  # type: ignore[arg-type]
+        # The premise of most policy tests is an incident that did collect telemetry;
+        # tests of the evidence rule itself pass 0.
+        target_telemetry=target_telemetry,
     )
 
 

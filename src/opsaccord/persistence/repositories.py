@@ -632,6 +632,33 @@ def set_takeover(session: Session, *, incident_id: str, actor: str) -> Workflow:
     return _workflow(workflow_row)
 
 
+#: Evidence kinds that are telemetry: a measurement of the service, not a probe, a
+#: runbook, a change record or a failed read.
+TELEMETRY_EVIDENCE_KINDS = (EvidenceKind.METRIC, EvidenceKind.TRACE)
+
+
+def count_target_telemetry(session: Session, *, incident_id: str, target: str) -> int:
+    """Successful telemetry reads this incident collected about ``target``.
+
+    A metric or trace read of the target itself counts. So does a dependency read that
+    a caller made of the target (``value.destination``), because that is how a fault
+    on the call path is attributed when the target's own probe looks healthy. Failed
+    reads are recorded as ``COLLECTION_ERROR`` and never count, and neither do health
+    probes, runbooks or change records.
+    """
+    rows = session.execute(
+        sa.select(EvidenceRow.service, EvidenceRow.value).where(
+            EvidenceRow.incident_id == incident_id,
+            EvidenceRow.kind.in_(TELEMETRY_EVIDENCE_KINDS),
+        )
+    ).all()
+    return sum(
+        1
+        for service, value in rows
+        if service == target or (value or {}).get("destination") == target
+    )
+
+
 def set_terminal_reason(session: Session, *, incident_id: str, reason: str) -> None:
     workflow_row = session.scalars(
         sa.select(WorkflowRow).where(WorkflowRow.incident_id == incident_id)

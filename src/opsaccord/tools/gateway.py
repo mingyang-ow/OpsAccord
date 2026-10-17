@@ -408,6 +408,9 @@ class ToolGateway:
                     ),
                     budget=policy_engine.budget_state(workflow),
                     settings=self.settings,
+                    target_telemetry=repo.count_target_telemetry(
+                        session, incident_id=incident_id, target=proposal.target
+                    ),
                 )
             )
         return decision, arguments
@@ -674,6 +677,9 @@ class ToolGateway:
                 rejected_intents=frozenset(repo.rejected_intents(session, workflow_id=workflow.id)),
                 budget=policy_engine.budget_state(workflow),
                 settings=self.settings,
+                target_telemetry=repo.count_target_telemetry(
+                    session, incident_id=action.incident_id, target=action.target
+                ),
             )
         )
         if not decision.allowed:

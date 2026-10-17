@@ -205,3 +205,27 @@ pre-change run is kept as evidence, because it is the one that found the read-to
 **Decision deliberately not taken:** the scorer was *not* changed after seeing results.
 Rescoring the injection scenarios, and moving evidence sufficiency into policy, are
 proposed for Phase 2b and left to the user.
+
+## 2026-10-17 - Phase 2b-1: evidence sufficiency is now policy
+
+**Decision (user's choice of priority):** a remediation needs telemetry about its target,
+enforced by the policy engine rather than left to the model. The rule is
+`INSUFFICIENT_EVIDENCE`: at least one successful metric or trace read of the target, or a
+caller's dependency read *of* the target. Failed reads (`COLLECTION_ERROR`), health
+probes, runbooks and change records do not count.
+
+**Why one read and not more:** the rule exists to stop acting on *no* measurement. A
+higher threshold would be a tuning guess with no evidence behind it yet. One read is the
+smallest rule that refuses the P1-04 behaviour, and nothing in the existing scenarios
+needed more.
+
+**Why the dependency read counts:** `paymentUnreachable` leaves payment's own probe
+healthy, and the fault is visible only on checkout's call to it. Counting only the
+target's own metrics would refuse the correct Payment fix.
+
+**Where it sits:** after a human rejection (so "a human already said no" is still reported
+first), and before the remediation posture. It is evaluated when a proposal is evaluated
+and again at dispatch, like every other rule.
+
+**Not yet shown live.** All live paths read telemetry about their target, so they should
+be unaffected, but no live run has been made since this change.

@@ -43,6 +43,7 @@ Operational audit events are append-only. Mutable workflow projections do not re
 - Completion requires fresh, service-specific recovery evidence. Failed verification must not become RESOLVED.
 - The target policy evaluates is the target that executes. A write proposal whose arguments name a different target than the proposal itself is refused by the gateway, both when it is evaluated and when its action is written.
 - Only registered write tools travel the action path. A read proposed as an action is refused when evaluated and when its action is written, and the dispatcher refuses, before any claim, an action row whose tool is not a registered write tool.
+- No side effect without telemetry about its target. Policy refuses a remediation (`INSUFFICIENT_EVIDENCE`) unless the incident collected at least one successful metric, trace, or caller-side dependency read of that target. A health probe, a runbook, or a model's confidence is not enough.
 
 ### Execution commitment and control ordering
 
