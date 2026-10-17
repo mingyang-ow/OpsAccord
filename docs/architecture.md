@@ -42,6 +42,7 @@ Operational audit events are append-only. Mutable workflow projections do not re
 - Approval APIs require a human-authenticated role or an explicitly documented local-development mechanism; the agent cannot approve itself. Keep development controls bound to localhost.
 - Completion requires fresh, service-specific recovery evidence. Failed verification must not become RESOLVED.
 - The target policy evaluates is the target that executes. A write proposal whose arguments name a different target than the proposal itself is refused by the gateway, both when it is evaluated and when its action is written.
+- Only registered write tools travel the action path. A read proposed as an action is refused when evaluated and when its action is written, and the dispatcher refuses, before any claim, an action row whose tool is not a registered write tool.
 
 ### Execution commitment and control ordering
 

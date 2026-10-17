@@ -48,6 +48,7 @@ from opsaccord.domain.models import (
     ActionProposal,
     Constraint,
     ToolResult,
+    ToolSpec,
     VerificationResult,
 )
 from opsaccord.domain.models import (
@@ -91,6 +92,23 @@ class UnknownTool(RuntimeError):
 
 class TargetMismatch(ValueError):
     """A write proposal named one target and carried another in its arguments."""
+
+
+class NotAnActionTool(UnknownTool):
+    """A registered tool that is not a write tool was proposed as an action."""
+
+
+def _require_write_tool(spec: ToolSpec) -> None:
+    """Only write tools may travel the action path.
+
+    Investigation reads belong to the controller's own read path. A read proposed as an
+    action used to be claimed and handed to the write dispatcher (deepseek-flash, P1-02,
+    2026-10-17), which called ``apply_remediation`` with a read's arguments.
+    """
+    if spec.side_effect is not SideEffect.WRITE:
+        raise NotAnActionTool(
+            f"{spec.name!r} is not a write tool, so it cannot be proposed as an action"
+        )
 
 
 def _bind_target(proposal: ActionProposal, arguments: dict[str, Any]) -> None:
@@ -364,6 +382,7 @@ class ToolGateway:
         spec = self.registry.get(proposal.tool_name)
         if spec is None:
             raise UnknownTool(f"{proposal.tool_name!r} is not a registered typed tool")
+        _require_write_tool(spec)
         raw = dict(proposal.arguments)
         if "target" in spec.arguments_schema:
             # The proposal already names its target; a model that does not repeat it
@@ -410,6 +429,7 @@ class ToolGateway:
         # whose recorded target differs from the one it would dispatch to.
         _bind_target(proposal, arguments)
         spec = self.registry.require(proposal.tool_name)
+        _require_write_tool(spec)
         # The policy engine is the authority on whether a human must approve this
         # exact action. The catalog attribute is a static floor for tools that
         # always need a human, and it is deliberately narrowed for the one
@@ -464,6 +484,14 @@ class ToolGateway:
             action = repo.get_action(session, action_id)
             if action is None:
                 raise repo.RepositoryError(f"unknown action {action_id}")
+            action_spec = self.registry.get(action.tool_name)
+            if action_spec is None or action_spec.side_effect is not SideEffect.WRITE:
+                # Defence in depth, before anything is claimed: an action row written
+                # by any path other than prepare_action still cannot reach the write
+                # dispatcher unless its tool is a registered write tool.
+                return ActionExecution(
+                    action, False, f"{action.tool_name!r} is not a registered write tool"
+                )
             # Serialise against human controls: from here until the claim commits,
             # a concurrent takeover or constraint either lands before this
             # revalidation (and blocks the dispatch) or waits for it. There is no

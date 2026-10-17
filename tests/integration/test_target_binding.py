@@ -89,3 +89,28 @@ def test_a_missing_argument_target_is_taken_from_the_proposal(
 
     assert len(trace.executed_actions) == 1
     assert trace.executed_actions[0].arguments["target"] == "ad-service"
+
+
+def test_a_read_tool_is_never_accepted_as_an_action(db: Database, settings: Settings) -> None:
+    """deepseek-flash, P1-02, 2026-10-17: it proposed ``read_recent_changes`` as its action.
+
+    The action path only checked that the tool was registered, so the read was claimed
+    and handed to the write dispatcher, which called ``apply_remediation`` with a read's
+    arguments. It failed before any side effect and was recorded UNCERTAIN, but a read
+    must never reach the dispatcher at all: investigation reads are the controller's.
+    """
+    reader = Scripted(
+        "reader",
+        ActionProposal(
+            tool_name="read_recent_changes",
+            target="ad-service",
+            arguments={},
+            rationale="check for a recent deploy before remediating",
+        ),
+    )
+    trace = run_scenario(SCENARIOS["P1-02"], db=db, settings=settings, provider=reader)
+
+    assert trace.actions == []
+    assert trace.executed_actions == []
+    assert any("not a write tool" in note for note in trace.run_notes)
+    assert str(trace.incident.status) == "READY_FOR_HUMAN"
