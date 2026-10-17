@@ -14,8 +14,8 @@ superseded by the rows here.
 | Runtime code under test | `src/` and `scripts/` are byte-identical from `335a3af` to the tip (`git diff --quiet 335a3af HEAD -- src scripts`); every commit after `335a3af` changes only this report and `tests/unit/test_demo_script.py` |
 | **Phase 1 status** | **READY_FOR_DISCUSSION** - every executable gate in `docs/phase1.md` has passed. The final diff inspection, acceptance and delivery are the user's |
 | Offline and database-backed gates | offline **389 passed, 7 skipped** in both environment variants; lint, format (95 files) and `mypy` (42 source files) clean; integration **85 passed**; pre-fix sensitivity harness as designed; simulated scenarios **9/9 PASS** - identical in the user's runs at `335a3af`, `d75ea8f` and `b9404e8` |
-| Live paths against the pinned `3.1.0` stack | **7/7 PASS** against the same runtime code: P1-01 at `335a3af` (one run), P1-02..P1-07 at `d75ea8f` and again at `b9404e8` (two runs, 6/6 each). 0 forbidden actions, 0 duplicate side effects, 0 simulator evidence, every armed flag read back `off`. The first single-invocation attempt (2026-10-17, `4962803`) measured **5/7**: P1-01 `NOT_MEASURED` and P1-07 `SAFE_ESCALATION`, both from checkout traffic at about a third of the passing runs' rate, with no unsafe outcome - see "The first seven-path run" |
-| Outstanding | the single seven-path run; the user's review of `git diff 3168bcf HEAD` and of the draft PR; a licence (noted by the user, not needed while private); the open design decisions under "Remaining work and discussion" |
+| Live paths against the pinned `3.1.0` stack | **7/7 PASS in one invocation**: `scripts/validate.sh --live` at `9ac1209` (2026-10-17 07:45:09-08:06:29 UTC), exit **0**, after `product-catalog` and `checkout` were restarted and verified. 0 forbidden actions, 0 duplicate side effects, 0 simulator evidence, every armed flag read back `off`. The same runtime code also passed P1-01 at `335a3af` and P1-02..P1-07 twice (`d75ea8f`, `b9404e8`), and one earlier seven-path attempt measured 5/7 on a starved stack - see "The seven-path pass" |
+| Outstanding | the user's review of `git diff 3168bcf HEAD` and of the draft PR; a licence (noted by the user, not needed while private); the open design decisions under "Remaining work and discussion" |
 | Dirty state | clean: the user's `AGENTS.md` reviewer-policy section is committed at the user's instruction; otherwise only gitignored local state (`.local/`, `reports/local/`, `.venv/`) |
 | Host | WSL 2, kernel `6.18.33.2-microsoft-standard-WSL2`, Ubuntu 26.04 LTS, 16 CPU, 15.5 GB RAM |
 | Toolchain | `uv` 0.12.5, Python 3.12.14 (`.python-version`), project-local PostgreSQL 18.6 on `127.0.0.1:55432`, Docker 29.7.2, Docker Compose v5.4.0 |
@@ -5675,3 +5675,48 @@ this session, because Docker is not reachable from it.
 the bursty load generator does not guarantee. A bounded, read-only-safe synthetic checkout driver for the
 fault and verification windows, in the spirit of `scripts/capture-baseline-checkout.py`, would make the live
 gate independent of it. That is a code change and has not been made.
+
+## The seven-path pass (`9ac1209` measured, 2026-10-17) - 7/7 in one invocation
+
+**Recovery first.** At about 07:35 UTC the user ran the recovery block. `scripts/demo.sh inspect` showed
+`product-catalog` `state=running health=unhealthy restarts=0 oom_killed=false memory_limit=20971520`. It had
+been started at 05:42:56, about 2 minutes before the 5/7 run, so it had become unhealthy without restarting or
+being OOM-killed. `scripts/demo.sh restart product-catalog checkout` exited 0. `verify-recovery` read both
+services `healthy` on its second attempt, and the recheck found all 25 containers running and healthy or with
+no healthcheck. Five minutes later, checkout read **1.50** `PlaceOrder`/min and **1.50** `Charge`/min, with
+**0.00** catalog client errors/min.
+
+**The run.** The user then ran the seven-path block at `9ac1209`, with `src/` and `scripts/` byte-identical to
+`335a3af`. Evidence: `.local/user-live-seven-20261017T074408/`, `reports/local/validation-20261017T074414/` and
+`reports/local/live-scenarios-20261017T074414.json`. `validate exit: 0`, which the block now records to a file.
+Every stage passed: offline 389/7 in both variants; lint, format (95 files) and types (42 source files) clean;
+integration 85; the sensitivity harness as expected; 9/9 simulated; and **7/7 live**, `run COMPLETED` with
+7 measured and none pending.
+
+| Path | Final status | Approvals / actions | Verification | Fault reading | Elapsed (s) |
+| --- | --- | --- | --- | --- | --- |
+| P1-01 | `RESOLVED` | 1 / 1 | `VERIFICATION_SUCCESS` | `checkout -> payment` `Charge` client error_rate 0.5 | 121.2 |
+| P1-02 | `RESOLVED` | 0 / 1 (allow-listed) | `VERIFICATION_SUCCESS` | `ad` CPU 1.476 cores | 181.1 |
+| P1-03 | `READY_FOR_HUMAN` | 0 / 0 | - | `cart` error_rate 0.333 | 180.6 |
+| P1-04 | `ESCALATED_INCOMPLETE` | 0 / 0 | - | telemetry unroutable, no fault armed | 12.2 |
+| P1-05 | `READY_FOR_HUMAN` | 1 (rejected) / 0 | - | edge error_rate 1.0 | 101.0 |
+| P1-06 | `ESCALATED_INCOMPLETE` | 1 / 1 | `VERIFICATION_FAILURE` | edge error_rate 1.0 | 332.1 |
+| P1-07 | `ESCALATED_INCOMPLETE` | 1 / 1 | `VERIFICATION_FAILURE` | edge error_rate 1.0 | 352.1 |
+
+Every record carries `simulated_evidence: 0`, `forbidden_actions: 0`, `duplicate_side_effects: 0` and
+`resolved_without_verification: false`, and the post-run read shows all 18 flags `off`. P1-01's and P1-02's
+cleanup read `was 'off'` because the approved or allow-listed remediation had already turned the flag off.
+
+**The stack was healthy throughout, read from Prometheus over the run window.** Checkout averaged **2.35**
+`PlaceOrder`/min and **2.35** `Charge`/min, within the passing runs' 1.56-2.43 range, and recorded **0** catalog
+client errors. Catalog client errors were still 0 in the 10 minutes before this record was written. This was
+read by the Claude Code session, not by the runner.
+
+**What this establishes, and what it does not.** All seven live paths now pass in one runner invocation on
+the runtime code that passed them separately, so the live gate in `docs/phase1.md` is met in one run. Neither
+5/7 attempt was a controller failure: both were starved of checkout traffic by an unhealthy `product-catalog`,
+and the controller refused to conclude instead of guessing. The live gate still depends on a healthy catalog
+and the bursty load generator. Why `product-catalog` becomes unhealthy, and whether its `20M` / `GOMEMLIMIT=16MiB`
+limit is the cause, remains undiagnosed; the earlier measurement argued against the memory reading. The
+synthetic checkout driver under "The first seven-path run" is the recorded way to make the gate independent of
+the load generator.

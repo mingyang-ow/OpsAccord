@@ -8,10 +8,10 @@ service, Streamlit console, scenarios, and adversarial checks are implemented an
 end. There are two execution surfaces, selected with `OPSACCORD_DEMO_MODE`: a deterministic simulated
 adapter, and a live adapter over the real Astronomy Shop stack (Prometheus, Jaeger, and the flagd
 control plane). All nine scenarios pass in simulation. All seven live paths (P1-01..P1-07) have passed
-against the pinned `3.1.0` stack on the same runtime code, with zero forbidden actions, zero duplicate
+against the pinned `3.1.0` stack in a single runner invocation, with zero forbidden actions, zero duplicate
 side effects, and zero simulated-provenance records. The branch has not been pushed or merged. See
 [the Phase 1 implementation report](docs/reports/phase1-implementation.md) for exact commands, counts,
-and the remaining single seven-path run.
+and which evidence is simulated rather than live.
 
 `scripts/prefix-sensitivity.sh` reproduces the two safety-pass defects on the pre-fix revision
 (`5cbcce2`) and confirms they are closed at `HEAD`.
