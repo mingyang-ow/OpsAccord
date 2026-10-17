@@ -2,20 +2,19 @@
 
 An incident-response agent with evidence-backed diagnosis, policy-controlled remediation, and human approval.
 
-**Status: Phase 1 implemented and validated locally; awaiting review with the user.**
+**Status: Phase 1 READY_FOR_DISCUSSION; awaiting review and acceptance with the user.**
 The controller, deterministic policy engine, typed tool gateway, PostgreSQL persistence, FastAPI
 service, Streamlit console, scenarios, and adversarial checks are implemented and exercised end to
-end. Both execution surfaces exist: a deterministic simulated adapter, and a live adapter over the
-real Astronomy Shop stack (Prometheus, Jaeger, and the flagd control plane), selected with
-`OPSACCORD_DEMO_MODE`. Docker Desktop runs the pinned `3.1.0` stack locally, and the seven live
-paths have been executed against it with zero simulated-provenance records. See
-[the Phase 1 implementation report](docs/reports/phase1-implementation.md) for exact commands,
-counts, and which evidence is simulated rather than live.
+end. There are two execution surfaces, selected with `OPSACCORD_DEMO_MODE`: a deterministic simulated
+adapter, and a live adapter over the real Astronomy Shop stack (Prometheus, Jaeger, and the flagd
+control plane). All nine scenarios pass in simulation. All seven live paths (P1-01..P1-07) have passed
+against the pinned `3.1.0` stack on the same runtime code, with zero forbidden actions, zero duplicate
+side effects, and zero simulated-provenance records. The branch has not been pushed or merged. See
+[the Phase 1 implementation report](docs/reports/phase1-implementation.md) for exact commands, counts,
+and the remaining single seven-path run.
 
-The current safety pass (`b508a0f`, control ordering and uncertain dispatch outcomes)
-is implemented and offline-verified; its PostgreSQL-backed and live validation, and its
-optional independent review, are outstanding. Run `scripts/prefix-sensitivity.sh` to
-reproduce the two defects on the pre-fix revision and confirm they are closed.
+`scripts/prefix-sensitivity.sh` reproduces the two safety-pass defects on the pre-fix revision
+(`5cbcce2`) and confirms they are closed at `HEAD`.
 
 ## Phase 1
 

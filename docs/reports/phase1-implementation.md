@@ -2,6 +2,38 @@
 
 ## Identity and status
 
+This table is the current state. The per-pass status rows that used to sit here are kept verbatim,
+as records, under "Status history" directly below; each was true of the revision it names and most are
+superseded by the rows here.
+
+| Item | Value |
+| --- | --- |
+| Repository | `mingyang-ow/OpsAccord` (private), remote `git@github.com:mingyang-ow/OpsAccord.git`; `origin/main` is still `3168bcf` |
+| Branch | `phase1/baseline`, branched at `3168bcf`; no upstream, not pushed |
+| Tip | `git log --oneline -1` (this report's record commit). `git diff --shortstat 3168bcf HEAD` before this commit: 111 files changed, 40664 insertions(+), 42 deletions(-) |
+| Runtime code under test | `src/` and `scripts/` are byte-identical from `335a3af` to the tip (`git diff --quiet 335a3af HEAD -- src scripts`); every commit after `335a3af` changes only this report and `tests/unit/test_demo_script.py` |
+| **Phase 1 status** | **READY_FOR_DISCUSSION** - every executable gate in `docs/phase1.md` has passed. The final diff inspection, acceptance and delivery are the user's |
+| Offline and database-backed gates | offline **389 passed, 7 skipped** in both environment variants; lint, format (95 files) and `mypy` (42 source files) clean; integration **85 passed**; pre-fix sensitivity harness as designed; simulated scenarios **9/9 PASS** - identical in the user's runs at `335a3af`, `d75ea8f` and `b9404e8` |
+| Live paths against the pinned `3.1.0` stack | **7/7 PASS** against the same runtime code: P1-01 at `335a3af` (one run), P1-02..P1-07 at `d75ea8f` and again at `b9404e8` (two runs, 6/6 each). 0 forbidden actions, 0 duplicate side effects, 0 simulator evidence, every armed flag read back `off`. All seven have not yet been measured in **one** invocation - that run is handed off at the end of this report |
+| Outstanding | the single seven-path run; the user's review of `git diff 3168bcf HEAD`; push and draft PR; a licence; the open design decisions under "Remaining work and discussion" |
+| Dirty state | the user's uncommitted `AGENTS.md` reviewer-policy section, preserved and never staged by the coding agent; otherwise only gitignored local state (`.local/`, `reports/local/`, `.venv/`) |
+| Host | WSL 2, kernel `6.18.33.2-microsoft-standard-WSL2`, Ubuntu 26.04 LTS, 16 CPU, 15.5 GB RAM |
+| Toolchain | `uv` 0.12.5, Python 3.12.14 (`.python-version`), project-local PostgreSQL 18.6 on `127.0.0.1:55432`, Docker 29.7.2, Docker Compose v5.4.0 |
+| Coding agents | Codex CLI on the user's DeepSeek provider (`deepseek-flash` / `deepseek-v4-pro`) for implementation through `f1df097`. The records-only pass after it (the six-path section, this table, the seven-path handoff and the README status) was written in the subscription-backed Claude Code harness (`claude-opus-5-5`); it changed no code and is not a review |
+| Application runtime model | `deterministic` / `deterministic-v1` - no paid application-model calls were made |
+
+`READY_FOR_DISCUSSION` means every executable technical gate in `docs/phase1.md` passed, including the
+four primary paths and the three Payment variations against the real isolated demo stack. It is **not**
+user acceptance, it is not permission to merge, and no merge, release, visibility change, or Phase 2 work
+was performed. Delivery was blocked only inside the Codex sandbox (see "Remaining work and discussion");
+from the user's own shell `git ls-remote origin` answers, so pushing is a user action rather than a
+blocker.
+
+### Status history
+
+Verbatim rows as they stood at `f1df097`. Each describes the revision it names; read the table above for
+the current state.
+
 | Item | Value |
 | --- | --- |
 | Repository | `mingyang-ow/OpsAccord` (private), remote `git@github.com:mingyang-ow/OpsAccord.git` |
@@ -26,18 +58,9 @@
 | **Payment fault-evidence status (branch tip with this report)** | **PARTIAL** - at `723fe7b` the user's diagnostic capture (30 polls, 00:56:03-01:05:48 UTC, flag armed and restored with a read-back) measured the mismatch decisively: at 00:58:04 checkout's `PlaceOrder` read a **0.3333** error share while the attributed Charge series read 0.0334 calls/s on `checkout`'s client spans and 0.0167 calls/s on `payment`'s, both at **0.0** error share, and the closing polls read a **1.0** caller error share with no Charge traffic at all. The pinned source confirms the injected failure *should* appear on the selected client span (same RPC, same operation name, same `otelgrpc` handler), so the inconsistency is real rather than a selector artefact. The traces that would settle it are unavailable: `_jaeger_traces` sends no `start`/`end`, so the capture's six distinct payloads were unbounded newest-N sets with no trace IDs, and Jaeger's store is bounded by `max_traces` rather than by age *(a bounded store is not a demonstrated eviction - corrected in the trace-query pass below)*. This pass corrected the diagnostic's reporting - four disjoint evidence classes, the *strongest* reading instead of the commonest one (which reported the least informative class by construction), `recovery: assessed: false`, and an exit status that is recorded and printed - and added a bounded read-only trace exporter so the missing evidence can be collected in one shot; both are committed as `56fab5a`. Offline `218 passed, 7 skipped` in both variants; lint, format and `mypy` clean. P1-01 remains unverified and Payment recovery has still never been demonstrated. See "The payment fault-evidence pass (`723fe7b` measured)". |
 | **Trace-query status (branch tip with this report)** | **PARTIAL** - the user's `022150` run (revision `6b7fe61`) is the first to reach the trace exporter: 18 armed observations resolved to 6 `generic_caller_failure_only`, 6 `traffic_without_failure`, 6 `no_usable_observation`, 0 `attributable_failure`, with the strongest-class aggregation working live, and `paymentUnreachable` restored with a read-back. The exporter exited `0` and returned **0 PlaceOrder traces**, and suggested eviction. Auditing the request showed it was well-formed - correct base path, real service names, microsecond UTC bounds, percent-encoded operation, no credentials - while the *entry filter* was an assumption: the pinned collector rewrites span names with `set_semconv_span_name`, the registry already carries two different naming forms, and no run has ever returned this operation. The **read** was the confirmed defect: `read_traces` reported an `observation_window_start/end` it never asked for, since the request carried `lookback` and `limit=20` and no bounds, and the same capture's `charge_traces` payload changed only twice in 18 polls. This pass bounds the read, retains trace IDs and cap/out-of-window provenance, makes an API error raise instead of reading as empty, and rebuilds the exporter as a progressive read-only sequence with an explicit "cause unknown" empty-result explanation; `a686617`. Offline `242 passed, 7 skipped` in both variants; lint, format and `mypy` clean. The historical interval has still not been read, P1-01 is unverified, and Payment recovery has still never been demonstrated. See "The trace-query pass (`6b7fe61` measured)". |
 | **Recovered-trace analysis status (branch tip with this report)** | **PARTIAL** - the user's `025435` run (revision `504fbd0`) is the first to retrieve traces from the fault interval: 17 services, 8 advertised Checkout operations, 40 recent unfiltered Checkout traces, `oteldemo.CheckoutService/PlaceOrder` confirmed in a returned trace, the bounded retrieval check succeeded, and **two** historical traces came back (`ce5e79a180be61a3c87ac161b474ef1d`, `798301119dc69ac06ecc4704cf100bcc`) with the exporter exiting `0`. The extract holds **summaries only**, so the requested ancestry reconstruction cannot be completed from it, and the run's own `evidence.sufficiency: sufficient` was a statement about retrieval presented as a statement about the subject - a claim this report retracts. Reading the summaries against the code shows the confirmed classification defects: the span called the "root" was a `frontend` client span (the load generator's HTTP span above it is the actual root), `child_of_root=False` was an artefact of that selection, both frontend durations (563.9 s, 826.6 s) outlast the 344 s fault interval, and `failed: 0` was computed from one span's direct children while six and nine spans in the same traces recorded errors. This pass resolves root, attempt and edge relationship from `CHILD_OF` references, makes span status three-valued with the deciding signal named, counts errors across the whole trace, fixes the observed-range arithmetic, replaces the single "sufficiency" with a five-level ladder, and corrects the same status defect in the runtime `read_traces` adapter. Offline `256 passed, 7 skipped` in both variants; lint, format and `mypy` clean. The two traces have **not** been positioned against injection and restoration, Payment is neither shown to have served nor to have failed, recovery remains undemonstrated, and P1-01 remains unverified on this revision. See "The recovered-trace analysis pass (`504fbd0` measured)". |
-
 | **Fault-free-baseline status (branch tip with this report)** | **PARTIAL** - the user's capture-only run at `63effae` returned `baseline_verified`, exit **0**: a fresh attempt (13.6 s past the boundary), all 6 flags safe and unchanged across both readings, no competing driver, the catalog and the `payment` edge on the path, and `explicit_success` satisfied by the caller's own `frontend` client span `11fb12ab7f0934a3` (`OK(rpc.grpc.status_code)`, the attempt's own parent reference, `ancestor` 1 hop, `correlated_caller`) with the attempt's `UNSET` left as written and **ERROR 0** on 121 spans. Re-derived from the run's extract here, and falsified by breaking the parent reference. **Payment recovery is still unverified and P1-01 has not run**, so Phase 1 stays PARTIAL. See "The option-B pass". |
-
 | **Live P1-01 status (branch tip with this report)** | **PARTIAL** - at `335a3af` the user's focused live run exited **0** and P1-01 **PASSED**: the fault was attributed on the caller's own `checkout-service -> payment-service` client spans (error_rate **0.5** against **0.0** before arming, while `payment`'s own probe stayed `SERVING` at `error_rate 0.0`), with **1** exact approval, **1** executed `disable_feature_flag` action, 0 forbidden actions, 0 duplicate side effects, `VERIFICATION_SUCCESS` after 6 settling attempts, `resolved_without_verification: false`, `simulated_evidence: 0`, and cleanup read back `paymentUnreachable=off`. Every other stage passed in the same run (offline 389/7 in both variants, integration 85, lint/format/types, the sensitivity harness as designed, 9/9 simulated). **Ad, Cart and metrics-timeout paths are still unrun**, so Phase 1 stays PARTIAL. See "The first live P1-01 pass". |
-
-`READY_FOR_DISCUSSION` means every executable technical gate in `docs/phase1.md`
-passed on this commit, including the four primary paths against the real isolated
-demo stack. It is **not** user acceptance, it is not permission to merge, and no
-merge, release, visibility change, or Phase 2 work was performed. The one gate
-that cannot be satisfied from this environment is delivery: the branch could not
-be pushed or opened as a draft PR because the harness's automatic approval
-review is misconfigured (see "Remaining work and discussion").
+| **All-seven-live-paths status (branch tip with this report)** | **READY_FOR_DISCUSSION on the live gate** - the user ran the handed-off six-path block **twice** and both runs passed every stage. Run 1 at `d75ea8f` (13:13:55-13:30:34 UTC) and run 2 at `b9404e8` (14:21:11-14:35:48 UTC) each measured **6/6** paths **PASS** with the run `COMPLETED`: `P1-02` `RESOLVED` (1 allow-listed action, `VERIFICATION_SUCCESS`, `ad` cpu 1.019 against 0.0137 pre-injection), `P1-03`/`P1-05` `READY_FOR_HUMAN` (0 actions; `P1-05`'s approval rejected), `P1-04`/`P1-06`/`P1-07` `ESCALATED_INCOMPLETE` (0/1/1 actions; the last two recorded `VERIFICATION_FAILURE`), with **0** forbidden actions, **0** duplicate side effects, **0** simulator evidence and every armed flag read back `off` (the reference read shows all 18 `off`). `src/` and `scripts/` are **byte-identical** between `335a3af` - where P1-01 passed - and this commit, so **all seven live paths are now demonstrated against the same runtime code**. Delivery is still outstanding (the branch has no upstream and was not pushed) and the final diff inspection and acceptance remain the user's. See "The six remaining live paths, measured by the user".
 
 ## Delivered behavior
 
@@ -2733,6 +2756,11 @@ PY
 
 **Blockers (environment, not code):**
 
+*Update (records-only pass after `f1df097`):* every live and database-backed check below has since run on
+the user's host, so the "no PostgreSQL and no network" blocker no longer holds for the evidence. Push is no
+longer blocked either, because `git ls-remote origin` answers from the user's shell. These bullets record the
+Codex sandbox as it was, and pushing remains the user's decision.
+
 - **Push and draft PR are blocked.** Re-attempted in the deadlock-correction pass
   (`git push -u origin phase1/baseline`, exit `128`), and still blocked for two
   independent reasons: the push fails
@@ -5387,6 +5415,10 @@ resolve. The expected exit status is therefore **0**, and the block decodes any 
 leaving it to be guessed at. `UV_CACHE_DIR=/tmp/uvcache scripts/validate.sh --live` (the full seven,
 re-running P1-01) is the alternative once these hold.
 
+**The user has since run this block twice and both runs passed** - see "The six remaining live paths,
+measured by the user" below - so the block is now the record of the command that was handed over, and the
+seven-path run at the end of this report is the next action.
+
 ```bash
 ( set -euo pipefail
   cd /home/brentiburo/projects/OpsAccord
@@ -5418,6 +5450,157 @@ re-running P1-01) is the alternative once these hold.
   echo "  0 is the expected result: PASS means every condition the plan asserts held, so a path that ends at a human decision or an escalation (P1-03..P1-07) passes by reaching that status, and only P1-02 has to resolve"
   echo "  1 a stage failed - for the live stage that is a path that did not PASS, a run that stopped early, an evidence record that could not be written, or simulator evidence in a live result; 2 usage, or the live driver's own preflight refusing to start because the demo stack did not answer it; 3 a competing live driver; 130 interrupted"
   echo "runner logs: $(sed -n 's/^logs: //p' "$LOGDIR/10-live-remaining.log" | head -1)"
+
+  echo "--- 2. cleanup, read back from the flag store (read-only GET) ---"
+  set +e
+  if [ -f .local/demo-endpoints.env ]; then
+    set -a; . .local/demo-endpoints.env; set +a
+    "$PYTHON" -c 'import json, os, urllib.request as u
+base = os.environ["OPSACCORD_FLAG_CONTROL_BASE_URL"].rstrip("/")
+doc = json.load(u.urlopen(base + "/api/read", timeout=10))
+flags = doc.get("flags", {})
+print("\n".join("%s=%s" % (name, (spec or {}).get("defaultVariant")) for name, spec in sorted(flags.items())))' 2>&1 | tee "$LOGDIR/20-flags-after.log"
+    echo "every fault flag should read off above: each path arms one and the driver restores it, so a flag left on is a finding rather than a detail"
+  else
+    echo "no .local/demo-endpoints.env; the runner's endpoints stage writes it" | tee "$LOGDIR/20-flags-after.log"
+  fi
+  set -e
+
+  echo "evidence dir: $LOGDIR"
+  echo "the paths' own records: the newest reports/local/live-scenarios-*.json named in the runner's 13-live-paths.log"
+  echo "send back $LOGDIR, that JSON, and the runner's reports/local/validation-*/summary.log"
+  exit "$rc"
+)
+```
+
+## The six remaining live paths, measured by the user (`d75ea8f` and `b9404e8`)
+
+The user ran the handed-off six-path block twice on 2026-10-15, first at `d75ea8f` and then at `b9404e8`.
+Between those revisions only this report and `tests/unit/test_demo_script.py` changed, and `src/` and
+`scripts/` are byte-identical to `335a3af`, where P1-01 passed. **The measurements are the user's host
+runs.** Everything below was read from the evidence they wrote:
+
+| Run | Revision | Block evidence | Runner logs | Path records |
+| --- | --- | --- | --- | --- |
+| 1 | `d75ea8f` | `.local/user-live-remaining-20261015T131230/` | `reports/local/validation-20261015T131237/` | `reports/local/live-scenarios-20261015T131237.json` |
+| 2 | `b9404e8` | `.local/user-live-remaining-20261015T142002/` | `reports/local/validation-20261015T142008/` | `reports/local/live-scenarios-20261015T142008.json` |
+
+### Runner stages (identical in both runs)
+
+| Stage | Result |
+| --- | --- |
+| 00 checkout | the named revision, dirty only by the user's `M AGENTS.md` |
+| 02 / 03 offline suite, both environment variants | **389 passed, 7 skipped, 85 deselected**, in both |
+| 04 / 05 / 06 lint, format, types | `All checks passed!` / 95 files already formatted / no issues in 42 source files |
+| 07 integration | **85 passed**, 396 deselected |
+| 08 sensitivity harness | as designed: `5cbcce2` fails the two defect tests, `HEAD` passes all three |
+| 09 simulated scenarios | **9/9 passed** |
+| 10 / 12b driver guards | no competing live scenario driver |
+| 11 demo stack | empty log: the stack was already answering, so nothing was started or restarted |
+| 13 live paths | **6/6 PASS**, `run COMPLETED`; the preflight read 18 flags and 347 Prometheus series, and the startup baseline found every fault flag at its safe variant |
+
+The runner is fail-fast, and both logs reach `=== done ===`. The block's own `validate exit:` line went to
+the user's terminal rather than to a file, so the exit status is inferred from the runner reaching `done`
+and was not read from the evidence.
+
+### The paths
+
+Run 1 / run 2. Approvals counts recorded approval decisions, including a rejection.
+
+| Path | Setup | Final status | Approvals / actions | Verification | Elapsed (s) |
+| --- | --- | --- | --- | --- | --- |
+| P1-02 Ad high CPU | `adHighCpu=on` | `RESOLVED` | 0 / **1** (`ALLOW_LISTED_REMEDIATION`) | `VERIFICATION_SUCCESS` | 161.0 / 160.9 |
+| P1-03 Cart failure | `cartFailure=100%` | `READY_FOR_HUMAN` | 0 / 0 | none (no action) | 220.7 / 200.7 |
+| P1-04 Metrics timeout | Prometheus and Jaeger pointed at an unroutable address | `ESCALATED_INCOMPLETE` | 0 / 0 | none (no action) | 12.2 / 12.3 |
+| P1-05 Payment approval rejected | `paymentUnreachable=on`, decision `REJECTED` | `READY_FOR_HUMAN` | 1 / 0 | none (no action) | 40.8 / 40.7 |
+| P1-06 Payment action times out after dispatch | `paymentUnreachable=on`, flag control plane unroutable after approval | `ESCALATED_INCOMPLETE` | 1 / 1 | `VERIFICATION_FAILURE` | 211.7 / 171.0 |
+| P1-07 action succeeds, service stays unhealthy | `paymentUnreachable=on`, re-armed right after dispatch | `ESCALATED_INCOMPLETE` | 1 / 1 | `VERIFICATION_FAILURE` | 352.3 / 291.3 |
+
+Every record in both runs carries `simulated: false`, `simulated_evidence: 0`, `forbidden_actions: 0`,
+`duplicate_side_effects: 0` and `resolved_without_verification: false`. Each run's flag read-back after the
+run shows all 18 flags `off`.
+
+What each path shows, against the required outcome in `docs/phase1.md`:
+
+- **P1-02.** The fault was visible as a CPU rise on `ad`'s own spans: 1.019 against 0.0137 before arming in
+  run 1, and 1.355 against 0.0075 in run 2. The diagnosis cited the 0.8 threshold and the `adHighCpu` flag.
+  The one allow-listed remediation was dispatched and acknowledged, and a fresh probe then read `SERVING`
+  with `error_rate 0.0`. Cleanup reads `was 'off'` because the remediation had already turned the flag off,
+  and the read-back confirms it.
+- **P1-03.** The diagnosis was correct (cart `error_rate` 0.51 / 0.20 with failing cart RPC spans). The
+  only proposal it produced was refused at typed validation: `disable_feature_flag` is not allow-listed for
+  `cart-service` (`allowed: []`). The incident handed off with no action.
+- **P1-04.** With both telemetry backends unroutable, the diagnosis recorded investigation as incomplete:
+  `read_metrics` and `read_traces` were unavailable, and a health probe alone is not sufficient evidence for
+  a remediation. It exited `ESCALATED_INCOMPLETE` with no action.
+- **P1-05.** The fault was attributed on the caller's `checkout-service -> payment-service` `Charge` client
+  spans. The action was prepared under `REQUIRE_EXACT_APPROVAL`, the human decision was a rejection, and
+  nothing executed.
+- **P1-06.** One action was dispatched into an unroutable control plane. The ledger records one action and
+  no duplicate, verification failed, and the incident escalated rather than retrying blindly.
+- **P1-07.** The action was acknowledged but the fault was re-armed behind it. Verification on the caller's
+  edge recorded `VERIFICATION_FAILURE`, and the incident was never marked `RESOLVED`.
+
+### Observations, not defects
+
+These did not change any outcome. They are recorded so they are not rediscovered as surprises:
+
+- **The Payment server's own probe differed between runs.** In run 1, the P1-06 and P1-07 diagnoses say
+  `payment`'s own probe "does not confirm it is serving" (`NOT_SERVING`, `error_rate=None`). In run 2 the
+  same paths, and P1-05 in both runs, say it "is serving normally". The attribution was on the caller's
+  edge either way. Why the target's probe read `NOT_SERVING` after a preceding Payment path in run 1 was not
+  diagnosed.
+- **P1-07's traffic wait in run 2 began with `payment-service` unreachable.** It started directly after
+  P1-06 and read `reachable=False, calls_per_second=0.0` for 60 s before traffic arrived. The baseline check
+  had passed and the wait is bounded (300 s), so this is settling time after the previous path, not
+  contamination. It does explain why P1-07 took 60-80 s longer than its fault-visibility work alone.
+- **The P1-02 CPU in the diagnosis text (2.22 / 2.97) is higher than the fault-visibility reading
+  (1.019 / 1.355).** These are different reads at different moments (fault visibility is the first reading
+  over the threshold, and the diagnosis comes later), not a disagreement.
+
+### The one next action: all seven live paths in one invocation (host shell, one block)
+
+Every live path has passed against the same runtime code, but in three separate invocations. This block
+runs `scripts/validate.sh --live` with no selection, which is the runner's full seven: P1-01..P1-07 in
+order, with the same stages and gates as above. It **starts** PostgreSQL and, if the stack is not
+answering, the stack itself, and it **injects a fault per path** and restores it. Expect about 20 minutes
+for the live stage. `PASS` means every condition the plan asserts held. P1-01 and P1-02 pass by resolving,
+and P1-03..P1-07 pass by reaching their designed terminal status, so the expected exit status is **0** with
+**7/7** live scenarios passed. The block records its own exit status into the evidence directory, so the
+next record does not have to infer it.
+
+```bash
+( set -euo pipefail
+  cd /home/brentiburo/projects/OpsAccord
+  deactivate 2>/dev/null || true
+  source .venv/bin/activate
+  export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+  export UV_CACHE_DIR=/tmp/uvcache
+  PYTHON="$PWD/.venv/bin/python"
+  TS="$(date -u +%Y%m%dT%H%M%S)"; LOGDIR=".local/user-live-seven-$TS"; mkdir -p "$LOGDIR"
+  echo "interpreter: $("$PYTHON" -c 'import sys; print(sys.executable)')"
+  echo "tested revision: $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD)" | tee "$LOGDIR/00-revision.log"
+  echo "evidence dir: $LOGDIR"
+  echo "This block runs all seven live paths, P1-01..P1-07, in one runner invocation. P1-01 and P1-02 are expected to resolve; P1-03..P1-07 are designed to end at a human decision or an escalation, and the runner scores reaching that status as the path's PASS."
+
+  echo "--- 0. what this shell already sees, and the stack as it stands ---"
+  git status --porcelain=v1 | tee "$LOGDIR/00-git-status.log"
+  git diff --quiet 335a3af HEAD -- src scripts && echo "src/ and scripts/ byte-identical to 335a3af" | tee "$LOGDIR/00-code-identity.log" || echo "src/ or scripts/ differ from 335a3af - this run measures different runtime code" | tee "$LOGDIR/00-code-identity.log"
+  set +e
+  bash scripts/demo.sh health 2>&1 | tee "$LOGDIR/00-demo-health.log"; health_rc=${PIPESTATUS[0]}
+  set -e
+  echo "demo.sh health exited $health_rc (0 every published port and adapter API answered; 1 at least one did not)"
+  echo "this preflight only reports: the runner has its own stack stage and starts the stack there if it is not answering"
+
+  echo "--- 1. all seven live paths, with progress and the runner's own gates ---"
+  set +e
+  scripts/validate.sh --live 2>&1 | tee "$LOGDIR/10-live-seven.log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  echo "validate exit: $rc" | tee "$LOGDIR/11-validate-exit.log"
+  echo "  0 is the expected result, with 7/7 live scenarios passed"
+  echo "  1 a stage failed - for the live stage that is a path that did not PASS, a run that stopped early, an evidence record that could not be written, or simulator evidence in a live result; 2 usage, or the live driver's own preflight refusing to start because the demo stack did not answer it; 3 a competing live driver; 130 interrupted"
+  echo "runner logs: $(sed -n 's/^logs: //p' "$LOGDIR/10-live-seven.log" | head -1)"
 
   echo "--- 2. cleanup, read back from the flag store (read-only GET) ---"
   set +e
