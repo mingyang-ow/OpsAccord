@@ -9,14 +9,14 @@ superseded by the rows here.
 | Item | Value |
 | --- | --- |
 | Repository | `mingyang-ow/OpsAccord` (private), remote `git@github.com:mingyang-ow/OpsAccord.git`; `origin/main` is still `3168bcf` |
-| Branch | `phase1/baseline`, branched at `3168bcf`; no upstream, not pushed |
+| Branch | `phase1/baseline`, branched at `3168bcf`; pushed to `origin/phase1/baseline` and opened as a draft PR into `main` at the user's instruction (2026-10-17); not merged |
 | Tip | `git log --oneline -1` (this report's record commit). `git diff --shortstat 3168bcf HEAD` before this commit: 111 files changed, 40664 insertions(+), 42 deletions(-) |
 | Runtime code under test | `src/` and `scripts/` are byte-identical from `335a3af` to the tip (`git diff --quiet 335a3af HEAD -- src scripts`); every commit after `335a3af` changes only this report and `tests/unit/test_demo_script.py` |
 | **Phase 1 status** | **READY_FOR_DISCUSSION** - every executable gate in `docs/phase1.md` has passed. The final diff inspection, acceptance and delivery are the user's |
 | Offline and database-backed gates | offline **389 passed, 7 skipped** in both environment variants; lint, format (95 files) and `mypy` (42 source files) clean; integration **85 passed**; pre-fix sensitivity harness as designed; simulated scenarios **9/9 PASS** - identical in the user's runs at `335a3af`, `d75ea8f` and `b9404e8` |
 | Live paths against the pinned `3.1.0` stack | **7/7 PASS** against the same runtime code: P1-01 at `335a3af` (one run), P1-02..P1-07 at `d75ea8f` and again at `b9404e8` (two runs, 6/6 each). 0 forbidden actions, 0 duplicate side effects, 0 simulator evidence, every armed flag read back `off`. All seven have not yet been measured in **one** invocation - that run is handed off at the end of this report |
-| Outstanding | the single seven-path run; the user's review of `git diff 3168bcf HEAD`; push and draft PR; a licence; the open design decisions under "Remaining work and discussion" |
-| Dirty state | the user's uncommitted `AGENTS.md` reviewer-policy section, preserved and never staged by the coding agent; otherwise only gitignored local state (`.local/`, `reports/local/`, `.venv/`) |
+| Outstanding | the single seven-path run; the user's review of `git diff 3168bcf HEAD` and of the draft PR; a licence (noted by the user, not needed while private); the open design decisions under "Remaining work and discussion" |
+| Dirty state | clean: the user's `AGENTS.md` reviewer-policy section is committed at the user's instruction; otherwise only gitignored local state (`.local/`, `reports/local/`, `.venv/`) |
 | Host | WSL 2, kernel `6.18.33.2-microsoft-standard-WSL2`, Ubuntu 26.04 LTS, 16 CPU, 15.5 GB RAM |
 | Toolchain | `uv` 0.12.5, Python 3.12.14 (`.python-version`), project-local PostgreSQL 18.6 on `127.0.0.1:55432`, Docker 29.7.2, Docker Compose v5.4.0 |
 | Coding agents | Codex CLI on the user's DeepSeek provider (`deepseek-flash` / `deepseek-v4-pro`) for implementation through `f1df097`. The records-only pass after it (the six-path section, this table, the seven-path handoff and the README status) was written in the subscription-backed Claude Code harness (`claude-opus-5-5`); it changed no code and is not a review |

@@ -24,3 +24,11 @@ Read README.md, docs/architecture.md, docs/phase1.md, and docs/evaluation.md bef
 - Make validation blocks stop on unexpected failure, using a subshell with `set -euo pipefail` where appropriate so the user's interactive shell is not closed. Respect harnesses whose expected negative tests are represented by an overall successful exit.
 - Keep commands on single lines where practical; avoid fragile backslash continuations. State the expected result and evidence destination briefly, without promising an unverified pass.
 - Do not require manual package installation one dependency at a time; use the project's dependency manifest and lockfile when environment setup is necessary.
+
+## Current reviewer policy (supersedes earlier handoffs)
+
+- Do not prepare, restore, probe, or invoke the retired GPT-6 Luna reviewer or substitute other OpenAI models. This work item is closed unless the user explicitly reopens it.
+- Do not repeat reviewer availability explanations in routine reports. Report only review that actually ran for the current pass; otherwise omit the reviewer section unless it is directly relevant to a user question.
+- Do not retry Claude while the already diagnosed socket restriction remains unchanged. Existing subscription authorization remains valid, but it is not an instruction to probe availability on every pass.
+- Do not launch a substitute reviewer solely to satisfy the retired setup requirement. Focus on the current task and tests; final discussion remains with the user.
+- Historical notes are records, not instructions to repeat retired work. The user's latest task takes precedence over older local handoffs.
