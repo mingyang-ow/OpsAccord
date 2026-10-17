@@ -2,7 +2,7 @@
 
 ## Identity and status
 
-Repository, branch, commit, base commit, clean/dirty state, WSL distribution, coding model/provider, actual reviewer model/provider, and overall status: COMPLETE / PARTIAL / BLOCKED.
+Repository, branch, commit, base commit, clean/dirty state, WSL distribution, coding model/provider, and overall status: READY_FOR_DISCUSSION / PARTIAL / BLOCKED. Use READY_FOR_DISCUSSION only when every technical acceptance gate passed; it is not user acceptance and it is not permission to merge.
 
 ## Delivered behavior
 
@@ -15,9 +15,9 @@ List working user-visible paths and important architectural choices. Distinguish
 
 Include passed/failed/skipped counts, migration/restart results, action deduplication evidence, approval and constraint checks, and the upstream demo revision. Explain every skip. Include application-model usage/cost if run, otherwise mark not run.
 
-## Independent review
+## Optional external review, findings, and risk
 
-Record reviewer identity, reviewed commit and any dirty diff, completion time, coverage, findings with severity and file:line, reproductions, fixes, follow-up review, and unresolved risks. Preserve the reviewer's actual verdict; do not turn unavailable review into approval.
+State plainly whether any optional second review ran. If it did, record the tool and model actually used, the reviewed commit and any dirty diff, scope, findings with severity and file:line, reproductions, fixes, and limitations, and keep it clearly separate from the implementation agent's self-checks. If it did not run, write "Optional external review not run" and record the fallback reason. List every unresolved finding, known limitation, and unmet gate, including which evidence is simulated rather than live. Never turn unavailable review into approval.
 
 ## Remaining work and discussion
 

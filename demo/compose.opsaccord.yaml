@@ -1,0 +1,28 @@
+# Local resource override for the pinned Astronomy Shop revision.
+#
+# This file changes *only* resource limits. It does not touch a service image, a
+# port, an environment address, a feature flag, or anything the Phase 1 fault and
+# remediation model depends on.
+#
+# Why it is needed: on this Docker Desktop / WSL2 host the pinned revision's
+# checkout service never becomes healthy. Upstream caps it at
+# `memory: 20M` with `GOMEMLIMIT=16MiB`; at that ceiling the Go runtime sits in a
+# GC loop, the process spins at ~700% CPU while holding 18.1MiB of its 20MiB, and
+# its gRPC server never accepts a connection on :5050
+# (`grpc_health_probe -addr=:5050` -> "failed to connect service within 1s",
+# 118 consecutive failures). checkout is the service that calls Payment, so the
+# Payment path cannot be demonstrated against the real stack while it is wedged.
+#
+# The host has 15.5 GB of RAM with ~9.5 GB free, so the limit is the binding
+# constraint rather than the machine. Raising the pair to a normal Go ratio
+# (GOMEMLIMIT at ~75% of the cgroup limit) clears the GC loop.
+#
+# The report and docs/astronomy-shop.md record this as an environment deviation.
+services:
+  checkout:
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    environment:
+      GOMEMLIMIT: 192MiB

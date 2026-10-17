@@ -12,6 +12,23 @@ Read README.md, docs/architecture.md, docs/phase1.md, and docs/evaluation.md bef
 - Keep tokens, credentials, raw provider payloads, local notes, and local runtime configuration out of Git. Log concise decision rationales and structured outcomes, not hidden chain-of-thought.
 - Use mocks for fast tests, and real local integration checks for persistence, telemetry adapters, recovery, and action safety. Clearly identify which evidence is simulated.
 - Add tests that exercise behavior and failure modes. Never weaken a test merely to obtain a passing run.
-- Prepare the requested independent reviewer at the start; perform its review after implementation and before the final report. Never claim review occurred unless it actually ran using the requested model/provider.
-- Report exact branch and commit, commands and results, scenarios, review findings and fixes, limitations, and next decisions using docs/report-template.md.
+- Development tooling is authorized explicitly: the DeepSeek-backed Codex agent is primary, and the authenticated subscription-backed Claude Code harness may be used for bounded implementation help or an optional second review. Record which tool and model actually ran; never claim a review that did not happen. If a tool is unavailable, continue with the others and state the fallback.
+- External review is optional and is never a completion gate. Final review and acceptance happen with the user in their planning conversation, so finish with an honest report and stop. Use READY_FOR_DISCUSSION / PARTIAL / BLOCKED in docs/report-template.md rather than declaring completion.
+- Report exact branch and commit, commands and results, scenarios, findings and fixes, limitations, and next decisions using docs/report-template.md.
 - Do not merge implementation work, publish a release, or change repository visibility without explicit instruction.
+
+## Commands for the user
+
+- Give the user one copy-and-paste shell block in execution order, rather than separate lines to assemble. Split blocks only when a result must be inspected before proceeding.
+- Include the project directory and explicit project Python environment selection. Prefer `.venv/bin/python -m ...` or project-scoped `uv run python -m ...` over bare `pytest` or `mypy` that can resolve to another project or system installation.
+- Make validation blocks stop on unexpected failure, using a subshell with `set -euo pipefail` where appropriate so the user's interactive shell is not closed. Respect harnesses whose expected negative tests are represented by an overall successful exit.
+- Keep commands on single lines where practical; avoid fragile backslash continuations. State the expected result and evidence destination briefly, without promising an unverified pass.
+- Do not require manual package installation one dependency at a time; use the project's dependency manifest and lockfile when environment setup is necessary.
+
+## Current reviewer policy (supersedes earlier handoffs)
+
+- Do not prepare, restore, probe, or invoke the retired GPT-6 Luna reviewer or substitute other OpenAI models. This work item is closed unless the user explicitly reopens it.
+- Do not repeat reviewer availability explanations in routine reports. Report only review that actually ran for the current pass; otherwise omit the reviewer section unless it is directly relevant to a user question.
+- Do not retry Claude while the already diagnosed socket restriction remains unchanged. Existing subscription authorization remains valid, but it is not an instruction to probe availability on every pass.
+- Do not launch a substitute reviewer solely to satisfy the retired setup requirement. Focus on the current task and tests; final discussion remains with the user.
+- Historical notes are records, not instructions to repeat retired work. The user's latest task takes precedence over older local handoffs.

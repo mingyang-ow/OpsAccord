@@ -1,0 +1,321 @@
+"""Fakes for the live scenario driver.
+
+The live driver talks to three bounded channels -- a flag document, per-service
+health probes, and the shared controller. These fakes provide the first two
+directly and stand in for the third, so the lifecycle, its cleanup on every exit
+path, and its reporting can be tested without a stack, a socket or a database.
+
+They are shared by ``tests/unit/test_live_lifecycle.py`` and
+``tests/unit/test_live_cli.py`` on purpose: the CLI test drives the real command
+with the same fakes behind it.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from opsaccord.domain.enums import IncidentStatus
+from opsaccord.scenarios import live as live_scenarios
+from opsaccord.scenarios.runner import ScenarioTrace
+from opsaccord.tools.contracts import DispatchRefused, DispatchTimeout
+from opsaccord.tools.live_environment import (
+    FLAG_SAFE_VARIANT,
+    LIVE_TARGETS,
+    LiveEnvironmentUnavailable,
+)
+
+# The controller is stubbed and the fake stack ignores its settings, so this is
+# never dereferenced; it only keeps the call signature honest.
+UNUSED_DB = object()
+#: A flag no live scenario owns, used to prove the flag document is carried
+#: through read-modify-write rather than rebuilt from the verified list.
+UNRELATED_FLAG = "productCatalogFailure"
+
+
+@dataclass
+class Probe:
+    succeeded: bool
+    value: dict[str, Any]
+
+
+class FakeFlagStore:
+    """flagd-ui's read-modify-write document, with every write recorded."""
+
+    def __init__(
+        self,
+        variants: dict[str, str] | None = None,
+        *,
+        refuse: set[str] | None = None,
+        apply_then_fail: set[str] | None = None,
+        ignore_writes: set[str] | None = None,
+    ) -> None:
+        self.variants: dict[str, str] = {flag_id: "off" for flag_id in FLAG_SAFE_VARIANT}
+        self.variants.update(variants or {})
+        self.unrelated: dict[str, dict[str, Any]] = {UNRELATED_FLAG: {"defaultVariant": "off"}}
+        #: Variants refused before anything is sent.
+        self.refuse = refuse or set()
+        #: Variants applied and *then* left unacknowledged: flagd-ui answered
+        #: nothing, so the caller cannot tell whether the change landed.
+        self.apply_then_fail = apply_then_fail or set()
+        #: Flags whose write is acknowledged but has no effect, which is what the
+        #: read-back verification exists to catch.
+        self.ignore_writes = ignore_writes or set()
+        self.writes: list[tuple[str, str]] = []
+
+    def document(self) -> dict[str, Any]:
+        flags = {flag_id: {"defaultVariant": variant} for flag_id, variant in self.variants.items()}
+        flags.update({flag_id: dict(body) for flag_id, body in self.unrelated.items()})
+        return {"flags": flags}
+
+    def write(self, flag_id: str, variant: str) -> dict[str, Any]:
+        if variant in self.refuse:
+            raise LiveEnvironmentUnavailable(f"flagd-ui refused the write {flag_id}={variant}")
+        previous = self.document()["flags"][flag_id].get("defaultVariant")
+        self.writes.append((flag_id, variant))
+        if flag_id not in self.ignore_writes:
+            if flag_id in self.variants:
+                self.variants[flag_id] = variant
+            else:
+                self.unrelated[flag_id]["defaultVariant"] = variant
+        if variant in self.apply_then_fail:
+            raise DispatchTimeout(
+                f"flagd-ui applied {flag_id}={variant!r} but never acknowledged it"
+            )
+        return {"flag_id": flag_id, "previous_variant": previous, "variant": variant}
+
+
+def health(
+    *, calls: float = 0.0, error_rate: float | None = None, cpu: float = 0.01
+) -> dict[str, Any]:
+    """One ``read_service_health`` value. Zero traffic is *not* zero error share."""
+    return {
+        "health": "SERVING" if calls > 0 and (error_rate or 0.0) < 0.05 else "NOT_SERVING",
+        "healthy": bool(calls > 0 and (error_rate or 0.0) < 0.05 and cpu < 0.80),
+        "reachable": calls > 0,
+        "cpu_utilization": cpu,
+        "error_rate": error_rate,
+        "calls_per_second": calls,
+        "window_seconds": 120,
+    }
+
+
+def cleared(value: dict[str, Any]) -> dict[str, Any]:
+    """The same target with its fault absent: what a safe flag position reads.
+
+    A fault only exists while its flag is armed, so the probe table describes the
+    *armed* demo and this is the pre-injection reading a scenario compares against.
+    Traffic is carried through -- a quiet fault (paymentUnreachable stops the
+    Charge arriving) is still quiet, and reading it as error-free would be the
+    absent-series-as-zero mistake in the other direction.
+    """
+    calls = value.get("calls_per_second")
+    observed = (
+        float(calls) if isinstance(calls, (int, float)) and not isinstance(calls, bool) else 0.0
+    )
+    return health(calls=observed, error_rate=None if observed == 0.0 else 0.0, cpu=0.01)
+
+
+def stack_health(**per_target: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Every live target quiet and healthy except the ones named."""
+    base = {
+        target: health()
+        for target in ("payment-service", "checkout-service", "ad-service", "cart-service")
+    }
+    base.update(per_target)
+    return base
+
+
+class FakeStack:
+    """The live surfaces the driver needs, with nothing behind them."""
+
+    is_simulated = False
+    revision = "test-fixture"
+    revision_source = "tests/support/live_fakes.py"
+
+    def __init__(
+        self,
+        store: FakeFlagStore,
+        probes: dict[str, dict[str, Any]] | None = None,
+        *,
+        fault_only_when_armed: bool = True,
+        interrupt_on: str | None = None,
+        interrupt_after: int | None = None,
+        interrupt_on_flag_read: int | None = None,
+        flag_read_error_after: int | None = None,
+        dependency_error_share: float | None = None,
+        dependency_attributable: bool = True,
+    ) -> None:
+        self.store = store
+        self.probes = probes or {}
+        #: What the caller's *own client spans* for the managed edge show, which is
+        #: the observation ``read_dependency`` attributes an incident from.
+        #:
+        #: The default follows the calibrated fault: while a target's flag is armed
+        #: the caller's own call to it fails, because the pinned revision redirects
+        #: the Charge to an unreachable address and the caller sees that failure.
+        #: ``dependency_error_share`` overrides the share to model the measured
+        #: 2026-09-24 state -- a demo degraded on the caller's *parent* spans while
+        #: the caller's own Charge client share stayed at 0.0 -- so a test can prove
+        #: the premise refuses a generic caller-side failure.
+        self.dependency_error_share = dependency_error_share
+        #: When false, the caller's own spans cannot be separated from the
+        #: callee's, which is an instrumentation gap and never a healthy edge.
+        self.dependency_attributable = dependency_attributable
+        self.dependency_reads: list[tuple[str, str]] = []
+        #: The demo shows a fault only while its flag is armed. Turning this off
+        #: models a demo that is already failing with every flag at its safe
+        #: variant, which is the state a scenario must refuse to measure against.
+        self.fault_only_when_armed = fault_only_when_armed
+        self.interrupt_on = interrupt_on
+        self.interrupt_after = interrupt_after
+        self.interrupt_on_flag_read = interrupt_on_flag_read
+        self.flag_read_error_after = flag_read_error_after
+        self.flag_reads = 0
+        self.reads: list[str] = []
+
+    @property
+    def writes(self) -> list[tuple[str, str]]:
+        return self.store.writes
+
+    def read_flag_document(self, *, timeout_seconds: float) -> dict[str, Any]:
+        """The document, or the configured interruption once N reads happened."""
+        self.flag_reads += 1
+        if (
+            self.interrupt_on_flag_read is not None
+            and self.flag_reads > self.interrupt_on_flag_read
+        ):
+            raise KeyboardInterrupt
+        if self.flag_read_error_after is not None and self.flag_reads > self.flag_read_error_after:
+            # The real adapter raises this where it decides locally that no request
+            # left the process. The fake uses it to make one lifecycle stage fail.
+            raise DispatchRefused("the flag document read was refused")
+        return self.store.document()
+
+    def set_flag_variant(
+        self, *, flag_id: str, variant: str, timeout_seconds: float
+    ) -> dict[str, Any]:
+        return self.store.write(flag_id, variant)
+
+    def read_service_health(self, *, target: str, timeout_seconds: float) -> Probe:
+        """A probe, or Ctrl+C once ``interrupt_after`` reads of that target happened."""
+        self.reads.append(target)
+        interrupting = target == self.interrupt_on and self.interrupt_after is not None
+        if interrupting and self.reads.count(target) > int(self.interrupt_after or 0):
+            raise KeyboardInterrupt
+        value = dict(self.probes.get(target, {}))
+        if self.fault_only_when_armed and not self._armed(target):
+            value = cleared(value)
+        return Probe(succeeded=True, value=value)
+
+    def read_dependency(
+        self,
+        *,
+        target: str,
+        dependency: str,
+        window_seconds: int,
+        timeout_seconds: float,
+    ) -> Probe:
+        """The caller's own view of the edge, from its client spans.
+
+        Calls are carried from the caller's health probe so the two readings
+        describe the same demo: one Charge per PlaceOrder is what the pinned
+        revision does, and a quiet caller is a quiet edge.
+        """
+        self.dependency_reads.append((target, dependency))
+        caller = self.probes.get(target, {})
+        calls = float(caller.get("calls_per_second") or 0.0)
+        armed = not self.fault_only_when_armed or self._armed(dependency)
+        if self.dependency_error_share is None:
+            share: float | None = 1.0 if armed else 0.0
+        else:
+            share = self.dependency_error_share
+        return Probe(
+            succeeded=True,
+            value={
+                "caller": target,
+                "destination": dependency,
+                "operation": "Charge",
+                "span_kind": "client",
+                "attributable": self.dependency_attributable,
+                "reason": None
+                if self.dependency_attributable
+                else "the caller's own spans cannot be separated from the callee's",
+                "calls_per_second": calls,
+                "errors_per_second": calls * (share or 0.0),
+                "error_rate": share,
+                "window_seconds": window_seconds,
+            },
+        )
+
+    def _armed(self, target: str) -> bool:
+        """Whether the flag that faults this target is armed right now."""
+        live_target = LIVE_TARGETS.get(target)
+        if live_target is None or live_target.fault_flag is None:
+            return False
+        flag_id = live_target.fault_flag
+        return self.store.variants.get(flag_id) != FLAG_SAFE_VARIANT.get(flag_id)
+
+
+class EnvironmentFactory:
+    """Stands in for ``LiveEnvironment``, ignoring the settings it is handed."""
+
+    revision = "test-fixture"
+    revision_source = "tests/support/live_fakes.py"
+
+    def __init__(self, stack: FakeStack) -> None:
+        self.stack = stack
+
+    def __call__(self, **kwargs: Any) -> FakeStack:
+        return self.stack
+
+
+class StubController:
+    """Stands in for ``run_scenario``: a bare trace, or a failure.
+
+    The trace is deliberately not a complete incident -- it carries no actions or
+    verifications -- so it is never mistaken for realistic scenario evidence. What
+    the lifecycle needs from it is only that a measurement happened.
+    """
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls: list[str] = []
+
+    def __call__(self, spec: Any, **kwargs: Any) -> ScenarioTrace:
+        self.calls.append(spec.id)
+        if self.error is not None:
+            raise self.error
+        return ScenarioTrace(
+            spec=spec,
+            incident=SimpleNamespace(
+                id="inc_lifecycle_test", status=IncidentStatus.ESCALATED_INCOMPLETE
+            ),
+            actions=[],
+            approvals=[],
+            evidence=[],
+            verifications=[],
+            events=[],
+            run_notes=[],
+        )
+
+
+def use_fake_stack(
+    monkeypatch: pytest.MonkeyPatch, stack: FakeStack, controller: Any = None
+) -> FakeStack:
+    """Point the live driver at ``stack`` (and optionally at a stub controller)."""
+    monkeypatch.setattr(live_scenarios, "LiveEnvironment", EnvironmentFactory(stack))
+    monkeypatch.setattr(
+        live_scenarios, "build_live_environment", lambda plan, settings, **kwargs: stack
+    )
+    if controller is not None:
+        monkeypatch.setattr(live_scenarios, "run_scenario", controller)
+    return stack
+
+
+def live_settings() -> Any:
+    """The CLI's calibrated settings, without a demo stack behind them."""
+    return live_scenarios.live_settings("test")
