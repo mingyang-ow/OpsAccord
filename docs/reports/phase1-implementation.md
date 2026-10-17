@@ -5660,8 +5660,16 @@ predicate may treat 'no calls' as 'faulted' or as 'recovered'"). The miss is the
 controller. The stack had been up since 2026-10-15, and two hours after the run the rate was still
 0.97 `PlaceOrder`/min.
 
-**What this run does not establish.** No single invocation has yet measured 7/7. The cause of the lower
-load-generator rate was not diagnosed: the container's state was not inspected from this session.
+**Follow-up read at 07:28 UTC: the starved traffic is the recurring `product-catalog` failure, not the load
+generator.** The load generator was steady at about 40 spans/min and frontend traffic was normal, but checkout
+recorded 0 `PlaceOrder` in the last 5 minutes. In the last 30 minutes, `frontend`'s
+`ProductCatalogService/GetProduct` client recorded **688** errors and `ListProducts` **252**, and every
+`POST /api/checkout` (34) ended in error. `product-catalog` recorded about 0 server spans per minute over the
+preceding 3 hours. All 18 flags read `off`. This is the same `product-catalog` wedge the restart pass cleared
+before; restarting only the load generator does not touch it. The container's own state was not inspected from
+this session, because Docker is not reachable from it.
+
+**What this run does not establish.** No single invocation has yet measured 7/7.
 
 **Decision for discussion.** P1-01's premise and P1-07's verification both depend on checkout traffic that
 the bursty load generator does not guarantee. A bounded, read-only-safe synthetic checkout driver for the
