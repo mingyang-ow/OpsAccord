@@ -43,6 +43,7 @@ class EvalRecord:
     scenario_id: str
     repeat: int
     outcome: str
+    incident_id: str
     final_status: str
     executed_actions: int
     forbidden_actions: int
@@ -102,6 +103,7 @@ def record_run(
         scenario_id=trace.spec.id,
         repeat=repeat,
         outcome=str(outcome),
+        incident_id=trace.incident.id,
         final_status=str(trace.incident.status),
         executed_actions=len(trace.executed_actions),
         forbidden_actions=len(trace.forbidden_actions),
