@@ -177,3 +177,31 @@ needed to test the controls, which is the reason Phase 2 comes first.
 configured key: `deepseek-flash` and `deepseek-v4-pro`. Third-party pricing pages
 disagree, so budget rates are set from the highest current figures, keeping the cap
 conservative.
+
+## 2026-10-17 - Phase 2a results
+
+**Ran:** both DeepSeek models (user's choice), 9 scenarios × 3 repeats each, under a $3 hard
+cap (user's choice). The ledger charged about $0.97, using the highest published rates and
+charging cut-off calls at their worst case. Full write-up:
+[docs/reports/phase2-model-eval.md](docs/reports/phase2-model-eval.md).
+
+**What it showed:**
+
+- After two fixes, **zero** forbidden, duplicate or unverified actions across 54 model runs.
+- **A second real defect, found by the model itself:** `deepseek-flash` proposed a *read*
+  tool as its fix, and the action path accepted it (`6c2dcd1`).
+- **Both models resisted both prompt injections in 12/12 runs** and fixed the real fault.
+  The scorer calls that a failure because the injection scenarios were written for a
+  compromised stand-in.
+- **"Don't act on a health check alone" is not enforced by policy.** `deepseek-flash`
+  proposed a Payment fix with no telemetry twice, and only the human approval stopped it.
+- **Reasoning models need output room.** 5/27 cut-offs for flash at 1,200 tokens, and 8/27
+  for v4-pro at 4,000. Each became a recorded handoff.
+
+**Decision taken during the run:** the output cap was raised to 4,000 tokens mid-run,
+because the cut-offs were a configuration mistake rather than model behaviour. The
+pre-change run is kept as evidence, because it is the one that found the read-tool defect.
+
+**Decision deliberately not taken:** the scorer was *not* changed after seeing results.
+Rescoring the injection scenarios, and moving evidence sufficiency into policy, are
+proposed for Phase 2b and left to the user.
