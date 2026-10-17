@@ -204,6 +204,17 @@ def cmd_run_live_scenarios(args: argparse.Namespace) -> int:
         + ("off (--no-checkout-driver)" if driver_factory is None else "on for the Payment plans")
     )
 
+    provider: Any = None
+    ledger: Any = None
+    if args.model is not None or args.budget_usd is not None:
+        built = _hosted_provider(settings, args)
+        if isinstance(built, str):
+            print(f"live run REFUSED: {built}")
+            return 2
+        provider, ledger = built
+    else:
+        print("# reasoning: deterministic adapter (pass --model and a budget for a hosted model)")
+
     db = _db(settings)
     try:
         run = run_live_suite(
@@ -215,6 +226,7 @@ def cmd_run_live_scenarios(args: argparse.Namespace) -> int:
             progress=LiveProgress(stream=sys.stdout),
             evidence_path=args.json,
             checkout_driver=driver_factory,
+            provider=provider,
         )
     except KeyboardInterrupt:
         print(
@@ -257,6 +269,22 @@ def cmd_run_live_scenarios(args: argparse.Namespace) -> int:
             f"\n{len(simulated)} live result(s) carry simulator evidence: "
             f"{[result.scenario_id for result in simulated]}"
         )
+    for result in run.results:
+        decision = result.model_decision or {}
+        if decision.get("provider") not in (None, "deterministic"):
+            action = decision.get("proposed_action") or {}
+            print(
+                f"model {result.scenario_id}: {decision.get('model_id')} proposed "
+                f"{action.get('tool_name', '-')}->{action.get('target', '-')}"
+                + (f", refused by {decision['refused_by']}" if decision.get("refused_by") else "")
+                + (
+                    f", error {decision['provider_error']}"
+                    if decision.get("provider_error")
+                    else ""
+                )
+            )
+    if ledger is not None:
+        print(f"# ledger: {ledger.snapshot()}")
     passed = len(run.results) - len(run.failures)
     print(f"\n{passed}/{len(run.results)} live scenarios passed")
     if not run.finished:
@@ -308,6 +336,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="rely on the load generator alone instead of placing bounded synthetic orders",
     )
+    _add_model_arguments(p, max_calls=20)
     p.set_defaults(func=cmd_run_live_scenarios)
 
     p = sub.add_parser(
@@ -316,9 +345,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--scenario", action="append", default=None, choices=sorted(SCENARIOS))
     p.add_argument("--repeats", type=int, default=1)
-    p.add_argument("--model", default=None, help="model id; defaults to OPSACCORD_MODEL_ID")
-    p.add_argument("--budget-usd", type=float, default=None)
-    p.add_argument("--max-calls", type=int, default=50)
+    _add_model_arguments(p, max_calls=50)
     p.add_argument("--baseline-only", action="store_true", help="the deterministic adapter only")
     p.add_argument("--out-dir", default="reports/local")
     p.add_argument("--env", default="scenario", choices=["dev", "test", "ci", "scenario"])
@@ -338,65 +365,94 @@ def build_parser() -> argparse.ArgumentParser:
 EVAL_MAX_INPUT_BYTES = 32_000
 
 
+def _hosted_provider(settings: Settings, args: argparse.Namespace) -> tuple[Any, Any] | str:
+    """A budgeted hosted provider from explicit flags, or the reason one cannot be built.
+
+    Paid calls need three explicit things: permission (``--allow-paid-calls``, or
+    ``OPSACCORD_ALLOW_PAID_MODEL_CALLS`` for the evaluation command), a budget
+    (``--budget-usd``), and per-1k-token rates (flags, or the ``OPSACCORD_MODEL_*_COST``
+    settings). The flags exist because ``scripts/validate.sh`` runs the offline and API
+    stages in the same shell as the live stage: provider settings exported to the
+    environment would reach the API's own provider there.
+    """
+    from opsaccord.reasoning.budget import BudgetedProvider, SpendLedger, TokenRates
+    from opsaccord.reasoning.openai_compatible import OpenAICompatibleAdapter
+
+    if not (getattr(args, "allow_paid_calls", False) or settings.allow_paid_model_calls):
+        return "paid model calls are not allowed; pass --allow-paid-calls"
+    if args.budget_usd is None:
+        return "a hosted model run needs an explicit --budget-usd"
+    input_rate = (
+        args.input_cost_per_1k
+        if args.input_cost_per_1k is not None
+        else settings.model_input_cost_per_1k_usd
+    )
+    output_rate = (
+        args.output_cost_per_1k
+        if args.output_cost_per_1k is not None
+        else settings.model_output_cost_per_1k_usd
+    )
+    if input_rate is None or output_rate is None:
+        return (
+            "the budget cannot be enforced without rates; pass --input-cost-per-1k and "
+            "--output-cost-per-1k"
+        )
+    rates = TokenRates(input_rate, output_rate)
+    max_output = args.max_output_tokens or settings.model_max_output_tokens
+    model_id = args.model or settings.model_id
+    adapter = OpenAICompatibleAdapter(
+        base_url=settings.model_base_url,
+        model_id=model_id,
+        api_key_env=settings.model_api_key_env,
+        timeout_seconds=settings.model_timeout_seconds,
+        max_output_tokens=max_output,
+        allow_paid_calls=True,
+        input_cost_per_1k_usd=rates.input_per_1k_usd,
+        output_cost_per_1k_usd=rates.output_per_1k_usd,
+        max_input_bytes=EVAL_MAX_INPUT_BYTES,
+    )
+    ledger = SpendLedger(budget_usd=args.budget_usd, max_calls=args.max_calls)
+    budgeted = BudgetedProvider(
+        adapter,
+        ledger=ledger,
+        rates=rates,
+        max_input_tokens=EVAL_MAX_INPUT_BYTES,
+        max_output_tokens=max_output,
+    )
+    print(
+        f"# model {model_id} at {settings.model_base_url}; budget ${args.budget_usd:.2f}, "
+        f"at most {args.max_calls} calls, {max_output} output tokens, "
+        f"worst case ${budgeted.worst_case_usd:.4f} per call"
+    )
+    return budgeted, ledger
+
+
+def _add_model_arguments(p: argparse.ArgumentParser, *, max_calls: int) -> None:
+    p.add_argument("--model", default=None, help="hosted model id; defaults to OPSACCORD_MODEL_ID")
+    p.add_argument("--budget-usd", type=float, default=None)
+    p.add_argument("--max-calls", type=int, default=max_calls)
+    p.add_argument("--allow-paid-calls", action="store_true")
+    p.add_argument("--input-cost-per-1k", type=float, default=None)
+    p.add_argument("--output-cost-per-1k", type=float, default=None)
+    p.add_argument("--max-output-tokens", type=int, default=None)
+
+
 def cmd_eval_model(args: argparse.Namespace) -> int:
     """Run the simulated scenarios with a hosted model in the loop, under a hard budget."""
     from datetime import UTC, datetime
 
-    from opsaccord.reasoning.budget import BudgetedProvider, SpendLedger, TokenRates
     from opsaccord.reasoning.deterministic import DeterministicAdapter
-    from opsaccord.reasoning.openai_compatible import OpenAICompatibleAdapter
     from opsaccord.scenarios.model_eval import run_eval, write_outputs
 
     settings = Settings(app_env=args.env)
     providers: list[Any] = [DeterministicAdapter()]
-    ledger: SpendLedger | None = None
+    ledger: Any = None
     if not args.baseline_only:
-        if not settings.allow_paid_model_calls:
-            print(
-                "refusing: paid model calls are disabled. Set "
-                "OPSACCORD_ALLOW_PAID_MODEL_CALLS=true and pass --budget-usd to run a hosted "
-                "model; --baseline-only runs without one"
-            )
+        built = _hosted_provider(settings, args)
+        if isinstance(built, str):
+            print(f"refusing: {built}; --baseline-only runs without a hosted model")
             return 2
-        if args.budget_usd is None:
-            print("refusing: a hosted model run needs an explicit --budget-usd")
-            return 2
-        rates = (
-            TokenRates(settings.model_input_cost_per_1k_usd, settings.model_output_cost_per_1k_usd)
-            if settings.model_input_cost_per_1k_usd is not None
-            and settings.model_output_cost_per_1k_usd is not None
-            else None
-        )
-        if rates is None:
-            print(
-                "refusing: set OPSACCORD_MODEL_INPUT_COST_PER_1K_USD and "
-                "OPSACCORD_MODEL_OUTPUT_COST_PER_1K_USD so the budget can be enforced"
-            )
-            return 2
-        model_id = args.model or settings.model_id
-        adapter = OpenAICompatibleAdapter(
-            base_url=settings.model_base_url,
-            model_id=model_id,
-            api_key_env=settings.model_api_key_env,
-            timeout_seconds=settings.model_timeout_seconds,
-            max_output_tokens=settings.model_max_output_tokens,
-            allow_paid_calls=True,
-            input_cost_per_1k_usd=rates.input_per_1k_usd,
-            output_cost_per_1k_usd=rates.output_per_1k_usd,
-            max_input_bytes=EVAL_MAX_INPUT_BYTES,
-        )
-        ledger = SpendLedger(budget_usd=args.budget_usd, max_calls=args.max_calls)
-        budgeted = BudgetedProvider(
-            adapter,
-            ledger=ledger,
-            rates=rates,
-            max_input_tokens=EVAL_MAX_INPUT_BYTES,
-            max_output_tokens=settings.model_max_output_tokens,
-        )
-        print(
-            f"# model {model_id} at {settings.model_base_url}; budget ${args.budget_usd:.2f}, "
-            f"at most {args.max_calls} calls, worst case ${budgeted.worst_case_usd:.4f} per call"
-        )
+        budgeted, ledger = built
         providers.append(budgeted)
     print(f"# scenario state database: {settings.state_database_url}")
     db = _db(settings)

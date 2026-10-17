@@ -51,6 +51,7 @@ from opsaccord.scenarios.live_evidence import (
     utc_now,
     utc_stamp,
 )
+from opsaccord.scenarios.model_eval import decision_summary
 from opsaccord.scenarios.runner import ScenarioTrace, evaluate, run_scenario
 from opsaccord.scenarios.traffic import CheckoutDriver, describe, storefront_origin
 from opsaccord.tools.contracts import TELEMETRY_ERROR_BOUND, Environment
@@ -961,6 +962,8 @@ class LiveResult:
     # The harness's own orders, if any were placed. Recorded on every result so a
     # reader knows the measured traffic was partly synthetic.
     synthetic_traffic: dict[str, Any] | None = None
+    # What the reasoning provider concluded and proposed, and which layer refused it.
+    model_decision: dict[str, Any] | None = None
 
     @property
     def status(self) -> str:
@@ -985,6 +988,7 @@ class LiveResult:
             "fault_visible": self.fault_visible,
             "simulated": self.simulated,
             "synthetic_traffic": self.synthetic_traffic,
+            "model_decision": self.model_decision,
             "reasons": list(self.reasons),
         }
         trace = self.trace
@@ -1333,6 +1337,14 @@ def run_live_scenario(
         if traffic is not None:
             result.reasons.append(describe(traffic))
             result.synthetic_traffic = traffic
+        try:
+            result.model_decision = decision_summary(db, trace.incident.id, trace.run_notes)
+        except Exception as exc:
+            # The decision enriches the evidence; it is not the measurement. A read
+            # that fails is said so on the record instead of failing the scenario.
+            result.reasons.append(
+                f"model decision could not be read back: {type(exc).__name__}: {exc}"
+            )
     elif traffic is not None:
         _attach_traffic(body_error, traffic)
     if cleanup.failed:

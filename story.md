@@ -277,3 +277,25 @@ without blocking any legitimate one. **Merged on success, as the user asked.**
 **Where Phase 2 stands:** a real model has been measured in simulation only. The obvious
 next steps are a hosted model on the live stack, and new scenarios chosen from what the
 models did (approval mismatch, and "the approved action became unnecessary").
+
+## 2026-10-17 - Phase 2c plan, and the live runner gets a model
+
+**Order (user's decision, on the recommendation):**
+
+1. A hosted model on the live stack.
+2. A new scenario where an approved fix is no longer needed by the time it would run.
+3. The product-catalog freeze, only if it gets in the way again.
+
+Approval mismatch was dropped from the list, because Phase 1's adversarial tests already
+cover mismatch, expiry and reuse.
+
+**Decision: hosted-model settings for live runs are command-line flags, never environment
+variables.** `validate.sh` runs the API acceptance stage in the same shell as the live
+stage, and the API builds its provider from `OPSACCORD_MODEL_*` settings. Exporting them
+for a live run would have pointed the API tests at a paid model with no run budget. The
+flags reach the live stage only.
+
+**Open item found along the way:** the API's `build_provider` has no run-level budget. With
+a hosted provider configured through the environment, API-driven incidents would make
+paid calls bounded only by the per-incident step budget. It is not used that way today,
+but it should get the same `BudgetedProvider` wrapper before anyone does.

@@ -6,6 +6,11 @@
 #   scripts/validate.sh --live --scenario P1-01
 #                                       the above, but only the named live path(s); repeatable
 #   scripts/validate.sh --offline-only  offline, lint, types only (no PostgreSQL needed)
+#   scripts/validate.sh --live --model ID --allow-paid-calls --budget-usd N \
+#       --input-cost-per-1k X --output-cost-per-1k Y [--max-calls N] [--max-output-tokens N]
+#                                       the live paths with a hosted model under a hard budget;
+#                                       these flags reach the live stage only, never the
+#                                       offline, integration or API stages
 #
 # Properties this script is responsible for:
 #
@@ -34,7 +39,11 @@ cd "$REPO_ROOT"
 
 MODE="full"
 SCENARIO_IDS=()
-usage() { printf 'usage: scripts/validate.sh [--live|--offline-only] [--scenario ID]...\n' >&2; exit 2; }
+# Hosted-model flags for the live stage. They are passed as arguments, never exported:
+# the API acceptance stage builds its own provider from OPSACCORD_MODEL_* settings, and
+# a provider exported for the live run would reach it there.
+MODEL_ARGS=()
+usage() { printf 'usage: scripts/validate.sh [--live|--offline-only] [--scenario ID]... [model flags with --live]\n' >&2; exit 2; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -45,7 +54,13 @@ while [ $# -gt 0 ]; do
       [ $# -gt 0 ] || usage
       SCENARIO_IDS+=("$1")
       ;;
-    -h | --help ) sed -n '2,22p' "$0"; exit 0 ;;
+    --allow-paid-calls ) MODEL_ARGS+=("$1") ;;
+    --model | --budget-usd | --max-calls | --input-cost-per-1k | --output-cost-per-1k | --max-output-tokens )
+      [ $# -gt 1 ] || usage
+      MODEL_ARGS+=("$1" "$2")
+      shift
+      ;;
+    -h | --help ) sed -n '2,34p' "$0"; exit 0 ;;
     * ) usage ;;
   esac
   shift
@@ -55,6 +70,10 @@ done
 # better than silently running all seven paths.
 if [ "${#SCENARIO_IDS[@]}" -gt 0 ] && [ "$MODE" != "live" ]; then
   printf 'refusing to run: --scenario needs --live\n' >&2
+  usage
+fi
+if [ "${#MODEL_ARGS[@]}" -gt 0 ] && [ "$MODE" != "live" ]; then
+  printf 'refusing to run: hosted-model flags need --live\n' >&2
   usage
 fi
 
@@ -181,7 +200,8 @@ if [ "$MODE" = "live" ]; then
     . .local/demo-endpoints.env
     set +a
     PYTHONUNBUFFERED=1 uv run python -u -m opsaccord.cli run-live-scenarios \
-      ${SCENARIO_ARGS[@]+"${SCENARIO_ARGS[@]}"} --json "reports/local/live-scenarios-$TS.json"
+      ${SCENARIO_ARGS[@]+"${SCENARIO_ARGS[@]}"} ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} \
+      --json "reports/local/live-scenarios-$TS.json"
   ) 2>&1 | tee "$LOGS/13-live-paths.log"
 fi
 
