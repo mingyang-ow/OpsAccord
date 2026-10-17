@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from opsaccord.domain.enums import SideEffect
 from opsaccord.domain.models import ToolSpec
+from opsaccord.reasoning.base import ToolContract
 from opsaccord.tools.contracts import DEPENDENCY_EDGES, dependency_callees
 
 STR = {"type": "string"}
@@ -181,6 +182,20 @@ class ToolRegistry:
         if spec is None:
             raise KeyError(f"unknown tool {name!r}")
         return spec
+
+    def contracts(self) -> tuple[ToolContract, ...]:
+        """Each tool as a model may see it: no per-target policy, only the catalog."""
+        return tuple(
+            ToolContract(
+                name=spec.name,
+                description=spec.description,
+                side_effect=str(spec.side_effect),
+                requires_approval=spec.requires_approval,
+                arguments=tuple(spec.arguments_schema),
+                allowed_values={k: tuple(v) for k, v in spec.fixed_arguments.items()},
+            )
+            for _, spec in sorted(self.tools.items())
+        )
 
     def names(self, side_effect: SideEffect | None = None) -> tuple[str, ...]:
         return tuple(

@@ -141,3 +141,39 @@ scenarios, chosen by what that evaluation reveals.
   behaviour is measured.
 - *Production integrations.* These are out of scope for a portfolio project and would
   weaken the "isolated, safe" framing.
+
+## 2026-10-17 - Phase 2a: preparing for a real model
+
+**Decision:** before spending anything, close the gaps a real model would hit. Each of
+these was invisible with the deterministic adapter:
+
+1. **A provider failure hands off.** Before this, `provider.propose()` was unguarded, so a
+   hosted model's timeout or malformed JSON would have crashed the workflow. It now
+   records a `HANDOFF` decision with unknown cost, and the incident ends
+   `ESCALATED_INCOMPLETE`.
+2. **A real budget.** "Paid calls enabled" was only an on/off flag. A run now has a hard USD
+   and call cap, with each call's worst case reserved before it is made. A run without
+   per-token rates refuses to start, and prompts are capped at 32,000 bytes so the worst
+   case is real.
+3. **The model sees the tool contracts, not the policy.** It is told each tool's
+   arguments, the globally allowed values and the services in scope. *Why not the
+   per-target allow-list:* it is policy, and whether a model proposes things policy must
+   refuse is exactly what this phase measures. Showing it would teach to the test.
+4. **A missing argument target is filled from the proposal.** Typed validation required
+   the target twice, at the top level and inside the arguments. That is an interface trap
+   rather than a safety property, so the gateway now fills it from the proposal, and
+   nothing else is filled.
+
+**A safety defect found along the way (fixed in `8e937f8`).** Policy checked the
+proposal's target but the executor used the target inside the arguments. In the Ad
+incident, a proposal naming ad-service (allow-listed, no approval needed) with
+payment-service in its arguments would have changed Payment's flag with no human
+approval, and the audit trail would have named ad-service. The gateway now refuses a
+proposal whose two targets differ. *Lesson:* the deterministic stand-in agreed with
+itself, so it could never find this. An adversarial proposer was always going to be
+needed to test the controls, which is the reason Phase 2 comes first.
+
+**Next decision for the user:** which models to run and the budget. Available on the
+configured key: `deepseek-flash` and `deepseek-v4-pro`. Third-party pricing pages
+disagree, so budget rates are set from the highest current figures, keeping the cap
+conservative.

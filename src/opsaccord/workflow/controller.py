@@ -487,9 +487,38 @@ class WorkflowController:
                 runbook_texts=runbooks,
                 allowed_tools=self.gateway.registry.names(),
                 steps_remaining=max(workflow.hard_step_cap - workflow.steps_used, 0),
+                allowed_targets=tuple(self.settings.allowed_targets),
+                tool_contracts=self.gateway.registry.contracts(),
             )
+            workflow_id = workflow.id
 
-        proposal = self.provider.propose(request)
+        try:
+            proposal = self.provider.propose(request)
+        except Exception as exc:
+            # A hosted model can time out, refuse, exceed its budget or return
+            # something that is not a proposal. None of that may crash the workflow
+            # or be read as a decision: the failure is recorded as a handoff decision
+            # with unknown usage (unknown is not zero), and a human owns the
+            # incident. The model step was already charged to the budget above.
+            reason = f"model provider failed: {type(exc).__name__}: {str(exc)[:300]}"
+            with self.db.session() as session:
+                repo.add_decision(
+                    session,
+                    incident_id=incident_id,
+                    workflow_id=workflow_id,
+                    decision_type=DecisionType.HANDOFF,
+                    provider=getattr(self.provider, "provider", "unknown"),
+                    model_id=getattr(self.provider, "model_id", "unknown"),
+                    rationale=reason,
+                    payload={"provider_error": type(exc).__name__},
+                    evidence_ids=tuple(state.get("evidence_ids", ())),
+                )
+                repo.set_terminal_reason(session, incident_id=incident_id, reason=reason)
+            return {
+                "escalate": True,
+                "terminal_reason": reason,
+                "notes": [*state.get("notes", []), reason],
+            }
         with self.db.session() as session:
             decision = repo.add_decision(
                 session,

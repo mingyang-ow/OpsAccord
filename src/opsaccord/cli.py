@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from opsaccord.config import REPO_ROOT, Settings, get_settings
 from opsaccord.domain.enums import ScenarioOutcome
@@ -309,12 +310,132 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=cmd_run_live_scenarios)
 
+    p = sub.add_parser(
+        "eval-model",
+        help="run the simulated scenarios with a hosted model in the loop, under a hard budget",
+    )
+    p.add_argument("--scenario", action="append", default=None, choices=sorted(SCENARIOS))
+    p.add_argument("--repeats", type=int, default=1)
+    p.add_argument("--model", default=None, help="model id; defaults to OPSACCORD_MODEL_ID")
+    p.add_argument("--budget-usd", type=float, default=None)
+    p.add_argument("--max-calls", type=int, default=50)
+    p.add_argument("--baseline-only", action="store_true", help="the deterministic adapter only")
+    p.add_argument("--out-dir", default="reports/local")
+    p.add_argument("--env", default="scenario", choices=["dev", "test", "ci", "scenario"])
+    p.set_defaults(func=cmd_eval_model)
+
     p = sub.add_parser("run-scenarios", help="execute the Phase 1 acceptance scenarios")
     p.add_argument("--scenario", default=None, choices=sorted(SCENARIOS))
     p.add_argument("--json", default=None, help="write a JSON evidence record to this path")
     p.add_argument("--env", default="scenario", choices=["dev", "test", "ci", "scenario"])
     p.set_defaults(func=cmd_run_scenarios)
     return parser
+
+
+#: Worst-case prompt size per call. Bytes bound tokens from above (see
+#: OpenAICompatibleAdapter.max_input_bytes), so this is also the input-token ceiling the
+#: run budget reserves against.
+EVAL_MAX_INPUT_BYTES = 32_000
+
+
+def cmd_eval_model(args: argparse.Namespace) -> int:
+    """Run the simulated scenarios with a hosted model in the loop, under a hard budget."""
+    from datetime import UTC, datetime
+
+    from opsaccord.reasoning.budget import BudgetedProvider, SpendLedger, TokenRates
+    from opsaccord.reasoning.deterministic import DeterministicAdapter
+    from opsaccord.reasoning.openai_compatible import OpenAICompatibleAdapter
+    from opsaccord.scenarios.model_eval import run_eval, write_outputs
+
+    settings = Settings(app_env=args.env)
+    providers: list[Any] = [DeterministicAdapter()]
+    ledger: SpendLedger | None = None
+    if not args.baseline_only:
+        if not settings.allow_paid_model_calls:
+            print(
+                "refusing: paid model calls are disabled. Set "
+                "OPSACCORD_ALLOW_PAID_MODEL_CALLS=true and pass --budget-usd to run a hosted "
+                "model; --baseline-only runs without one"
+            )
+            return 2
+        if args.budget_usd is None:
+            print("refusing: a hosted model run needs an explicit --budget-usd")
+            return 2
+        rates = (
+            TokenRates(settings.model_input_cost_per_1k_usd, settings.model_output_cost_per_1k_usd)
+            if settings.model_input_cost_per_1k_usd is not None
+            and settings.model_output_cost_per_1k_usd is not None
+            else None
+        )
+        if rates is None:
+            print(
+                "refusing: set OPSACCORD_MODEL_INPUT_COST_PER_1K_USD and "
+                "OPSACCORD_MODEL_OUTPUT_COST_PER_1K_USD so the budget can be enforced"
+            )
+            return 2
+        model_id = args.model or settings.model_id
+        adapter = OpenAICompatibleAdapter(
+            base_url=settings.model_base_url,
+            model_id=model_id,
+            api_key_env=settings.model_api_key_env,
+            timeout_seconds=settings.model_timeout_seconds,
+            max_output_tokens=settings.model_max_output_tokens,
+            allow_paid_calls=True,
+            input_cost_per_1k_usd=rates.input_per_1k_usd,
+            output_cost_per_1k_usd=rates.output_per_1k_usd,
+            max_input_bytes=EVAL_MAX_INPUT_BYTES,
+        )
+        ledger = SpendLedger(budget_usd=args.budget_usd, max_calls=args.max_calls)
+        budgeted = BudgetedProvider(
+            adapter,
+            ledger=ledger,
+            rates=rates,
+            max_input_tokens=EVAL_MAX_INPUT_BYTES,
+            max_output_tokens=settings.model_max_output_tokens,
+        )
+        print(
+            f"# model {model_id} at {settings.model_base_url}; budget ${args.budget_usd:.2f}, "
+            f"at most {args.max_calls} calls, worst case ${budgeted.worst_case_usd:.4f} per call"
+        )
+        providers.append(budgeted)
+    print(f"# scenario state database: {settings.state_database_url}")
+    db = _db(settings)
+
+    def show(record: Any) -> None:
+        action = record.proposed_action
+        proposed = f"{action['tool_name']}->{action['target']}" if action else "-"
+        print(
+            f"{record.model_id:<22} {record.scenario_id:<6} #{record.repeat} {record.outcome:<20} "
+            f"{record.final_status:<21} {proposed:<36} {record.refused_by or ''}"
+            + (f" error={record.provider_error}" if record.provider_error else "")
+        )
+
+    try:
+        records = run_eval(
+            db=db,
+            settings=settings,
+            providers=providers,
+            scenario_ids=args.scenario,
+            repeats=args.repeats,
+            on_record=show,
+        )
+    finally:
+        db.dispose()
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+    base = Path(args.out_dir) / f"model-eval-{stamp}"
+    snapshot = ledger.snapshot() if ledger else None
+    write_outputs(
+        records,
+        json_path=base.with_suffix(".json"),
+        markdown_path=base.with_suffix(".md"),
+        ledger=snapshot,
+        title=f"Model evaluation {stamp} (simulated demo)",
+    )
+    if snapshot:
+        print(f"# ledger: {snapshot}")
+    print(f"wrote {base.with_suffix('.json')} and {base.with_suffix('.md')}")
+    unsafe = sum(1 for r in records if r.outcome == "UNSAFE_FAILURE")
+    return 1 if unsafe else 0
 
 
 def main(argv: list[str] | None = None) -> int:
