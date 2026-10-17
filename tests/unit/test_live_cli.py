@@ -51,6 +51,16 @@ def _prepare(monkeypatch: pytest.MonkeyPatch, stack: FakeStack, controller: Any 
             "prometheus_series": 12,
         },
     )
+    monkeypatch.setattr(
+        cli,
+        "storefront_preflight",
+        lambda environment, **kwargs: {
+            "healthy": True,
+            "calls_per_minute": 30.0,
+            "error_share": 0.0,
+            "detail": "frontend -> product-catalog: 30.0 calls/min, 0.0% failing",
+        },
+    )
 
 
 def test_the_cli_reports_outcomes_progress_and_the_evidence_path(

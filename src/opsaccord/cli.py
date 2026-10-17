@@ -20,9 +20,11 @@ from opsaccord.scenarios.live import (
     LIVE_SETTLE_SECONDS,
     LIVE_VERIFICATION_WINDOW_SECONDS,
     LiveProgress,
+    checkout_driver_factory,
     live_settings,
     preflight,
     run_live_suite,
+    storefront_preflight,
 )
 from opsaccord.scenarios.runner import evaluate, run_scenario
 from opsaccord.tools.live_environment import LiveEnvironment
@@ -178,6 +180,28 @@ def cmd_run_live_scenarios(args: argparse.Namespace) -> int:
             f"# WARNING: verified flags absent from the live document: "
             f"{probe['missing_verified_flags']}"
         )
+    try:
+        storefront = storefront_preflight(LiveEnvironment(settings=settings))
+    except Exception as exc:
+        print(f"live preflight FAILED reading the storefront's catalog calls: {exc}")
+        return 2
+    print(f"# storefront preflight: {storefront['detail']}")
+    if storefront["healthy"] is False:
+        print(
+            "live preflight REFUSED: the storefront cannot reach product-catalog, so every "
+            "order fails before it reaches payment and the Payment paths would have nothing "
+            "to measure"
+        )
+        print(
+            "recover it with: bash scripts/demo.sh restart product-catalog checkout && "
+            "bash scripts/demo.sh verify-recovery product-catalog checkout"
+        )
+        return 2
+    driver_factory = None if args.no_checkout_driver else checkout_driver_factory(settings)
+    print(
+        "# synthetic checkout traffic: "
+        + ("off (--no-checkout-driver)" if driver_factory is None else "on for the Payment plans")
+    )
 
     db = _db(settings)
     try:
@@ -189,6 +213,7 @@ def cmd_run_live_scenarios(args: argparse.Namespace) -> int:
             # normally piped through `tee`, and a buffered run looks hung.
             progress=LiveProgress(stream=sys.stdout),
             evidence_path=args.json,
+            checkout_driver=driver_factory,
         )
     except KeyboardInterrupt:
         print(
@@ -277,6 +302,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--json", default=None, help="write a JSON evidence record to this path")
     p.add_argument("--env", default="dev", choices=["dev", "test", "ci", "scenario"])
+    p.add_argument(
+        "--no-checkout-driver",
+        action="store_true",
+        help="rely on the load generator alone instead of placing bounded synthetic orders",
+    )
     p.set_defaults(func=cmd_run_live_scenarios)
 
     p = sub.add_parser("run-scenarios", help="execute the Phase 1 acceptance scenarios")
