@@ -161,3 +161,19 @@ policy.
 
 **Trade-off recorded:** a bigger allowance removes cut-offs but lengthens calls past the
 45 s timeout. Neither failure mode can produce an action; both hand off.
+
+## Live confirmation before merge
+
+The user ran `scripts/validate.sh --live` at the branch tip `cc44b49` on 2026-10-17
+(12:16:23-12:34:43 UTC). Evidence: `.local/user-live-phase2-20261017T121508/` and
+`reports/local/live-scenarios-20261017T121508.json`.
+
+- `validate exit: 0`; offline 421, integration 97, sensitivity harness as expected,
+  simulated 9/9.
+- **Live 7/7 PASS**, with the same final statuses as Phase 1, and 0 forbidden actions,
+  0 duplicates, 0 simulator evidence and 0 unverified resolutions.
+- **No `INSUFFICIENT_EVIDENCE` refusal** in any live path. Every legitimate live fix had
+  telemetry about its target, as expected, so the new rule cost nothing on the real
+  stack.
+- The live runs use the deterministic adapter. A hosted model on the live stack is not
+  yet measured.

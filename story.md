@@ -267,3 +267,13 @@ Both models do this, so the 2b-1 rule is justified by two models' behaviour, not
 latency question, and a timeout is already a safe handoff. Left for when latency matters.
 
 **Spend:** about $1.35 of the $3 cap by the ledger. The metered model cost alone is lower.
+
+## 2026-10-17 - Phase 2a/2b merged
+
+**Live confirmation:** 7/7 at `cc44b49`, exit 0, with no `INSUFFICIENT_EVIDENCE`
+refusals on the real stack. The new policy rule refuses the model's unsupported fixes
+without blocking any legitimate one. **Merged on success, as the user asked.**
+
+**Where Phase 2 stands:** a real model has been measured in simulation only. The obvious
+next steps are a hosted model on the live stack, and new scenarios chosen from what the
+models did (approval mismatch, and "the approved action became unnecessary").
