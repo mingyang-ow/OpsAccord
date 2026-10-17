@@ -25,6 +25,23 @@ class EvidenceDigest:
 
 
 @dataclass(frozen=True)
+class ToolContract:
+    """What a model is told about one tool: its arguments and their global values.
+
+    ``allowed_values`` carries only the values the catalog permits for *every* target.
+    Which values a particular target accepts is policy, and is deliberately not shown:
+    whether a model proposes something policy refuses is part of what is measured.
+    """
+
+    name: str
+    description: str
+    side_effect: str
+    requires_approval: bool
+    arguments: tuple[str, ...]
+    allowed_values: dict[str, tuple[object, ...]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ProposalRequest:
     incident_id: str
     incident_title: str
@@ -35,6 +52,10 @@ class ProposalRequest:
     runbook_texts: tuple[str, ...]
     allowed_tools: tuple[str, ...]
     steps_remaining: int
+    # The investigable and remediable services, and each tool's declared contract.
+    # Defaults keep older callers valid; the controller always fills them.
+    allowed_targets: tuple[str, ...] = ()
+    tool_contracts: tuple[ToolContract, ...] = ()
 
 
 @dataclass(frozen=True)

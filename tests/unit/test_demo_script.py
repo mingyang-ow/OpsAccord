@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 from opsaccord.config import REPO_ROOT
@@ -945,7 +946,15 @@ def test_both_services_passing_is_what_allows_the_run_to_continue(tmp_path: Path
 
 
 def test_one_deadline_covers_every_named_service(tmp_path: Path) -> None:
-    """One overall wait, not a long wait per probe: the window is the caller's, once."""
+    """One overall wait, not a long wait per probe: the window is the caller's, once.
+
+    The script measures its window with bash's whole-second ``$SECONDS``, so a 1 s window
+    with a 1 s pace yields one reading or two, depending on whether the first reading
+    happens to cross a second boundary (common under load). Asserting exactly two made
+    this test fail intermittently. What it pins is the bound: at most two readings, and
+    an elapsed time nowhere near a per-probe wait.
+    """
+    started = time.monotonic()
     result = _run(
         tmp_path,
         "verify-recovery",
@@ -959,8 +968,10 @@ def test_one_deadline_covers_every_named_service(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 1
+    elapsed = time.monotonic() - started
     attempts = re.findall(r"demo: attempt (\d+):", result.stdout)
-    assert attempts == ["1", "2"], attempts
+    assert attempts in (["1"], ["1", "2"]), attempts
+    assert elapsed < 10, elapsed
     assert "state=running health=starting" in result.stdout
     assert "did not come ready inside the one 1 s window" in result.stderr
     assert "READY" not in result.stdout

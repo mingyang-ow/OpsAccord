@@ -48,6 +48,7 @@ from opsaccord.domain.models import (
     ActionProposal,
     Constraint,
     ToolResult,
+    ToolSpec,
     VerificationResult,
 )
 from opsaccord.domain.models import (
@@ -87,6 +88,43 @@ ALLOW_LISTED_AUTONOMOUS_RULE = "ALLOW_LISTED_REMEDIATION"
 
 class UnknownTool(RuntimeError):
     pass
+
+
+class TargetMismatch(ValueError):
+    """A write proposal named one target and carried another in its arguments."""
+
+
+class NotAnActionTool(UnknownTool):
+    """A registered tool that is not a write tool was proposed as an action."""
+
+
+def _require_write_tool(spec: ToolSpec) -> None:
+    """Only write tools may travel the action path.
+
+    Investigation reads belong to the controller's own read path. A read proposed as an
+    action used to be claimed and handed to the write dispatcher (deepseek-flash, P1-02,
+    2026-10-17), which called ``apply_remediation`` with a read's arguments.
+    """
+    if spec.side_effect is not SideEffect.WRITE:
+        raise NotAnActionTool(
+            f"{spec.name!r} is not a write tool, so it cannot be proposed as an action"
+        )
+
+
+def _bind_target(proposal: ActionProposal, arguments: dict[str, Any]) -> None:
+    """The target policy evaluates must be the target the executor acts on.
+
+    Policy, approval binding and the audit trail all use ``proposal.target``, while the
+    adapter is called with the validated arguments. A proposal whose arguments name a
+    different target would be authorised for one service and executed against another;
+    in the Ad incident that was an unapproved change to Payment.
+    """
+    bound = arguments.get("target")
+    if bound is not None and bound != proposal.target:
+        raise TargetMismatch(
+            f"{proposal.tool_name} target {proposal.target!r} does not match the "
+            f"argument target {bound!r}"
+        )
 
 
 class PolicyBlocked(RuntimeError):
@@ -344,7 +382,14 @@ class ToolGateway:
         spec = self.registry.get(proposal.tool_name)
         if spec is None:
             raise UnknownTool(f"{proposal.tool_name!r} is not a registered typed tool")
-        arguments = spec.validate_arguments(proposal.arguments)
+        _require_write_tool(spec)
+        raw = dict(proposal.arguments)
+        if "target" in spec.arguments_schema:
+            # The proposal already names its target; a model that does not repeat it
+            # inside the arguments is not refused for that. A *different* value is.
+            raw.setdefault("target", proposal.target)
+        arguments = spec.validate_arguments(raw)
+        _bind_target(proposal, arguments)
         with self.db.session() as session:
             workflow = repo.get_workflow(session, incident_id)
             incident = repo.get_incident(session, incident_id)
@@ -363,6 +408,9 @@ class ToolGateway:
                     ),
                     budget=policy_engine.budget_state(workflow),
                     settings=self.settings,
+                    target_telemetry=repo.count_target_telemetry(
+                        session, incident_id=incident_id, target=proposal.target
+                    ),
                 )
             )
         return decision, arguments
@@ -380,7 +428,11 @@ class ToolGateway:
         """Persist an approved-or-awaiting-approval action. Never dispatches."""
         if not decision.allowed:
             raise PolicyBlocked(decision)
+        # Checked again where the action is written, so no caller can persist an action
+        # whose recorded target differs from the one it would dispatch to.
+        _bind_target(proposal, arguments)
         spec = self.registry.require(proposal.tool_name)
+        _require_write_tool(spec)
         # The policy engine is the authority on whether a human must approve this
         # exact action. The catalog attribute is a static floor for tools that
         # always need a human, and it is deliberately narrowed for the one
@@ -435,6 +487,14 @@ class ToolGateway:
             action = repo.get_action(session, action_id)
             if action is None:
                 raise repo.RepositoryError(f"unknown action {action_id}")
+            action_spec = self.registry.get(action.tool_name)
+            if action_spec is None or action_spec.side_effect is not SideEffect.WRITE:
+                # Defence in depth, before anything is claimed: an action row written
+                # by any path other than prepare_action still cannot reach the write
+                # dispatcher unless its tool is a registered write tool.
+                return ActionExecution(
+                    action, False, f"{action.tool_name!r} is not a registered write tool"
+                )
             # Serialise against human controls: from here until the claim commits,
             # a concurrent takeover or constraint either lands before this
             # revalidation (and blocks the dispatch) or waits for it. There is no
@@ -617,6 +677,9 @@ class ToolGateway:
                 rejected_intents=frozenset(repo.rejected_intents(session, workflow_id=workflow.id)),
                 budget=policy_engine.budget_state(workflow),
                 settings=self.settings,
+                target_telemetry=repo.count_target_telemetry(
+                    session, incident_id=action.incident_id, target=action.target
+                ),
             )
         )
         if not decision.allowed:

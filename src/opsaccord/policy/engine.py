@@ -76,6 +76,7 @@ POLICY_RULES = frozenset(
         "TARGET_NOT_REGISTERED",
         "REMEDIATION_NOT_PERMITTED",
         "AUTONOMOUS_REMEDIATION_NOT_ALLOW_LISTED",
+        "INSUFFICIENT_EVIDENCE",
     }
 )
 
@@ -107,6 +108,10 @@ class PolicyRequest:
     rejected_intents: frozenset[str]
     budget: BudgetState
     settings: Settings
+    # Successful metric, trace or caller-side dependency reads this incident collected
+    # about the proposal's target (repositories.count_target_telemetry). Only a side
+    # effect reads it; the default means "none was supplied", which refuses a write.
+    target_telemetry: int = 0
 
 
 def _matching(constraints: tuple[Constraint, ...], kind: ConstraintKind) -> list[Constraint]:
@@ -250,7 +255,24 @@ def evaluate(request: PolicyRequest) -> PolicyDecision:
             matched_rule="REJECTED_INTENT",
         )
 
-    # 7. Service-level remediation posture.
+    # 7. No side effect without telemetry about its target. A health probe alone, a
+    #    runbook, or a model's confidence is not evidence that a fix is warranted.
+    #    Phase 1 left this to the deterministic adapter's own judgment; in Phase 2a a
+    #    hosted model proposed the Payment fix with every metric and trace read timed
+    #    out (P1-04), and only the human approval stood in the way.
+    if request.target_telemetry < 1:
+        return PolicyDecision(
+            allowed=False,
+            requires_approval=False,
+            reasons=(
+                f"no successful metric, trace or dependency read of {proposal.target} was "
+                "collected for this incident; a remediation needs telemetry, not a health "
+                "probe alone",
+            ),
+            matched_rule="INSUFFICIENT_EVIDENCE",
+        )
+
+    # 8. Service-level remediation posture.
     posture = request.service.auto_remediation
     if posture == "none":
         return PolicyDecision(
