@@ -52,6 +52,8 @@ jobs:
     env:
       # The suite only resets a database whose name ends in _test.
       OPSACCORD_TEST_DATABASE_URL: postgresql+psycopg://opsaccord:opsaccord@127.0.0.1:5432/opsaccord_test
+      # The isolation tests need a separate demo database to prove a test reset leaves it intact.
+      OPSACCORD_DATABASE_URL: postgresql+psycopg://opsaccord:opsaccord@127.0.0.1:5432/opsaccord
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -59,6 +61,8 @@ jobs:
           enable-cache: true
       - name: Install dependencies from the lockfile
         run: uv sync --all-groups --frozen
+      - name: Create the demo database
+        run: uv run python -c "import psycopg; psycopg.connect('postgresql://opsaccord:opsaccord@127.0.0.1:5432/opsaccord_test', autocommit=True).execute('CREATE DATABASE opsaccord')"
       - name: Migrations and recovery tests against real PostgreSQL
         run: uv run pytest -m integration -q
       - name: Phase 1 acceptance scenarios
