@@ -89,6 +89,26 @@ class UnknownTool(RuntimeError):
     pass
 
 
+class TargetMismatch(ValueError):
+    """A write proposal named one target and carried another in its arguments."""
+
+
+def _bind_target(proposal: ActionProposal, arguments: dict[str, Any]) -> None:
+    """The target policy evaluates must be the target the executor acts on.
+
+    Policy, approval binding and the audit trail all use ``proposal.target``, while the
+    adapter is called with the validated arguments. A proposal whose arguments name a
+    different target would be authorised for one service and executed against another;
+    in the Ad incident that was an unapproved change to Payment.
+    """
+    bound = arguments.get("target")
+    if bound is not None and bound != proposal.target:
+        raise TargetMismatch(
+            f"{proposal.tool_name} target {proposal.target!r} does not match the "
+            f"argument target {bound!r}"
+        )
+
+
 class PolicyBlocked(RuntimeError):
     def __init__(self, decision: PolicyDecisionModel) -> None:
         super().__init__("; ".join(decision.reasons) or decision.matched_rule)
@@ -344,7 +364,13 @@ class ToolGateway:
         spec = self.registry.get(proposal.tool_name)
         if spec is None:
             raise UnknownTool(f"{proposal.tool_name!r} is not a registered typed tool")
-        arguments = spec.validate_arguments(proposal.arguments)
+        raw = dict(proposal.arguments)
+        if "target" in spec.arguments_schema:
+            # The proposal already names its target; a model that does not repeat it
+            # inside the arguments is not refused for that. A *different* value is.
+            raw.setdefault("target", proposal.target)
+        arguments = spec.validate_arguments(raw)
+        _bind_target(proposal, arguments)
         with self.db.session() as session:
             workflow = repo.get_workflow(session, incident_id)
             incident = repo.get_incident(session, incident_id)
@@ -380,6 +406,9 @@ class ToolGateway:
         """Persist an approved-or-awaiting-approval action. Never dispatches."""
         if not decision.allowed:
             raise PolicyBlocked(decision)
+        # Checked again where the action is written, so no caller can persist an action
+        # whose recorded target differs from the one it would dispatch to.
+        _bind_target(proposal, arguments)
         spec = self.registry.require(proposal.tool_name)
         # The policy engine is the authority on whether a human must approve this
         # exact action. The catalog attribute is a static floor for tools that
