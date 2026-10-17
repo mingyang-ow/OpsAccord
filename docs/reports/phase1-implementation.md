@@ -14,7 +14,7 @@ superseded by the rows here.
 | Runtime code under test | `src/` and `scripts/` are byte-identical from `335a3af` to the tip (`git diff --quiet 335a3af HEAD -- src scripts`); every commit after `335a3af` changes only this report and `tests/unit/test_demo_script.py` |
 | **Phase 1 status** | **READY_FOR_DISCUSSION** - every executable gate in `docs/phase1.md` has passed. The final diff inspection, acceptance and delivery are the user's |
 | Offline and database-backed gates | offline **389 passed, 7 skipped** in both environment variants; lint, format (95 files) and `mypy` (42 source files) clean; integration **85 passed**; pre-fix sensitivity harness as designed; simulated scenarios **9/9 PASS** - identical in the user's runs at `335a3af`, `d75ea8f` and `b9404e8` |
-| Live paths against the pinned `3.1.0` stack | **7/7 PASS** against the same runtime code: P1-01 at `335a3af` (one run), P1-02..P1-07 at `d75ea8f` and again at `b9404e8` (two runs, 6/6 each). 0 forbidden actions, 0 duplicate side effects, 0 simulator evidence, every armed flag read back `off`. All seven have not yet been measured in **one** invocation - that run is handed off at the end of this report |
+| Live paths against the pinned `3.1.0` stack | **7/7 PASS** against the same runtime code: P1-01 at `335a3af` (one run), P1-02..P1-07 at `d75ea8f` and again at `b9404e8` (two runs, 6/6 each). 0 forbidden actions, 0 duplicate side effects, 0 simulator evidence, every armed flag read back `off`. The first single-invocation attempt (2026-10-17, `4962803`) measured **5/7**: P1-01 `NOT_MEASURED` and P1-07 `SAFE_ESCALATION`, both from checkout traffic at about a third of the passing runs' rate, with no unsafe outcome - see "The first seven-path run" |
 | Outstanding | the single seven-path run; the user's review of `git diff 3168bcf HEAD` and of the draft PR; a licence (noted by the user, not needed while private); the open design decisions under "Remaining work and discussion" |
 | Dirty state | clean: the user's `AGENTS.md` reviewer-policy section is committed at the user's instruction; otherwise only gitignored local state (`.local/`, `reports/local/`, `.venv/`) |
 | Host | WSL 2, kernel `6.18.33.2-microsoft-standard-WSL2`, Ubuntu 26.04 LTS, 16 CPU, 15.5 GB RAM |
@@ -5623,3 +5623,47 @@ print("\n".join("%s=%s" % (name, (spec or {}).get("defaultVariant")) for name, s
   exit "$rc"
 )
 ```
+
+## The first seven-path run (`4962803` measured, 2026-10-17) - 5/7, starved of checkout traffic
+
+The user ran the seven-path block once at `4962803`. `src/` and `scripts/` are byte-identical to `335a3af`.
+The runner wrote its evidence to `.local/user-live-seven-20261017T054403/`,
+`reports/local/validation-20261017T054411/` and `reports/local/live-scenarios-20261017T054411.json`. Every
+stage before the live paths passed: offline 389/7 in both variants, lint, format and types clean, integration
+85, the sensitivity harness as designed, and 9/9 simulated. The live stage measured **5/7** and
+`validate exit: 1`.
+
+| Path | Outcome | Final status | Why |
+| --- | --- | --- | --- |
+| P1-01 | `NOT_MEASURED` (fault-visibility stage) | - | The `checkout -> payment` `Charge` edge went from 0.022 calls/s before arming to **0 calls** for the whole 420 s visibility budget (05:48:17-05:55:19 UTC). No incident was opened and nothing was dispatched. Cleanup read back `paymentUnreachable=off` |
+| P1-02..P1-06 | `PASS` | as designed (`RESOLVED`, `READY_FOR_HUMAN`, `ESCALATED_INCOMPLETE`, `READY_FOR_HUMAN`, `ESCALATED_INCOMPLETE`) | as in the two six-path runs |
+| P1-07 | `SAFE_ESCALATION` (the plan expects `PASS`) | `ESCALATED_INCOMPLETE`, 1 approval, 1 action | The fault was attributed on the edge (error_rate 1.0), but verification recorded `VERIFICATION_INCONCLUSIVE` instead of the planned `VERIFICATION_FAILURE`: "the caller made no calls to this dependency inside the window" |
+
+Across the run there were 0 forbidden actions, 0 duplicate side effects, 0 simulator evidence and no
+resolution without verification, and the post-run read shows all 18 flags `off`.
+
+**The cause is measured, read-only from Prometheus after the run.** Checkout's own span metrics give the
+rate of orders that reached each step during each live stage:
+
+| Live stage | `PlaceOrder`/min | `Charge`/min |
+| --- | --- | --- |
+| P1-01 pass, 2026-10-15 12:03-12:20 | 1.56 | 1.56 |
+| six-path run 1, 2026-10-15 13:14-13:31 | 2.00 | 2.00 |
+| six-path run 2, 2026-10-15 14:21-14:36 | 2.43 | 2.43 |
+| **this run, 2026-10-17 05:45-06:19** | **0.82** | **0.74** |
+
+Inside P1-01's armed window, checkout recorded **no** `Charge` client span. The only `PlaceOrder` error, at
+05:52, coincides with a `GetProduct` client error: that order failed at product-catalog before it reached
+payment. P1-07's verification window (about 06:17-06:18) likewise held no `Charge` calls. Both paths
+therefore refused to conclude without evidence, which is the behaviour "Calibration" requires ("no live
+predicate may treat 'no calls' as 'faulted' or as 'recovered'"). The miss is the stack's traffic, not the
+controller. The stack had been up since 2026-10-15, and two hours after the run the rate was still
+0.97 `PlaceOrder`/min.
+
+**What this run does not establish.** No single invocation has yet measured 7/7. The cause of the lower
+load-generator rate was not diagnosed: the container's state was not inspected from this session.
+
+**Decision for discussion.** P1-01's premise and P1-07's verification both depend on checkout traffic that
+the bursty load generator does not guarantee. A bounded, read-only-safe synthetic checkout driver for the
+fault and verification windows, in the spirit of `scripts/capture-baseline-checkout.py`, would make the live
+gate independent of it. That is a code change and has not been made.
