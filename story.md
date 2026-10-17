@@ -85,8 +85,11 @@ the demo's luck.
 `oom_killed=false`, a 20 MB memory limit). The earlier measurement argued against a
 memory-limit fix, so this needs new numbers before anything changes.
 
-**Validated:** offline, integration and simulated checks all pass. The change has not
-yet been run live; a seven-path run with the driver on is the evidence still needed.
+**Validated:** offline, integration and simulated checks all pass, and the first live run
+with the driver on passed **7/7** (exit 0, 2026-10-17, `6cea3c0`). The order outcomes
+matched each path's design: P1-01's failed under the fault and succeeded after the fix,
+P1-06's all failed, and P1-07's flipped to failing when the fault was re-armed. The
+preflight's refusal path is tested offline but has not yet been triggered live.
 
 ## 2026-10-17 - going public
 

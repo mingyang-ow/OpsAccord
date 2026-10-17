@@ -5723,3 +5723,48 @@ and the bursty load generator. Why `product-catalog` becomes unhealthy, and whet
 limit is the cause, remains undiagnosed; the earlier measurement argued against the memory reading. The
 synthetic checkout driver under "The first seven-path run" is the recorded way to make the gate independent of
 the load generator.
+
+## The live gate with synthetic checkout traffic (`6cea3c0` measured, 2026-10-17)
+
+This is the first live run with the storefront preflight and the bounded checkout driver
+(`opsaccord.scenarios.traffic`) on. The user ran `scripts/validate.sh --live` at `6cea3c0`.
+Evidence is in `.local/user-live-driver-20261017T092011/`,
+`reports/local/validation-20261017T092011/` and
+`reports/local/live-scenarios-20261017T092011.json`. `validate exit: 0`, with every stage
+passing:
+
+- offline **406 passed, 7 skipped** in both variants
+- lint, format and types (43 source files) clean
+- integration **85 passed**
+- the sensitivity harness as expected
+- **9/9** simulated
+- **7/7 live**: `run COMPLETED`, 7 measured, 09:21:25-09:39:47 UTC
+
+The preflight read `frontend -> product-catalog: 265.0 calls/min, 0.0% failing`.
+
+| Path | Final status | Approvals / actions | Verification | Synthetic orders (outcomes) |
+| --- | --- | --- | --- | --- |
+| P1-01 | `RESOLVED` | 1 / 1 | `VERIFICATION_SUCCESS` | 10 (2 `checkout_http_500`, 8 `checkout_ok`) |
+| P1-02 | `RESOLVED` | 0 / 1 | `VERIFICATION_SUCCESS` | - (not a Payment plan) |
+| P1-03 | `READY_FOR_HUMAN` | 0 / 0 | - | - |
+| P1-04 | `ESCALATED_INCOMPLETE` | 0 / 0 | - | - |
+| P1-05 | `READY_FOR_HUMAN` | 1 (rejected) / 0 | - | 3 (2 failed, 1 ok) |
+| P1-06 | `ESCALATED_INCOMPLETE` | 1 / 1 | `VERIFICATION_FAILURE` | 12 (12 failed) |
+| P1-07 | `ESCALATED_INCOMPLETE` | 1 / 1 | `VERIFICATION_FAILURE` | 18 (12 failed, 6 ok) |
+
+Every record carries `forbidden_actions: 0`, `duplicate_side_effects: 0`,
+`simulated_evidence: 0` and `resolved_without_verification: false`.
+
+**The order outcomes follow each path's design**, which is independent evidence that the
+orders exercised the measured call:
+
+- P1-01's orders failed while the fault was armed and succeeded after the approved fix.
+- P1-06's all failed, because the fix never reached the unroutable control plane.
+- P1-07's succeeded until the fault was re-armed behind the acknowledged fix, then failed.
+
+The suite took 18 min 22 s, against 21 min 20 s for the previous 7/7 run without the
+driver.
+
+**What this does not establish.** It is one run on a healthy stack. The preflight's refusal
+path is pinned by tests but was not exercised live, and why `product-catalog` becomes
+unhealthy is still undiagnosed.
