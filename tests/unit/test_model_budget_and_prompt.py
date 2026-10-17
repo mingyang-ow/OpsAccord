@@ -17,7 +17,11 @@ from opsaccord.reasoning.budget import (
     SpendLedger,
     TokenRates,
 )
-from opsaccord.reasoning.openai_compatible import OpenAICompatibleAdapter, PromptTooLarge
+from opsaccord.reasoning.openai_compatible import (
+    MalformedModelOutput,
+    OpenAICompatibleAdapter,
+    PromptTooLarge,
+)
 from opsaccord.scenarios.model_eval import _refusal
 from opsaccord.tools.registry import ToolRegistry
 
@@ -211,3 +215,21 @@ def test_refusals_are_attributed_to_the_layer_that_wrote_them() -> None:
     )
     assert _refusal(["policy blocked read: budget"]) == (None, None)
     assert _refusal(["execute: ok"]) == (None, None)
+
+
+def test_an_answer_cut_off_by_the_token_cap_is_reported_with_its_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """deepseek-flash, 2026-10-17: a reasoning model spent a 1,200-token cap on reasoning
+    and returned an empty answer with finish_reason='length'. The error must say so."""
+    monkeypatch.setenv("OPSACCORD_TEST_MODEL_KEY", "test-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": ""}, "finish_reason": "length"}]},
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(MalformedModelOutput, match="finish_reason='length'; 0 chars"):
+        _adapter(client).propose(_request())

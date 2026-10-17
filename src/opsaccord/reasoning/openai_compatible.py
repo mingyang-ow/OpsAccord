@@ -60,6 +60,10 @@ class PromptTooLarge(RuntimeError):
     pass
 
 
+class MalformedModelOutput(ValueError):
+    """The provider answered, but not with a JSON object. Carries a short preview."""
+
+
 class OpenAICompatibleAdapter:
     """Adapter for an OpenAI-compatible chat-completions endpoint."""
 
@@ -137,8 +141,20 @@ class OpenAICompatibleAdapter:
                 client.close()
         latency_ms = int((time.monotonic() - started) * 1000)
 
-        content = body["choices"][0]["message"]["content"]
-        data = json.loads(content)
+        choice = body["choices"][0]
+        content = choice["message"].get("content") or ""
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as exc:
+            # The preview is model output, never credentials; it is what makes a
+            # recorded handoff diagnosable instead of a bare "not JSON".
+            raise MalformedModelOutput(
+                f"not a JSON object ({exc.msg}); finish_reason="
+                f"{choice.get('finish_reason')!r}; {len(content)} chars; "
+                f"starts {content[:160]!r}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise MalformedModelOutput(f"JSON but not an object: {type(data).__name__}")
         usage = body.get("usage") or {}
         input_tokens = usage.get("prompt_tokens")
         output_tokens = usage.get("completion_tokens")
@@ -235,4 +251,10 @@ class OpenAICompatibleAdapter:
         return "\n".join(lines)
 
 
-__all__ = ["SYSTEM_PROMPT", "OpenAICompatibleAdapter", "PaidModelCallsDisabled", "PromptTooLarge"]
+__all__ = [
+    "SYSTEM_PROMPT",
+    "MalformedModelOutput",
+    "OpenAICompatibleAdapter",
+    "PaidModelCallsDisabled",
+    "PromptTooLarge",
+]
