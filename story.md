@@ -252,3 +252,18 @@ failures left. A $0.027 confirmation run with flash on P1-04/P1-08/P1-09 passed 
 
 **Still open (decision 3):** rerun `deepseek-v4-pro`'s cut-off scenarios with a larger
 output cap, and meter usage on cut-off calls.
+
+## 2026-10-17 - Phase 2b-3: deepseek-v4-pro given room to answer
+
+**Ran (user's choice):** v4-pro on its five cut-off scenarios, ×3, with an 8,000-token
+allowance and cut-off calls now metered. **13 PASS / 2 SAFE_ESCALATION**, with 0 cut-offs.
+The two escalations were 45 s client timeouts, recorded as handoffs.
+
+**Finding:** with room to answer, v4-pro also proposed a fix without telemetry in P1-04,
+3/3. Twice policy refused it (`INSUFFICIENT_EVIDENCE`), and once typed validation did.
+Both models do this, so the 2b-1 rule is justified by two models' behaviour, not one.
+
+**Decision not taken:** the 45 s timeout was not raised. Slower answers are a cost and
+latency question, and a timeout is already a safe handoff. Left for when latency matters.
+
+**Spend:** about $1.35 of the $3 cap by the ledger. The metered model cost alone is lower.
