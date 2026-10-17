@@ -35,6 +35,7 @@ Two reasoning adapters ship: a deterministic offline adapter (the default, no cr
 
 ## Read next
 
+- [The story so far: decisions and why](story.md)
 - [Architecture and safety contract](docs/architecture.md)
 - [Phase 1 acceptance criteria](docs/phase1.md)
 - [Evaluation roadmap](docs/evaluation.md)

@@ -421,6 +421,35 @@ settle round is the caller-side dependency read; without it a recovery verdict
 would rest on the callee's probe alone, which is the blind spot described under
 "Dependency attribution".
 
+### Synthetic checkout traffic and the storefront preflight
+
+The Payment plans (P1-01, P1-05, P1-06, P1-07) are measured on checkout's own `Charge`
+client spans, which exist only when an order reaches payment. The load generator does
+not guarantee that. It averaged 1.56-2.43 orders/min in the passing runs and 0.82/min in
+the 2026-10-17 5/7 run, when an unhealthy `product-catalog` failed every order before it
+reached payment.
+
+Two changes remove that dependence:
+
+- **The storefront preflight** (`storefront_preflight`). Before any scenario starts,
+  `run-live-scenarios` reads the share of `frontend -> ProductCatalogService/*` client
+  spans that failed over the last 5 minutes. At 50% or more it refuses with exit 2 and
+  prints the recovery command
+  (`scripts/demo.sh restart product-catalog checkout && scripts/demo.sh verify-recovery
+  product-catalog checkout`). It only reads; it never restarts anything itself.
+- **Bounded synthetic orders** (`opsaccord.scenarios.traffic.CheckoutDriver`). While a
+  Payment plan runs, from traffic-wait until the scenario body ends, the harness places
+  one order every 15 s, at most 60, through the shop's public API. Each order is a
+  `POST /api/cart` followed by `POST /api/checkout`, the same pair the load generator
+  sends, on the origin of `OPSACCORD_FLAG_CONTROL_BASE_URL` or
+  `OPSACCORD_STOREFRONT_BASE_URL`. The orders follow the real request path, so the spans
+  they produce are ordinary live telemetry. Each result records `synthetic_traffic` (the
+  order count and the HTTP outcome per order), and its reasons say the measured
+  telemetry includes those orders. `--no-checkout-driver` turns it off.
+
+The driver is harness code. No model, policy decision or gateway call can reach it, and
+its paths and origin are fixed by configuration, never taken from an incident.
+
 ### Local override for the checkout container
 
 `compose.yaml` pins `checkout` to `memory: 20M` with `GOMEMLIMIT=16MiB`. Under

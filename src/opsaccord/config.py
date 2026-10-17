@@ -89,6 +89,10 @@ class Settings(BaseSettings):
     prometheus_base_url: str = "http://127.0.0.1:9090"
     jaeger_base_url: str = "http://127.0.0.1:16686/jaeger/ui"
     flag_control_base_url: str = "http://127.0.0.1:8080/feature"
+    # The shop's public origin, used only by the live harness's bounded synthetic
+    # checkout traffic (opsaccord.scenarios.traffic). Unset means the flag control
+    # plane's origin, which is the same frontend proxy.
+    storefront_base_url: str | None = None
 
     # Application runtime reasoning model. Explicitly configured; never inherited.
     model_provider: Literal["deterministic", "openai_compatible"] = "deterministic"
@@ -149,6 +153,15 @@ class Settings(BaseSettings):
     def _live_endpoints_are_http(cls, value: str) -> str:
         if not value.startswith(("http://", "https://")):
             raise ValueError(f"live demo endpoint must be an http(s) URL, got {value!r}")
+        return value.rstrip("/")
+
+    @field_validator("storefront_base_url")
+    @classmethod
+    def _storefront_is_http(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.startswith(("http://", "https://")):
+            raise ValueError(f"storefront endpoint must be an http(s) URL, got {value!r}")
         return value.rstrip("/")
 
     @property

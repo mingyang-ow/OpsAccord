@@ -52,8 +52,10 @@ from opsaccord.scenarios.live_evidence import (
     utc_stamp,
 )
 from opsaccord.scenarios.runner import ScenarioTrace, evaluate, run_scenario
+from opsaccord.scenarios.traffic import CheckoutDriver, describe, storefront_origin
 from opsaccord.tools.contracts import TELEMETRY_ERROR_BOUND, Environment
 from opsaccord.tools.live_environment import (
+    CALLS_METRIC_CANDIDATES,
     FLAG_SAFE_VARIANT,
     LIVE_HEALTH_WINDOW_SECONDS,
     LiveEnvironment,
@@ -279,6 +281,17 @@ class LivePlan:
     # 17.7% while the caller's own Charge client share stayed at 0.0, and the
     # scenario went on to measure a fault its own controller could not attribute.
     corroborating_dependency: str | None = None
+    # Whether the harness places its own bounded orders while this plan runs. The
+    # Payment plans are measured on checkout's Charge client spans, which exist only
+    # when an order reaches payment; see opsaccord.scenarios.traffic for why the load
+    # generator alone cannot be relied on for that.
+    drive_checkout: bool = False
+
+
+#: Builds the synthetic traffic for one plan, or returns None for no driver. The CLI
+#: passes :func:`checkout_driver_factory`; the default is no driver, so a test that
+#: drives the lifecycle never sends a request to a real shop by accident.
+CheckoutDriverFactory = Callable[["LivePlan"], "CheckoutDriver | None"]
 
 
 LIVE_PLANS: dict[str, LivePlan] = {
@@ -288,6 +301,7 @@ LIVE_PLANS: dict[str, LivePlan] = {
         fault_flag="paymentUnreachable",
         corroborating_target="checkout-service",
         corroborating_dependency="checkout-service",
+        drive_checkout=True,
     ),
     "P1-02": LivePlan(
         scenario_id="P1-02",
@@ -311,6 +325,7 @@ LIVE_PLANS: dict[str, LivePlan] = {
         fault_flag="paymentUnreachable",
         corroborating_target="checkout-service",
         corroborating_dependency="checkout-service",
+        drive_checkout=True,
     ),
     "P1-06": LivePlan(
         scenario_id="P1-06",
@@ -319,6 +334,7 @@ LIVE_PLANS: dict[str, LivePlan] = {
         induced_failure="control_plane_timeout",
         corroborating_target="checkout-service",
         corroborating_dependency="checkout-service",
+        drive_checkout=True,
     ),
     "P1-07": LivePlan(
         scenario_id="P1-07",
@@ -327,6 +343,7 @@ LIVE_PLANS: dict[str, LivePlan] = {
         induced_failure="fault_rearmed_after_dispatch",
         corroborating_target="checkout-service",
         corroborating_dependency="checkout-service",
+        drive_checkout=True,
     ),
 }
 
@@ -941,6 +958,9 @@ class LiveResult:
     stage: str = "complete"
     cleanup: str | None = None
     elapsed_seconds: float | None = None
+    # The harness's own orders, if any were placed. Recorded on every result so a
+    # reader knows the measured traffic was partly synthetic.
+    synthetic_traffic: dict[str, Any] | None = None
 
     @property
     def status(self) -> str:
@@ -964,6 +984,7 @@ class LiveResult:
             "elapsed_seconds": self.elapsed_seconds,
             "fault_visible": self.fault_visible,
             "simulated": self.simulated,
+            "synthetic_traffic": self.synthetic_traffic,
             "reasons": list(self.reasons),
         }
         trace = self.trace
@@ -1068,6 +1089,7 @@ def run_live_scenario(
     progress: LiveProgress | None = None,
     budget_seconds: float | None = None,
     poll_seconds: float | None = None,
+    checkout_driver: CheckoutDriverFactory | None = None,
 ) -> LiveResult:
     """Put the demo into the scenario's starting state, run it, and clean up after it.
 
@@ -1113,6 +1135,8 @@ def run_live_scenario(
     reasons: list[str] = []
     stage = "baseline"
     body_error: BaseException | None = None
+    driver: CheckoutDriver | None = None
+    traffic: dict[str, Any] | None = None
 
     try:
         reporter.enter_stage(
@@ -1128,6 +1152,15 @@ def run_live_scenario(
             # Traffic first, then the fault: the demo has to be exercising the
             # target for the injected fault to be measurable at all.
             stage = "traffic-wait"
+            if checkout_driver is not None and plan.drive_checkout:
+                driver = checkout_driver(plan)
+                if driver is not None:
+                    driver.start()
+                    reporter.observation(
+                        f"synthetic checkout traffic: placing an order through "
+                        f"{driver.base_url} every {driver.interval_seconds}s "
+                        f"(at most {driver.max_checkouts}) until the scenario body ends"
+                    )
             traffic_budget = budget.clamp(TRAFFIC_VISIBILITY_TIMEOUT_SECONDS)
             reporter.enter_stage(
                 stage,
@@ -1254,6 +1287,11 @@ def run_live_scenario(
         body_error = exc
 
     failure_stage = stage
+    if driver is not None:
+        # Stopped before cleanup, on every exit path: the orders exist to make the
+        # premise and the verification observable, not to load a restored demo.
+        traffic = driver.stop()
+        reporter.observation(describe(traffic))
     last_observation = reporter.last_observation
     reporter.mark_body_finished(failure_stage)
     reporter.enter_stage("cleanup", message="restoring this scenario's fault flag")
@@ -1292,6 +1330,11 @@ def run_live_scenario(
             settings=settings,
             elapsed_seconds=budget.elapsed,
         )
+        if traffic is not None:
+            result.reasons.append(describe(traffic))
+            result.synthetic_traffic = traffic
+    elif traffic is not None:
+        _attach_traffic(body_error, traffic)
     if cleanup.failed:
         raise LiveCleanupFailed(cleanup.detail, stage=failure_stage, result=result) from body_error
     if body_error is not None:
@@ -1488,6 +1531,7 @@ def _unmeasured_result(
     stage: str,
     cleanup: str | None = None,
     observation: str | None = None,
+    synthetic_traffic: dict[str, Any] | None = None,
 ) -> LiveResult:
     """A scenario that produced no result, recorded as such.
 
@@ -1502,6 +1546,8 @@ def _unmeasured_result(
         reasons.append(f"last observation: {observation}")
     if cleanup:
         reasons.append(f"cleanup: {cleanup}")
+    if synthetic_traffic is not None:
+        reasons.append(describe(synthetic_traffic))
     return LiveResult(
         scenario_id=scenario_id,
         title=spec.title,
@@ -1513,7 +1559,80 @@ def _unmeasured_result(
         fault_visible=None,
         stage=stage,
         cleanup=cleanup,
+        synthetic_traffic=synthetic_traffic,
     )
+
+
+def _attach_traffic(exc: BaseException, traffic: dict[str, Any]) -> None:
+    """Carry the driver's summary out on a failure, like the lifecycle facts."""
+    try:
+        exc.synthetic_traffic = traffic  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):  # pragma: no cover - exotic exception type
+        return
+
+
+def checkout_driver_factory(settings: Settings) -> CheckoutDriverFactory:
+    """The production factory: one driver per Payment plan, against the shop's origin."""
+    origin = storefront_origin(settings)
+
+    def build(plan: LivePlan) -> CheckoutDriver | None:
+        return CheckoutDriver(origin) if plan.drive_checkout else None
+
+    return build
+
+
+#: Above this share of failing catalog calls, the storefront cannot place an order,
+#: so a Payment path would be starved of the traffic its premise needs.
+STOREFRONT_ERROR_SHARE_LIMIT = 0.5
+STOREFRONT_WINDOW = "5m"
+
+
+def storefront_preflight(
+    environment: Environment, *, timeout_seconds: float = 8.0
+) -> dict[str, Any]:
+    """Read whether the storefront can reach ``product-catalog``, read-only.
+
+    The 2026-10-17 5/7 run was spent on a stack whose ``product-catalog`` had stopped
+    answering: every order failed before it reached payment, so two Payment paths had
+    nothing to measure after 35 minutes. This reads the frontend's own catalog client
+    spans over the last five minutes so that state is refused in seconds instead.
+    ``healthy`` is None when there were no catalog calls to judge.
+    """
+    live = _as_live(environment)
+    metric = live.prometheus.resolve_metric(CALLS_METRIC_CANDIDATES, timeout_seconds)
+    if metric is None:
+        return {
+            "healthy": None,
+            "calls_per_minute": None,
+            "error_share": None,
+            "detail": "no span-metric calls series is published",
+        }
+    selector = "service_name='frontend',span_name=~'oteldemo.ProductCatalogService/.*'"
+    window = STOREFRONT_WINDOW
+    calls = live.prometheus.scalar(
+        f"sum(rate({metric}{{{selector}}}[{window}]))*60", timeout_seconds
+    )
+    errors = live.prometheus.scalar(
+        f"sum(rate({metric}{{{selector},status_code='STATUS_CODE_ERROR'}}[{window}]))*60",
+        timeout_seconds,
+    )
+    if not calls:
+        return {
+            "healthy": None,
+            "calls_per_minute": calls,
+            "error_share": None,
+            "detail": f"no frontend -> product-catalog calls in the last {window}",
+        }
+    share = (errors or 0.0) / calls
+    return {
+        "healthy": share < STOREFRONT_ERROR_SHARE_LIMIT,
+        "calls_per_minute": round(calls, 2),
+        "error_share": round(share, 3),
+        "detail": (
+            f"frontend -> product-catalog: {calls:.1f} calls/min, "
+            f"{share:.1%} failing over the last {window}"
+        ),
+    }
 
 
 def _cause_suffix(exc: BaseException) -> str:
@@ -1558,6 +1677,7 @@ def run_live_suite(
     scenario_budget_seconds: float | None = None,
     suite_budget_seconds: float | None = None,
     poll_seconds: float | None = None,
+    checkout_driver: CheckoutDriverFactory | None = None,
 ) -> LiveRun:
     """Run the selected live plans, restoring the demo after each one.
 
@@ -1743,6 +1863,7 @@ def run_live_suite(
                     progress=reporter,
                     budget_seconds=min(scenario_budget_seconds, suite_budget.remaining),
                     poll_seconds=poll_seconds,
+                    checkout_driver=checkout_driver,
                 )
             except LiveCleanupFailed as exc:
                 stopped_reason = (
@@ -1763,6 +1884,7 @@ def run_live_suite(
                             ),
                             stage=exc.stage,
                             cleanup=exc.cleanup,
+                            synthetic_traffic=getattr(exc, "synthetic_traffic", None),
                         )
                     )
                 reporter.notice(f"{stopped_reason}; later scenarios were not started")
@@ -1790,6 +1912,7 @@ def run_live_suite(
                         stage=exc.stage,
                         cleanup=exc.cleanup,
                         observation=exc.observation,
+                        synthetic_traffic=getattr(exc, "synthetic_traffic", None),
                     )
                 )
                 stopped_reason = (
@@ -1805,6 +1928,7 @@ def run_live_suite(
                         stage=exc.stage,
                         cleanup=exc.cleanup,
                         observation=exc.observation,
+                        synthetic_traffic=getattr(exc, "synthetic_traffic", None),
                     )
                 )
                 reporter.notice(f"{scenario_id} was not measured: {exc}")
@@ -1823,6 +1947,7 @@ def run_live_suite(
                         stage=stage,
                         cleanup=getattr(exc, "cleanup", None),
                         observation=getattr(exc, "observation", None),
+                        synthetic_traffic=getattr(exc, "synthetic_traffic", None),
                     )
                 )
                 stopped_reason = f"{reason}, so later scenarios were not started"
@@ -1892,6 +2017,7 @@ __all__ = [
     "LiveSetupFailed",
     "arm_fault",
     "build_live_environment",
+    "checkout_driver_factory",
     "detect_residual_faults",
     "live_settings",
     "preflight",
@@ -1899,6 +2025,7 @@ __all__ = [
     "restore_owned_fault",
     "run_live_scenario",
     "run_live_suite",
+    "storefront_preflight",
     "wait_for_fault",
     "wait_for_traffic",
 ]
