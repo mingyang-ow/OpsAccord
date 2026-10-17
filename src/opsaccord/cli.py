@@ -28,6 +28,7 @@ from opsaccord.scenarios.live import (
     storefront_preflight,
 )
 from opsaccord.scenarios.runner import evaluate, run_scenario
+from opsaccord.scenarios.traffic import storefront_origin
 from opsaccord.tools.live_environment import LiveEnvironment
 from opsaccord.workflow.checkpoints import ensure_checkpoint_schema
 
@@ -182,7 +183,9 @@ def cmd_run_live_scenarios(args: argparse.Namespace) -> int:
             f"{probe['missing_verified_flags']}"
         )
     try:
-        storefront = storefront_preflight(LiveEnvironment(settings=settings))
+        storefront = storefront_preflight(
+            LiveEnvironment(settings=settings), storefront_url=storefront_origin(settings)
+        )
     except Exception as exc:
         print(f"live preflight FAILED reading the storefront's catalog calls: {exc}")
         return 2

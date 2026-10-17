@@ -315,3 +315,22 @@ discarded because its explanation was long-winded.
 **Lesson:** every limit the controls enforce has to be stated to the model, or it becomes
 a silent failure mode. This is the third such interface trap after the doubled `target`
 argument and the output cap.
+
+## 2026-10-18 - The catalog froze again, so item 3 is on
+
+**What happened:** the clean 7/7 rerun with the model measured only 3 paths. The catalog
+had **hung** this time, rather than failing: requests never completed, so the frontend
+recorded no spans. My startup check treated "no spans" as "can't tell" and let a doomed
+35-minute run start.
+
+**Decision 1, check the path itself, not just its shadow:** the startup check now makes one
+bounded, read-only `GET /api/products` and refuses on a timeout or an error. *Why not just
+treat "zero spans" as broken:* zero spans is also what a freshly restarted, quiet stack
+looks like. A direct request is the only reading that tells "quiet" from "hung".
+
+**Decision 2, item 3 starts now, as agreed:** "the catalog freeze, if it gets in our way
+again". It has twice now. The next freeze will be captured **before** the restart:
+container state, CPU and memory, its logs and its database's logs, and what its database
+connections are waiting on. A restart destroys exactly the state the diagnosis needs.
+Earlier measurements already ruled out a stable memory signature. The catalog's database
+(`astronomy-db`, an 80 MB cap) and its unbounded connection pool are the new suspects.

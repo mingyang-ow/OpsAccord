@@ -198,3 +198,20 @@ The user ran `scripts/validate.sh --live` with `deepseek-flash` under a $0.50 ca
 **Fix:** the prompt now states both field limits, and the adapter trims the free-text
 rationale to its limit exactly as it trims the summary. The structured fields (tool,
 target, arguments) are never trimmed.
+
+### Second live run (`ca20de3`): spoiled by a hung catalog, 1/7
+
+The rerun after the rationale fix measured only 3 of 7 paths (1 PASS, 2 SAFE_ESCALATION,
+4 NOT_MEASURED; [evidence](phase2/live-scenarios-20261017T224123-flash-catalog-hung.json)).
+None of it was the model's doing, and nothing unsafe happened. The model made 3 calls
+for $0.0045.
+
+- **`product-catalog` had hung.** It did not crash and did not error. Afterwards,
+  `GET /api/products` timed out at 8 s, and the catalog produced no spans while the load
+  generator ran at about 39 spans/min. Every synthetic order timed out (26/26, 17/17,
+  17/17), so no Charge call existed and the Payment faults could not appear.
+- **The startup check let it through.** Hung calls never complete, so they produce no
+  spans. The check read "no catalog calls" as *unknown* rather than *broken*, and only
+  refused a high *error* share. It now also makes one bounded `GET /api/products` itself,
+  and refuses on a timeout, a transport failure or an error status (exit 2, with the
+  recovery command).

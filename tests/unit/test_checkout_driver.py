@@ -375,3 +375,52 @@ def test_the_cli_passes_the_driver_unless_it_is_switched_off(
         with contextlib.suppress(KeyboardInterrupt):
             cli.main(argv)
     assert callable(seen[0]) and seen[1] is None
+
+
+def _hang(url: str, timeout_seconds: float) -> int:
+    import httpx
+
+    raise httpx.ReadTimeout("no answer")
+
+
+def test_a_hung_catalog_is_refused_even_when_the_spans_show_nothing() -> None:
+    """2026-10-17 live-model run: the catalog hung, its calls never completed, the spans
+    showed *no* calls, and the old preflight could not judge, so a doomed run started."""
+    prometheus = _Prometheus(None, None)
+    result = live_scenarios.storefront_preflight(
+        _Surface(prometheus),  # type: ignore[arg-type]
+        storefront_url="http://shop.test:8080",
+        fetch=_hang,
+    )
+    assert result["healthy"] is False
+    assert "ReadTimeout" in result["detail"] and "hung or down" in result["detail"]
+    assert result["probe"]["url"] == "http://shop.test:8080/api/products"
+    assert prometheus.queries == []  # refused before any span read
+
+
+def test_an_error_status_from_the_storefront_is_refused() -> None:
+    result = live_scenarios.storefront_preflight(
+        _Surface(_Prometheus(30.0, 0.0)),  # type: ignore[arg-type]
+        storefront_url="http://shop.test",
+        fetch=lambda url, t: 503,
+    )
+    assert result["healthy"] is False and "HTTP 503" in result["detail"]
+
+
+def test_an_answering_storefront_with_no_recent_spans_is_healthy() -> None:
+    result = live_scenarios.storefront_preflight(
+        _Surface(_Prometheus(0.0, 0.0)),  # type: ignore[arg-type]
+        storefront_url="http://shop.test",
+        fetch=lambda url, t: 200,
+    )
+    assert result["healthy"] is True
+    assert "answered" in result["detail"]
+
+
+def test_failing_spans_still_refuse_when_the_probe_answers() -> None:
+    result = live_scenarios.storefront_preflight(
+        _Surface(_Prometheus(30.0, 29.0)),  # type: ignore[arg-type]
+        storefront_url="http://shop.test",
+        fetch=lambda url, t: 200,
+    )
+    assert result["healthy"] is False
