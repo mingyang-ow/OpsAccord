@@ -299,3 +299,19 @@ flags reach the live stage only.
 a hosted provider configured through the environment, API-driven incidents would make
 paid calls bounded only by the per-incident step budget. It is not used that way today,
 but it should get the same `BudgetedProvider` wrapper before anyone does.
+
+## 2026-10-17 - Phase 2c-1: first live run with a real model
+
+**Result:** 6/7 with `deepseek-flash` on the live stack, with nothing unsafe. P1-03 failed
+because the model's rationale was over the 600-character field limit, so the whole
+proposal was thrown away (safely handed off).
+
+**Decision:** trim the rationale, rather than reject the proposal, and state both limits
+in the prompt. *Why trimming is acceptable here and nowhere else:* the rationale is
+free-text explanation, and the summary was already trimmed the same way. The fields that
+decide what runs (tool, target, arguments) are never altered. A proposal must not be
+discarded because its explanation was long-winded.
+
+**Lesson:** every limit the controls enforce has to be stated to the model, or it becomes
+a silent failure mode. This is the third such interface trap after the doubled `target`
+argument and the output cap.

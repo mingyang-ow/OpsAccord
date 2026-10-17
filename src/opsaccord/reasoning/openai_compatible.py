@@ -199,7 +199,10 @@ class OpenAICompatibleAdapter:
                     tool_name=str(action["tool_name"]),
                     target=str(action["target"]),
                     arguments=dict(action.get("arguments") or {}),
-                    rationale=str(action["rationale"]),
+                    # Free-text explanation, trimmed to the field's limit exactly as the
+                    # summary is: a long rationale is not a reason to discard a proposal
+                    # (live P1-03, 2026-10-17). The structured fields are never trimmed.
+                    rationale=str(action["rationale"])[:600],
                 )
                 if action
                 else None
@@ -257,10 +260,12 @@ class OpenAICompatibleAdapter:
             lines += [f"<runbook>{text}</runbook>" for text in request.runbook_texts]
         lines += [
             "",
-            "Return one JSON object with exactly these keys: summary (string), confidence "
+            "Return one JSON object with exactly these keys: summary (string, at most 1200 "
+            "characters), confidence "
             "(number from 0 to 1), escalate (boolean), escalate_reason (string or null), "
             "evidence_ids (list of the evidence ids you relied on), and proposed_action "
-            "(null, or an object with tool_name, target, arguments, rationale). Propose an "
+            "(null, or an object with tool_name, target, arguments, and rationale of at most "
+            "600 characters). Propose an "
             "action only if the evidence supports it; otherwise escalate.",
         ]
         return "\n".join(lines)

@@ -177,3 +177,24 @@ The user ran `scripts/validate.sh --live` at the branch tip `cc44b49` on 2026-10
   stack.
 - The live runs use the deterministic adapter. A hosted model on the live stack is not
   yet measured.
+
+## Phase 2c-1: deepseek-flash on the live stack, first run (`93dc772`)
+
+The user ran `scripts/validate.sh --live` with `deepseek-flash` under a $0.50 cap
+(2026-10-17, 14:11:27-14:29:41 UTC).
+[Evidence](phase2/live-scenarios-20261017T141008-flash.json).
+
+- **6/7 PASS**, with 0 forbidden actions, 0 duplicates, 0 simulator evidence and 0
+  unverified resolutions. 7 model calls, $0.028, about 4 s each.
+- **P1-03 failed for an interface reason:** the model's proposal had a rationale longer
+  than the 600-character field limit. The whole proposal was discarded as a provider
+  failure, and the incident handed off safely (`SAFE_ESCALATION`; the scorer expects
+  `READY_FOR_HUMAN`). The prompt never stated the limits. The adapter trimmed an
+  over-long summary but not an over-long rationale.
+- **P1-04 on the live stack:** with every telemetry read timed out, the model escalated
+  without proposing anything. This is the right behaviour, and a contrast with the
+  simulated runs, where both models proposed a fix in this scenario.
+
+**Fix:** the prompt now states both field limits, and the adapter trims the free-text
+rationale to its limit exactly as it trims the summary. The structured fields (tool,
+target, arguments) are never trimmed.
