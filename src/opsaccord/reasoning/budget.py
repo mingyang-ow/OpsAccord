@@ -19,7 +19,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 
-from opsaccord.reasoning.base import Proposal, ProposalRequest, ReasoningProvider
+from opsaccord.reasoning.base import Proposal, ProposalRequest, ProposalUsage, ReasoningProvider
 
 
 class ModelBudgetExceeded(RuntimeError):
@@ -105,13 +105,23 @@ class BudgetedProvider:
             ledger.calls += 1
             ledger.spent_usd += self.worst_case_usd
         actual: float | None = None
+        usage: ProposalUsage | None = None
         try:
             proposal = self.inner.propose(request)
             usage = proposal.usage
-            if usage.input_tokens is not None and usage.output_tokens is not None:
-                actual = self.rates.cost(usage.input_tokens, usage.output_tokens)
             return proposal
+        except Exception as exc:
+            # A failed call can still report what it consumed (a cut-off answer does).
+            reported = getattr(exc, "usage", None)
+            usage = reported if isinstance(reported, ProposalUsage) else None
+            raise
         finally:
+            if (
+                usage is not None
+                and usage.input_tokens is not None
+                and usage.output_tokens is not None
+            ):
+                actual = self.rates.cost(usage.input_tokens, usage.output_tokens)
             with ledger._lock:
                 if actual is None:
                     # A failed call or one without usage stays charged at its worst case.

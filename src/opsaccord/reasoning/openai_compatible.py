@@ -61,7 +61,15 @@ class PromptTooLarge(RuntimeError):
 
 
 class MalformedModelOutput(ValueError):
-    """The provider answered, but not with a JSON object. Carries a short preview."""
+    """The provider answered, but not with a JSON object. Carries a short preview.
+
+    ``usage`` is what the provider reported for the call, when it reported it: a cut-off
+    answer still consumed tokens, and unknown is not zero.
+    """
+
+    def __init__(self, message: str, *, usage: ProposalUsage | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage
 
 
 class OpenAICompatibleAdapter:
@@ -141,20 +149,8 @@ class OpenAICompatibleAdapter:
                 client.close()
         latency_ms = int((time.monotonic() - started) * 1000)
 
-        choice = body["choices"][0]
-        content = choice["message"].get("content") or ""
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError as exc:
-            # The preview is model output, never credentials; it is what makes a
-            # recorded handoff diagnosable instead of a bare "not JSON".
-            raise MalformedModelOutput(
-                f"not a JSON object ({exc.msg}); finish_reason="
-                f"{choice.get('finish_reason')!r}; {len(content)} chars; "
-                f"starts {content[:160]!r}"
-            ) from exc
-        if not isinstance(data, dict):
-            raise MalformedModelOutput(f"JSON but not an object: {type(data).__name__}")
+        # Usage is read before the answer is parsed, so a call that produced no usable
+        # answer is still metered.
         usage = body.get("usage") or {}
         input_tokens = usage.get("prompt_tokens")
         output_tokens = usage.get("completion_tokens")
@@ -168,6 +164,30 @@ class OpenAICompatibleAdapter:
             cost = round(
                 input_tokens / 1000 * self._input_cost + output_tokens / 1000 * self._output_cost,
                 6,
+            )
+        metered = ProposalUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost,
+            latency_ms=latency_ms,
+        )
+
+        choice = body["choices"][0]
+        content = choice["message"].get("content") or ""
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as exc:
+            # The preview is model output, never credentials; it is what makes a
+            # recorded handoff diagnosable instead of a bare "not JSON".
+            raise MalformedModelOutput(
+                f"not a JSON object ({exc.msg}); finish_reason="
+                f"{choice.get('finish_reason')!r}; {len(content)} chars; "
+                f"starts {content[:160]!r}",
+                usage=metered,
+            ) from exc
+        if not isinstance(data, dict):
+            raise MalformedModelOutput(
+                f"JSON but not an object: {type(data).__name__}", usage=metered
             )
         action = data.get("proposed_action")
         diagnosis = DiagnosisProposal(
@@ -191,12 +211,7 @@ class OpenAICompatibleAdapter:
             diagnosis=diagnosis,
             provider=self.provider,
             model_id=self.model_id,
-            usage=ProposalUsage(
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cost_usd=cost,
-                latency_ms=latency_ms,
-            ),
+            usage=metered,
         )
 
     @staticmethod

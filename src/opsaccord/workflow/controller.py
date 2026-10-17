@@ -501,6 +501,7 @@ class WorkflowController:
             # with unknown usage (unknown is not zero), and a human owns the
             # incident. The model step was already charged to the budget above.
             reason = f"model provider failed: {type(exc).__name__}: {str(exc)[:300]}"
+            usage = getattr(exc, "usage", None)
             with self.db.session() as session:
                 repo.add_decision(
                     session,
@@ -512,6 +513,10 @@ class WorkflowController:
                     rationale=reason,
                     payload={"provider_error": type(exc).__name__},
                     evidence_ids=tuple(state.get("evidence_ids", ())),
+                    input_tokens=getattr(usage, "input_tokens", None),
+                    output_tokens=getattr(usage, "output_tokens", None),
+                    cost_usd=getattr(usage, "cost_usd", None),
+                    latency_ms=getattr(usage, "latency_ms", None),
                 )
                 repo.set_terminal_reason(session, incident_id=incident_id, reason=reason)
             return {

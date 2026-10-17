@@ -233,3 +233,30 @@ def test_an_answer_cut_off_by_the_token_cap_is_reported_with_its_cause(
     client = httpx.Client(transport=httpx.MockTransport(handler))
     with pytest.raises(MalformedModelOutput, match="finish_reason='length'; 0 chars"):
         _adapter(client).propose(_request())
+
+
+def test_a_cut_off_answer_is_metered_from_the_usage_it_reports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cut-off call still consumed tokens; the budget charges what was reported."""
+    monkeypatch.setenv("OPSACCORD_TEST_MODEL_KEY", "test-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 1000, "completion_tokens": 4000},
+            },
+        )
+
+    adapter = _adapter(httpx.Client(transport=httpx.MockTransport(handler)))
+    ledger = SpendLedger(budget_usd=1.0, max_calls=5)
+    provider = _budgeted(adapter, ledger)
+
+    with pytest.raises(MalformedModelOutput) as caught:
+        provider.propose(_request())
+
+    assert caught.value.usage is not None and caught.value.usage.output_tokens == 4000
+    assert ledger.spent_usd == pytest.approx(0.009)  # 1000 in + 4000 out at the rates
+    assert ledger.charged_at_worst_case == 0
