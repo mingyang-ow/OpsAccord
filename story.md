@@ -90,11 +90,24 @@ yet been run live; a seven-path run with the driver on is the evidence still nee
 
 ## 2026-10-17 - going public
 
-**Decision (pending the user's pick):** the repository will be made public as a
-portfolio project. Before that it needs a licence (MIT recommended: short, permissive,
-standard for portfolio work) and a pass so a stranger can read it: a README with a
-diagram and a demo capture, and a short Phase 1 summary in front of the 5,000-line
-report.
+**Decision:** the repository will be made public as a portfolio project, under the
+**MIT licence** (the user approved it: short, permissive, standard for portfolio work).
+Before the visibility change, a readability pass was done for strangers:
+
+- **The README** now leads with what the project proves, a results table, a Mermaid
+  architecture diagram and two real console screenshots.
+- **The screenshots** come from the simulated scenario run, and their captions say so;
+  nothing is mocked up.
+- **A one-page [Phase 1 summary](docs/reports/phase1-summary.md)** sits in front of the
+  forensic report, and the report now points readers to it first.
+
+*Why a summary rather than rewriting the report:* the report's value is that it is an
+honest, chronological record, including the mistakes. Rewriting it would lose that, so a
+stranger gets a front door instead.
+
+**Still to do before going public:** have the user read the README, the summary and
+`story.md` as a stranger would, then flip the visibility themselves. Visibility is never
+changed without an explicit instruction.
 
 ## 2026-10-17 - Phase 2: what to start with
 

@@ -1,5 +1,8 @@
 # Phase 1 implementation report
 
+> **New here? Read the one-page [Phase 1 summary](phase1-summary.md) first.** This report is the
+> forensic record behind it: every command, measurement, defect and correction, in the order they happened.
+
 ## Identity and status
 
 This table is the current state. The per-pass status rows that used to sit here are kept verbatim,

@@ -7,6 +7,7 @@ name = "opsaccord"
 version = "0.1.0.dev0"
 description = "Incident response with evidence-backed diagnosis and policy-controlled remediation"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115",
