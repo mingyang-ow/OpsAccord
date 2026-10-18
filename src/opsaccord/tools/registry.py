@@ -148,9 +148,12 @@ WRITE_TOOLS: tuple[ToolSpec, ...] = (
                 "remediation_id": ("disable_feature_flag",),
                 "flag_id": ("adHighCpu",),
             },
+            # Two verified Payment faults, two fixes. Allowing paymentFailure here is a
+            # policy decision (P2-02): without it, the correct fix for "payment answers
+            # with errors" would be refused while the wrong one stayed allowed.
             "payment-service": {
                 "remediation_id": ("disable_feature_flag",),
-                "flag_id": ("paymentUnreachable",),
+                "flag_id": ("paymentUnreachable", "paymentFailure"),
             },
             # No remediation is allow-listed for these targets: an empty tuple
             # rejects every value, so the registry refuses before policy runs.

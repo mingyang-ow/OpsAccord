@@ -1,5 +1,8 @@
 # Phase 1 implementation report
 
+> References such as "design note D29", "experiment E28" or "known issue A26" point to
+> working notes kept outside this repository; they are not published.
+>
 > **New here? Read the one-page [Phase 1 summary](phase1-summary.md) first.** This report is the
 > forensic record behind it: every command, measurement, defect and correction, in the order they happened.
 
@@ -12,13 +15,13 @@ superseded by the rows here.
 | Item | Value |
 | --- | --- |
 | Repository | `mingyang-ow/OpsAccord` (private), remote `git@github.com:mingyang-ow/OpsAccord.git`; `origin/main` is still `3168bcf` |
-| Branch | `phase1/baseline`, branched at `3168bcf`; pushed to `origin/phase1/baseline` and opened as a draft PR into `main` at the user's instruction (2026-10-17); not merged |
+| Branch | `phase1/baseline`, branched at `3168bcf`; merged into `main` as PR #1 (merge commit `36f8cbf`, 2026-10-17) and tagged `phase1` |
 | Tip | `git log --oneline -1` (this report's record commit). `git diff --shortstat 3168bcf HEAD` before this commit: 111 files changed, 40664 insertions(+), 42 deletions(-) |
 | Runtime code under test | `src/` and `scripts/` are byte-identical from `335a3af` to the tip (`git diff --quiet 335a3af HEAD -- src scripts`); every commit after `335a3af` changes only this report and `tests/unit/test_demo_script.py` |
-| **Phase 1 status** | **READY_FOR_DISCUSSION** - every executable gate in `docs/phase1.md` has passed. The final diff inspection, acceptance and delivery are the user's |
+| **Phase 1 status** | **Accepted and merged** (2026-10-17). Every executable gate in `docs/phase1.md` passed, including all seven live paths in a single run |
 | Offline and database-backed gates | offline **389 passed, 7 skipped** in both environment variants; lint, format (95 files) and `mypy` (42 source files) clean; integration **85 passed**; pre-fix sensitivity harness as designed; simulated scenarios **9/9 PASS** - identical in the user's runs at `335a3af`, `d75ea8f` and `b9404e8` |
 | Live paths against the pinned `3.1.0` stack | **7/7 PASS in one invocation**: `scripts/validate.sh --live` at `9ac1209` (2026-10-17 07:45:09-08:06:29 UTC), exit **0**, after `product-catalog` and `checkout` were restarted and verified. 0 forbidden actions, 0 duplicate side effects, 0 simulator evidence, every armed flag read back `off`. The same runtime code also passed P1-01 at `335a3af` and P1-02..P1-07 twice (`d75ea8f`, `b9404e8`), and one earlier seven-path attempt measured 5/7 on a starved stack - see "The seven-path pass" |
-| Outstanding | the user's review of `git diff 3168bcf HEAD` and of the draft PR; a licence (noted by the user, not needed while private); the open design decisions under "Remaining work and discussion" |
+| Outstanding | nothing for Phase 1. Later work is in `docs/phase2.md`, `docs/reports/phase2-summary.md` and `story.md`. The repository is public under the MIT licence |
 | Dirty state | clean: the user's `AGENTS.md` reviewer-policy section is committed at the user's instruction; otherwise only gitignored local state (`.local/`, `reports/local/`, `.venv/`) |
 | Host | WSL 2, kernel `6.18.33.2-microsoft-standard-WSL2`, Ubuntu 26.04 LTS, 16 CPU, 15.5 GB RAM |
 | Toolchain | `uv` 0.12.5, Python 3.12.14 (`.python-version`), project-local PostgreSQL 18.6 on `127.0.0.1:55432`, Docker 29.7.2, Docker Compose v5.4.0 |
@@ -3762,7 +3765,7 @@ trace only when all of the following hold, each recorded separately with the evi
 > above, at the user's direction, after the live run showed the clause refusing a healthy baseline on a span
 > this revision never writes a status to. The direct path is unchanged, `UNSET` is still reported as `UNSET`
 > and the shared status classifier is untouched. See "The option-B pass" at the end of this report and
-> [D35](decisions/D35-the-baseline-s-success-may-come-from-the-caller.md).
+> design note D35.
 >
 > **Updated again 2026-10-15 (the user's live capture, `63effae`).** With that path in place the capture is
 > no longer refused: the user's run returned `baseline_verified`, satisfied by the caller's own `frontend`
@@ -4587,7 +4590,7 @@ run is the live answer, and it is stronger than the fallback path it guarded:
 * Both commands that read optional keys (`inspect` and `ensure`) read `.State.Health`,
   `.Config.Healthcheck` and `.Config.Labels` through `index`, and both were accepted for all 25
   containers, including the six, now that those six are **running**. The second half of
-  [A26](../04%20Known%20Issues.md)'s open question - whether `ensure` would still read their state once
+  known issue A26's open question - whether `ensure` would still read their state once
   they were running - is answered yes.
 * The live *trigger* is still unexplained, and this run does not explain it either: the previous run's
   contrast (the field form accepted by `ensure` for those six while stopped, rejected by `inspect` while
@@ -4619,7 +4622,7 @@ crash loop is confirmed for *this* instance.
 
 What is **not** measured for this instance is the rest of that row: there is no CPU/resident-set sample
 pair, so neither "CPU near the core count with RSS held at the 20 MiB cap" nor "CPU near idle with RSS
-well below it" can be read from this run. The two samples on file ([E28](../03%20Experiment%20Log.md):
+well below it" can be read from this run. The two samples on file (experiment E28:
 56.50% and 28.34% of the cap, with 159.76% and 378.74% CPU) belong to the 2026-09-25 instance; they are
 what refused the memory deviation for `product-catalog` in the first place, and that refusal stands - it
 is not overturned by anything measured here.
@@ -4627,8 +4630,8 @@ is not overturned by anything measured here.
 One reading *is* new, and it is new because it was **retained** rather than because anything was sampled.
 The container was **started**, not recreated, so its own health log still holds its previous era's last
 two probes: both `ExitCode 0`, both `status: SERVING`, at `2026-09-26T04:02:30Z` and `04:02:35Z` - about
-an hour **after** the `02:57:33` in-place restart [E29](../03%20Experiment%20Log.md) measured.
-[D29](decisions/D29-a-restart-is-allowed-only-after-the-state-it-replaces-is-captured.md)'s revisit
+an hour **after** the `02:57:33` in-place restart experiment E29 measured.
+design note D29's revisit
 condition asked for exactly that reading, and E29 could not capture it (the helper ate the per-container
 state that run). It is a ring buffer of five entries, so it dates a recovery and not its extent; what it
 does not support is "the restart did nothing".
@@ -4638,12 +4641,12 @@ does not support is "the restart did nothing".
 `cmd_ensure`, when it refuses over a running-but-unhealthy container, now also collects the **two bounded
 `docker stats` samples** for it, beside the health output and the log tail. This run is the reason: it
 stopped exactly as designed and handed back the probe's text and the logs, but not the numbers
-[D27](decisions/D27-a-repair-waits-for-the-measurement-that-names-its-cause.md) requires before a repair,
+design note D27 requires before a repair,
 so the decision had to cost a second host run - and the state those numbers describe (a process wedged
 *now*, with its restart counter and its health history intact) cannot be recovered afterwards. The
 samples are read-only and the refusal is unchanged: still exit **1**, still nothing started, stopped or
 recreated, and a failed sample pair is reported as a failed sample (`the sample pair exited N`) without
-changing the verdict. See [D33](decisions/D33-a-stop-hands-back-the-measurement.md).
+changing the verdict. See design note D33.
 
 ### Checks executed in this pass
 
@@ -4676,8 +4679,8 @@ Docker Desktop must already be up, and the cluster and the 25 containers are alr
 should verify and start nothing. The block preserves the as-found state first. When `ensure` refuses, the
 measurement that names the cause is taken **before** anything is restarted; then only `product-catalog`
 and `otel-collector` are restarted in place - the scope
-[D29](decisions/D29-a-restart-is-allowed-only-after-the-state-it-replaces-is-captured.md) allows, and the
-one whose evidence ([E28](../03%20Experiment%20Log.md), [E29](../03%20Experiment%20Log.md), and the
+design note D29 allows, and the
+one whose evidence (experiment E28, experiment E29, and the
 retained health log above) shows the catalog serving again - the same readings are taken again, and only
 after **both** restarted services are verified ready inside **one** bounded window does the block refresh
 the endpoints and run the checkout capture. Each service is resolved to its container through this
@@ -4938,7 +4941,7 @@ Zero matches and two matches both stop the caller and print the rows they found;
 container name. What it prints is the service, the resolved container **id** and the container's own name,
 and the block uses those ids for every reading. The pair is resolved *before* the restart as well as after
 it: if the ids differ, the restart was not in place and the before/after comparison
-[D29](decisions/D29-a-restart-is-allowed-only-after-the-state-it-replaces-is-captured.md) rests on would be
+design note D29 rests on would be
 between different containers, so the block stops rather than capturing.
 
 **2. Both restarted services are verified, inside one bounded window.**
@@ -4956,7 +4959,7 @@ the run instead of being counted in either direction. Every named service shares
 long wait per service would lengthen the tail without making either reading more decisive. On failure the
 stop hands back the reading that decided it, the container's configured-check history and a bounded log
 tail - the same reason the previous pass moved the two `docker stats` samples into `ensure`'s refusal
-([D33](decisions/D33-a-stop-hands-back-the-measurement.md)).
+(design note D33).
 
 **What the collector's reading is, and is not.** An OTLP receiver answering HTTP 200 proves the *receive*
 path is serving; that is **process** readiness. It does not show the collector's exports reach Jaeger, and
@@ -4973,12 +4976,12 @@ fact rather than a carried-over one.
 ### Scope, and what the restart is claimed to be
 
 The block's restart is described as a **targeted recovery attempt based on historical observations**.
-[E28](../03%20Experiment%20Log.md) and [E29](../03%20Experiment%20Log.md) are what say an in-place restart
+experiment E28 and experiment E29 are what say an in-place restart
 has previously been followed by the catalog serving again, and the retained health log quoted in the
-previous section is the reading [D29](decisions/D29-a-restart-is-allowed-only-after-the-state-it-replaces-is-captured.md)
+previous section is the reading design note D29
 asked for. It is **not** a repair of a named cause: no cold-start root cause is claimed and **memory
 pressure is not ruled out** - that deviation stays refused *by measurement*
-([D27](decisions/D27-a-repair-waits-for-the-measurement-that-names-its-cause.md)), not by argument. Nothing
+(design note D27), not by argument. Nothing
 outside the named pair is restarted, no resource limit and no capture timeout is changed, and the
 PostgreSQL state checks and safeguards are untouched.
 

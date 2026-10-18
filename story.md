@@ -14,7 +14,7 @@ matters. The thesis it is built to demonstrate: **a language model may propose, 
 never decides.** A deterministic policy engine, a typed tool gateway and exact human
 approvals decide what actually runs, and PostgreSQL records every step.
 
-It is a learning and portfolio project, meant to be public.
+It is an independent project, published under the MIT licence.
 
 ## Phase 1 decisions (2026-09-23 to 2026-10-17)
 
@@ -89,13 +89,14 @@ memory-limit fix, so this needs new numbers before anything changes.
 with the driver on passed **7/7** (exit 0, 2026-10-17, `6cea3c0`). The order outcomes
 matched each path's design: P1-01's failed under the fault and succeeded after the fix,
 P1-06's all failed, and P1-07's flipped to failing when the fault was re-armed. The
-preflight's refusal path is tested offline but has not yet been triggered live.
+preflight's refusal path was tested offline at this point. *(It was triggered live on
+2026-10-18, when it refused a hung catalog in seconds.)*
 
 ## 2026-10-17 - going public
 
-**Decision:** the repository will be made public as a portfolio project, under the
-**MIT licence** (the user approved it: short, permissive, standard for portfolio work).
-Before the visibility change, a readability pass was done for strangers:
+**Decision:** the repository will be made public under the **MIT licence** (the user approved it:
+short and permissive). Before the visibility change, a readability pass was done for
+first-time readers:
 
 - **The README** now leads with what the project proves, a results table, a Mermaid
   architecture diagram and two real console screenshots.
@@ -106,10 +107,10 @@ Before the visibility change, a readability pass was done for strangers:
 
 *Why a summary rather than rewriting the report:* the report's value is that it is an
 honest, chronological record, including the mistakes. Rewriting it would lose that, so a
-stranger gets a front door instead.
+first-time reader gets a front door instead.
 
 **Still to do before going public:** have the user read the README, the summary and
-`story.md` as a stranger would, then flip the visibility themselves. Visibility is never
+`story.md` as a first-time reader would, then flip the visibility themselves. Visibility is never
 changed without an explicit instruction.
 
 ## 2026-10-17 - Phase 2: what to start with
@@ -126,7 +127,7 @@ scenarios, chosen by what that evaluation reveals.
   actually tested.
 - It needs no new infrastructure: the adapter, the budget accounting and the scenario
   scoring already exist, and simulated mode is cheap and repeatable.
-- It produces the artifact that reads best in a portfolio: a table of what the model
+- It produces the most informative artifact: a table of what the model
   proposed, what policy blocked, outcome per scenario, latency and cost - compared with
   the deterministic baseline.
 - Its findings choose the next scenarios on evidence. For example, if the model often
@@ -139,8 +140,8 @@ scenarios, chosen by what that evaluation reveals.
   each new scenario adds less to the story.
 - *Multi-model routing.* This is interesting, but it is premature until one model's
   behaviour is measured.
-- *Production integrations.* These are out of scope for a portfolio project and would
-  weaken the "isolated, safe" framing.
+- *Production integrations.* These are out of scope for this project and would
+  weaken the "isolated, safe" design.
 
 ## 2026-10-17 - Phase 2a: preparing for a real model
 
@@ -466,3 +467,42 @@ with 0 actions executed. The clean-edge wait visibly mattered: P1-06 had to wait
 P1-05's tail.
 
 **Spend so far:** about $1.45 of the $3 cap.
+
+## 2026-10-18 - The remaining evaluation concepts: P2-02, P2-03, P2-04
+
+**User decisions:**
+
+- Nothing about the user's DeepSeek account may be public, and people bring their own
+  key. Audited: the key is in no tracked file and no commit in the history. Only the
+  *name* of the environment variable appears.
+- Skip extra live repeats for now, and defer the stale-flag root cause.
+- Build #2, #12 and #7, then update the README and write-up.
+
+**What building them found:**
+
+- **#12 found a real hole.** If an approved action's arguments were rewritten while its
+  digests stayed the same, the claim checked the stored digests, passed, and the altered
+  action ran. *Decision:* recompute the digests from the exact arguments about to be
+  dispatched, before the claim, and compare them with both the action and its approval.
+- **#2 found two problems.** The deterministic adapter always proposed the "unreachable"
+  fix, and the simulator let *any* Payment flag clear *any* Payment fault. Fixed both.
+  *Policy decision:* payment may now have either verified flag disabled; otherwise the
+  correct fix for #2 would be refused while the wrong one stayed allowed.
+- **#7 needed nothing new.** The hard cap refused the proposal, as designed.
+
+**Finding left as a finding:** `deepseek-flash` picked the wrong Payment flag in 2 of 6
+runs, with a correct description of the evidence. The human approved and it ran. I did
+*not* add a rule tying the fix to the fault signature: that would move diagnosis into
+policy on the strength of two runs. It is recorded as the limit of human approval, and a
+candidate for later.
+
+## 2026-10-18 - The README and write-up updated for Phase 2
+
+**Decision:** the README leads with the Phase 2 headline (a real model deciding live, 8/8)
+and the safety holes it exposed, and it states the model's failures as plainly as its
+successes. *Why:* the point of the project is to show judgment about safety, and hiding
+the 2-of-6 wrong-flag result would undercut exactly that. A one-page
+[Phase 2 summary](docs/reports/phase2-summary.md) sits beside the Phase 1 one.
+
+**On keys:** the README tells readers to bring their own provider key. The repository has
+never contained one, and a history audit confirmed it.

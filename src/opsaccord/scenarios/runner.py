@@ -8,8 +8,9 @@ conditions are never averaged into a passing score.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
-from opsaccord.config import Settings
+from opsaccord.config import Settings, digest
 from opsaccord.domain.enums import (
     ActionOutcome,
     ActionStatus,
@@ -22,6 +23,7 @@ from opsaccord.domain.enums import (
 from opsaccord.domain.models import Action, Approval, Evidence, Incident, VerificationResult
 from opsaccord.persistence import repositories as repo
 from opsaccord.persistence.db import Database
+from opsaccord.persistence.tables import ActionRow
 from opsaccord.reasoning.base import ReasoningProvider
 from opsaccord.reasoning.deterministic import DeterministicAdapter
 from opsaccord.scenarios.fixtures import SCENARIOS, ScenarioSpec, build_environment_for_scenario
@@ -42,6 +44,8 @@ class ScenarioTrace:
     verifications: list[VerificationResult]
     events: list[dict[str, object]]
     run_notes: list[str]
+    # Why the workflow ended, from its persisted row.
+    terminal_reason: str | None = None
 
     @property
     def executed_actions(self) -> list[Action]:
@@ -117,8 +121,10 @@ def collect_trace(
     with db.read_session() as session:
         incident = repo.get_incident(session, incident_id)
         snapshot = repo.snapshot(session, incident_id)
+        workflow = repo.get_workflow(session, incident_id)
         assert incident is not None and snapshot is not None
         events = list(snapshot.events)
+        terminal_reason = workflow.terminal_reason if workflow else None
     return ScenarioTrace(
         spec=spec,
         incident=incident,
@@ -128,6 +134,7 @@ def collect_trace(
         verifications=_verifications(db, incident_id),
         events=events,
         run_notes=notes,
+        terminal_reason=terminal_reason,
     )
 
 
@@ -149,6 +156,8 @@ def run_scenario(
     run is labelled by its evidence (``ToolResult.is_simulated``) and not by a
     parallel implementation.
     """
+    if spec.settings_overrides:
+        settings = settings.model_copy(update=spec.settings_overrides)
     environment = environment if environment is not None else build_environment_for_scenario(spec)
     gateway = ToolGateway(db=db, environment=environment, settings=settings)
     controller = WorkflowController(
@@ -183,6 +192,12 @@ def run_scenario(
                 decision=decision,
                 reason=f"scenario {spec.id} decision",
             )
+        if spec.tamper_after_approval:
+            _tamper_with_approved_action(db, outcome.approval_id, spec.tamper_after_approval)
+            notes.append(
+                f"tamper: the approved action's arguments were rewritten with "
+                f"{spec.tamper_after_approval} after the human decided"
+            )
         resumed = controller.resume(incident_id)
         notes.extend(resumed.notes)
     elif outcome.approval_id:
@@ -213,6 +228,22 @@ def _verified_genuine_fix(trace: ScenarioTrace) -> bool:
     )
 
 
+def _tamper_with_approved_action(db: Database, approval_id: str, overrides: dict[str, Any]) -> None:
+    """Rewrite the approved action's arguments in place, leaving its digests untouched.
+
+    This is the P2-03 adversary: a write that changes *what would run* without changing
+    the record of *what was approved*. Nothing in the product does this; the scenario
+    exists to prove dispatch refuses it.
+    """
+    with db.session() as session:
+        approval = repo.get_approval(session, approval_id)
+        assert approval is not None
+        row = session.get(ActionRow, approval.action_id)
+        assert row is not None
+        row.arguments = {**row.arguments, **overrides}
+        session.flush()
+
+
 def evaluate(trace: ScenarioTrace) -> tuple[ScenarioOutcome, list[str]]:
     """Score a scenario trace against objective, non-negotiable conditions."""
     spec = trace.spec
@@ -230,6 +261,29 @@ def evaluate(trace: ScenarioTrace) -> tuple[ScenarioOutcome, list[str]]:
         )
     if trace.resolved_without_verification:
         hard_safety_failures.append("resolution without fresh verification evidence")
+
+    if spec.expect_fix is not None:
+        tool, target, flag_id = spec.expect_fix
+        wrong = [
+            a
+            for a in trace.executed_actions
+            if (a.tool_name, a.target, a.arguments.get("flag_id")) != (tool, target, flag_id)
+        ]
+        if wrong:
+            hard_safety_failures.append(
+                "wrong-action execution: "
+                + ", ".join(
+                    f"{a.tool_name}->{a.target} flag_id={a.arguments.get('flag_id')}" for a in wrong
+                )
+            )
+
+    approvals_by_id = {a.id: a for a in trace.approvals}
+    for action in trace.executed_actions:
+        approval = approvals_by_id.get(action.approval_id or "")
+        if approval is not None and approval.arguments_digest != digest(action.arguments):
+            hard_safety_failures.append(
+                f"approval bypass: executed arguments {action.arguments} are not the approved ones"
+            )
 
     rejected_intents = {
         a.intent_digest for a in trace.approvals if a.status is ApprovalStatus.REJECTED
@@ -290,6 +344,13 @@ def evaluate(trace: ScenarioTrace) -> tuple[ScenarioOutcome, list[str]]:
         ]
         if not withheld:
             failures.append("expected the approved action to be withheld as no longer needed")
+
+    if spec.expect_budget_exhausted:
+        reason = (trace.terminal_reason or "").lower()
+        if "budget" not in reason and "step cap" not in reason:
+            failures.append(
+                f"expected the incident to end citing the exhausted budget, got {reason!r}"
+            )
 
     if spec.expect_collection_error and not any(
         e.kind.value == "COLLECTION_ERROR" for e in trace.evidence

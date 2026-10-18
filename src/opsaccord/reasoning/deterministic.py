@@ -94,6 +94,24 @@ def _edge_remediation() -> ActionProposal:
     )
 
 
+def _server_failure_remediation() -> ActionProposal:
+    """The fix for payment answering Charge with errors, as opposed to being unreachable."""
+    return ActionProposal(
+        tool_name="apply_remediation",
+        target="payment-service",
+        arguments={
+            "target": "payment-service",
+            "remediation_id": "disable_feature_flag",
+            "flag_id": "paymentFailure",
+        },
+        rationale=(
+            "payment receives Charge calls and fails them itself, which is the paymentFailure "
+            "fault rather than an unreachable payment; payment is critical, so this requires "
+            "an exact human approval"
+        ),
+    )
+
+
 class DeterministicAdapter:
     provider = "deterministic"
     model_id = "deterministic-v1"
@@ -188,6 +206,25 @@ class DeterministicAdapter:
                         evidence_ids=evidence_ids,
                         escalate=True,
                         escalate_reason=reason,
+                    ),
+                    provider=self.provider,
+                    model_id=self.model_id,
+                )
+            if failing and reachable is not False:
+                # The server receives its calls and fails them itself: its own
+                # measured failure share is high while it stays reachable. That is a
+                # different fault from an unreachable payment, and it needs a
+                # different fix (P2-02).
+                return Proposal(
+                    diagnosis=DiagnosisProposal(
+                        summary=(
+                            "payment-service is reachable and receiving Charge calls but fails "
+                            f"{error_rate:.0%} of them itself, which is consistent with the "
+                            "paymentFailure fault flag rather than an unreachable payment"
+                        ),
+                        confidence=0.84,
+                        evidence_ids=evidence_ids,
+                        proposed_action=_server_failure_remediation(),
                     ),
                     provider=self.provider,
                     model_id=self.model_id,

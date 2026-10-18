@@ -45,6 +45,7 @@ Operational audit events are append-only. Mutable workflow projections do not re
 - Only registered write tools travel the action path. A read proposed as an action is refused when evaluated and when its action is written, and the dispatcher refuses, before any claim, an action row whose tool is not a registered write tool.
 - No side effect without telemetry about its target. Policy refuses a remediation (`INSUFFICIENT_EVIDENCE`) unless the incident collected at least one successful metric, trace, or caller-side dependency read of that target. A health probe, a runbook, or a model's confidence is not enough.
 - No side effect that is no longer needed. Just before dispatch, an action that waited for a human is re-checked against fresh evidence (the target's health and, where it applies, the caller's calls to it). Only a proven recovery withholds it: it is cancelled as `CONFIRMED_NOT_APPLIED` with a conditional update that cannot race a claimed dispatch, and the incident still resolves only on full verification. Anything short of proof leaves the human's approval standing.
+- What runs is exactly what was approved. Before an action is claimed, its intent and argument digests are recomputed from the very arguments that would be dispatched, and compared with the action's record and with its approval. Any difference refuses the dispatch, without consuming the approval.
 
 ### Execution commitment and control ordering
 
