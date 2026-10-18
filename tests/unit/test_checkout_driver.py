@@ -186,7 +186,7 @@ def _factory(log: list[str]) -> Any:
 
 def test_only_the_payment_plans_drive_checkout() -> None:
     driven = sorted(sid for sid, plan in live_scenarios.LIVE_PLANS.items() if plan.drive_checkout)
-    assert driven == ["P1-01", "P1-05", "P1-06", "P1-07"]
+    assert driven == ["P1-01", "P1-05", "P1-06", "P1-07", "P2-01"]
 
 
 def test_a_payment_plan_starts_and_stops_the_driver_and_records_it(

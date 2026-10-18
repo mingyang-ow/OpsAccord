@@ -403,3 +403,14 @@ deterministic adapter and `deepseek-flash` both pass 3/3.
 
 **Not yet done:** P2-01 on the live stack. The live runner approves immediately, so it
 needs a way to clear the flag while the approval is pending.
+
+## 2026-10-18 - P2-01 merged (`phase2c2`), and built for the live stack
+
+**Design decision for the live version:** the harness, not the incident, clears the fault.
+It turns the flag off, then *waits until recovery is visible on checkout's own calls to
+payment* before releasing the human's approval. *Why wait:* the verification window
+spans 120 s, so straight after the flag goes off the window still contains failures. An
+approval that came instantly would test nothing. Waiting models the realistic case, an
+approval that took a few minutes, and gives the need check a fair chance to see the
+recovery. If recovery never shows within 300 s, the harness reports it and lets the
+scenario fail on its own expectation, rather than retrying until green.
