@@ -334,3 +334,20 @@ container state, CPU and memory, its logs and its database's logs, and what its 
 connections are waiting on. A restart destroys exactly the state the diagnosis needs.
 Earlier measurements already ruled out a stable memory signature. The catalog's database
 (`astronomy-db`, an 80 MB cap) and its unbounded connection pool are the new suspects.
+
+## 2026-10-18 - Item 3 decided: the catalog is starved by its memory limit
+
+**Evidence (captured before the restart, as planned):** while hung, the catalog ran at
+**4-6 CPU cores with 17.8-19.5 MB of its 20 MB cap in use**. That is the same Go GC death
+spiral that froze `checkout` in Phase 1. Its database was healthy and idle. After a
+restart it hung again within ~7 minutes. The new startup check caught that in seconds
+and refused the run, which is the check doing its job.
+
+**Decision:** raise `product-catalog` to the same documented override as `checkout` (256 MB,
+`GOMEMLIMIT=192MiB`). Only resource limits change: no image, flag, port or behaviour.
+
+**Why now and not in Phase 1:** in Phase 1 the samples were taken while the catalog was
+quiet, and they disagreed, so I recorded that they did *not* justify the change. A capture
+taken during the hang is the measurement that could decide it. *Lesson:* capture before
+you restart. A restart erases the evidence, and that is why this took three freezes to
+diagnose.

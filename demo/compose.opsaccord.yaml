@@ -17,9 +17,25 @@
 # constraint rather than the machine. Raising the pair to a normal Go ratio
 # (GOMEMLIMIT at ~75% of the cgroup limit) clears the GC loop.
 #
-# The report and docs/astronomy-shop.md record this as an environment deviation.
+# product-catalog carries the identical upstream pair and was raised the same way on
+# 2026-10-18, after a capture taken *during* a hang (before any restart) measured the
+# same signature: 621.78% and 423.99% CPU while holding 19.51 MiB and 17.77 MiB of its
+# 20 MiB, gRPC health probe failing, every OTLP export timing out, and
+# GET /api/products hanging past 8 s. Its database was ruled out in the same capture
+# (11 idle connections of 100, none waiting). Earlier samples taken while the catalog
+# was quiet could not decide the question; this one could. A restart alone re-entered
+# the hang within about seven minutes.
+#
+# The report and docs/astronomy-shop.md record both as environment deviations.
 services:
   checkout:
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    environment:
+      GOMEMLIMIT: 192MiB
+  product-catalog:
     deploy:
       resources:
         limits:
