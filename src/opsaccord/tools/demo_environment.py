@@ -100,6 +100,8 @@ class DemoEnvironment:
         self.attempted: dict[str, dict[str, object]] = {}
         self.call_counts: dict[str, int] = {}
         self.read_calls: list[tuple[str, str, str]] = []
+        # Fault changes made outside OpsAccord (an operator, an upstream fix).
+        self.external_changes: list[dict[str, str]] = []
 
     # --- helpers ----------------------------------------------------------
 
@@ -385,6 +387,26 @@ class DemoEnvironment:
             is_simulated=True,
             collected_at=self._now(),
         )
+
+    def clear_fault_externally(self, *, target: str, flag_id: str) -> None:
+        """Clear a fault the way an operator or an upstream fix outside OpsAccord would.
+
+        It changes the simulated service state exactly as turning the flag off does, but it
+        is not an action: nothing is recorded in the action ledger or keyed by an
+        idempotency key, so a trace can tell "the system fixed it" from "it recovered on
+        its own".
+        """
+        self.external_changes.append({"target": target, "flag_id": flag_id})
+        state = self._state(target)
+        if flag_id == "paymentUnreachable":
+            state.reachable = True
+            state.health = "SERVING"
+            state.error_rate = 0.0
+            state.latency_p95_ms = 45.0
+        elif flag_id == "adHighCpu":
+            state.cpu_utilization = 0.21
+        elif flag_id == "cartFailure":
+            state.error_rate = 0.0
 
     def _disable_flag(self, *, target: str, flag_id: str) -> None:
         if self.faults.remediation_ineffective:

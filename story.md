@@ -377,3 +377,29 @@ held for 10 minutes past its old hang window and sat at 32 MB, above the 20 MB t
 starved it. The startup check stays in place in case it ever comes back.
 
 **Spend so far:** about $1.40 of the $3 cap, by the ledger.
+
+## 2026-10-18 - Phase 2c-2: an approved fix that is no longer needed (P2-01)
+
+**Gap:** before a fix ran, the controls re-checked *permission* (policy, constraints,
+approval) but never whether it was still *needed*. Approvals take time, and faults clear
+on their own or get fixed by someone else.
+
+**Decisions:**
+
+- **Re-check need just before dispatch, but only for actions that waited for a human.**
+  An allow-listed autonomous fix has no wait, so the check would only spend budget.
+- **Two reads, not a full verification.** The full four-read round would have put P1-01
+  exactly on its step cap. Health, plus the caller's view of the path, is enough to
+  decide whether to *withhold*. Full verification still decides `RESOLVED`.
+- **Only proven recovery overrides a human's approval.** An unproven or unreadable state
+  leaves the approval standing. Withholding wrongly costs an incident; running a
+  no-longer-needed fix costs a pointless side effect. Neither is unsafe, but overriding a
+  human on weak evidence is the worse habit.
+- **Withholding is a conditional update** (`APPROVED` -> `CANCELLED`), so it can never
+  race a worker that has already claimed the dispatch.
+
+**Shown:** disabling the check makes P2-01 fail (the unneeded fix runs). With it, the
+deterministic adapter and `deepseek-flash` both pass 3/3.
+
+**Not yet done:** P2-01 on the live stack. The live runner approves immediately, so it
+needs a way to clear the flag while the approval is pending.

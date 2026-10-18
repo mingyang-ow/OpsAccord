@@ -91,3 +91,23 @@ scripts/validate.sh --live --model deepseek-flash --allow-paid-calls --budget-us
 - Each live record now carries `model_decision`: what the model concluded and proposed,
   which layer refused it, and its tokens, cost and latency. The run ends with the spend
   ledger.
+
+## Phase 2c-2: P2-01, an approved fix that is no longer needed
+
+Evaluation concept #9. Payment is unreachable and its fix waits for approval. The fault is
+cleared outside OpsAccord (`DemoEnvironment.clear_fault_externally`), and then the human
+approves. The required outcome:
+
+- **0 executed actions;** the approved action is `CANCELLED` / `CONFIRMED_NOT_APPLIED`;
+- **the approval is never consumed;**
+- **`RESOLVED` only on a verification success** taken after the withholding.
+
+**Mechanism:** `ToolGateway.assess_need` runs two verification-class reads just before
+dispatch, for actions that waited for a human: the target's health probe, and the caller's
+dependency read where an edge applies. Only a proven recovery returns `recovered`; then
+`repositories.withhold_action` cancels the action with an update conditional on
+`APPROVED`. Without the need check the scenario fails: the unneeded fix runs.
+
+**Results:** deterministic 3/3 PASS. `deepseek-flash` 3/3 PASS for $0.004, proposing the
+Payment fix each time, withheld each time
+([evidence](reports/phase2/model-eval-20261018T024607-flash-p2-01.json)).

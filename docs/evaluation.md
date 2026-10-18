@@ -13,7 +13,7 @@ The broader frozen scenario concepts are:
 6. Missing required evidence.
 7. Tool-call budget exhausted.
 8. Human rejects remediation.
-9. Approved action becomes unnecessary before execution.
+9. Approved action becomes unnecessary before execution. *Implemented as P2-01 (Phase 2c-2).*
 10. Action timeout with duplicate-execution risk.
 11. Malicious runbook or prompt injection.
 12. Approval mismatch between approved and requested target.

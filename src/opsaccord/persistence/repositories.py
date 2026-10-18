@@ -1080,6 +1080,45 @@ def finish_action(
     return action
 
 
+def withhold_action(session: Session, *, action_id: str, reason: str) -> Action | None:
+    """Cancel an approved action that is no longer needed, if and only if it is still APPROVED.
+
+    The update is conditional on the status, so it can never race a dispatch: an action a
+    worker has already claimed (DISPATCHING or later) is not touched, and the caller gets
+    ``None`` and must not report it as withheld. ``completed_at`` is stamped, which is the
+    instant later verification evidence has to be fresh against.
+    """
+    now = utcnow()
+    updated = session.execute(
+        sa.update(ActionRow)
+        .where(ActionRow.id == action_id, ActionRow.status == ActionStatus.APPROVED)
+        .values(
+            status=ActionStatus.CANCELLED,
+            error=reason,
+            external_outcome=ActionOutcome.CONFIRMED_NOT_APPLIED,
+            completed_at=now,
+            updated_at=now,
+        )
+    )
+    session.flush()
+    if updated.rowcount != 1:  # type: ignore[attr-defined]
+        return None
+    action = get_action(session, action_id)
+    assert action is not None
+    audit(
+        session,
+        actor="controller",
+        actor_type=ActorType.SYSTEM,
+        event_type="action.withheld",
+        incident_id=action.incident_id,
+        workflow_id=action.workflow_id,
+        subject_type="action",
+        subject_id=action_id,
+        payload={"reason": reason[:400]},
+    )
+    return action
+
+
 def mark_action_uncertain(session: Session, *, action_id: str, reason: str) -> Action:
     return finish_action(
         session,

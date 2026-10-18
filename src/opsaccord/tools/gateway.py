@@ -147,6 +147,15 @@ class ActionExecution:
 
 
 @dataclass(frozen=True)
+class NeedCheck:
+    """Whether an approved action is still needed, decided just before dispatch."""
+
+    recovered: bool
+    detail: str
+    evidence_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class _VerificationRound:
     """One round of fresh verification reads, and what it established."""
 
@@ -901,6 +910,80 @@ class ToolGateway:
             health=health,
             metrics_ok=metrics_ok,
             dependency=dependency,
+        )
+
+    def assess_need(self, *, incident_id: str, workflow_id: str, target: str) -> NeedCheck:
+        """Has the target recovered on its own while its fix waited for approval?
+
+        Two reads, charged as verification: the target's health probe and, where the
+        target sits behind an allow-listed edge, the caller's own calls to it, which is
+        the path the incident was diagnosed on. Only a *proven* recovery returns
+        ``recovered=True``. Anything else, a failing or unproven path, a failed read or a
+        refused one, returns False, and the human's approval stands. A recovered verdict
+        here never resolves anything by itself: the full verification still has to
+        confirm it.
+        """
+        evidence: list[str] = []
+        try:
+            health = self.read(
+                incident_id=incident_id,
+                workflow_id=workflow_id,
+                tool_name="read_service_health",
+                arguments={"target": target},
+                target=target,
+                budget_class="verification",
+            )
+        except (repo.BudgetExhausted, PolicyBlocked) as exc:
+            return NeedCheck(False, f"need check could not read {target}: {exc}")
+        evidence.append(health.evidence_id)
+        value = health.result.value
+        if not (health.result.succeeded and bool(value.get("healthy"))):
+            return NeedCheck(
+                False,
+                f"{target} still needs the fix: health={value.get('health')} "
+                f"error_rate={value.get('error_rate')}",
+                tuple(evidence),
+            )
+        callers = dependency_callers(target)
+        if callers:
+            caller = callers[0]
+            try:
+                edge = self.read(
+                    incident_id=incident_id,
+                    workflow_id=workflow_id,
+                    tool_name="read_dependency",
+                    arguments={
+                        "target": caller,
+                        "dependency": target,
+                        "window_seconds": self.settings.verification_window_seconds,
+                    },
+                    target=caller,
+                    budget_class="verification",
+                )
+            except (repo.BudgetExhausted, PolicyBlocked) as exc:
+                return NeedCheck(
+                    False, f"need check could not read {caller} -> {target}: {exc}", tuple(evidence)
+                )
+            evidence.append(edge.evidence_id)
+            if not edge.result.succeeded:
+                return NeedCheck(
+                    False,
+                    f"{caller} -> {target} could not be read ({edge.result.error})",
+                    tuple(evidence),
+                )
+            verdict = classify_dependency_edge(edge.result.value)
+            if not verdict.healthy:
+                return NeedCheck(
+                    False,
+                    f"{caller} -> {target} is not proven recovered: {verdict.detail}",
+                    tuple(evidence),
+                )
+        return NeedCheck(
+            True,
+            f"{target} recovered while the fix waited for approval: health="
+            f"{value.get('health')} error_rate={value.get('error_rate')}"
+            + (f"; {callers[0]} -> {target} calls are succeeding" if callers else ""),
+            tuple(evidence),
         )
 
     def verify_service(
