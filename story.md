@@ -414,3 +414,25 @@ approval that came instantly would test nothing. Waiting models the realistic ca
 approval that took a few minutes, and gives the need check a fair chance to see the
 recovery. If recovery never shows within 300 s, the harness reports it and lets the
 scenario fail on its own expectation, rather than retrying until green.
+
+## 2026-10-18 - A stale flag cache, and a verification that refused to be fooled
+
+**What happened:** the first eight-path run measured 2/8. After P1-01 turned the Payment
+fault flag off, *checkout kept behaving as if it were on*, for the rest of the run. Its
+flag client caches values and hears about changes over an event stream, and that stream
+had broken. The flag store said `off` and the service did `on`.
+
+**The good part:** P1-01's fix was "confirmed applied", yet OpsAccord's verification read
+checkout's own calls, saw them still failing, and **refused to mark the incident
+resolved**. Verifying on the affected path, rather than trusting a successful write, is
+the Phase 1 design decision this paid off.
+
+**Decision:** add a startup check that refuses to run if checkout's calls to payment are
+failing while every fault flag is off. The cure is to restart checkout, which reloads
+its flags. *Why not have the harness restart it automatically:* the same reason as the
+catalog. A harness that silently repairs the demo hides the very states worth knowing
+about, so it refuses and says what to run.
+
+**Pattern so far:** each new failure of the demo has been caught first by a control
+doing its job (verification, the storefront check), and then made cheaper by a startup
+check that refuses in seconds instead of minutes.

@@ -318,6 +318,11 @@ def test_the_cli_refuses_a_storefront_that_cannot_reach_the_catalog(
     )
     monkeypatch.setattr(
         cli,
+        "payment_path_preflight",
+        lambda env, **kw: {"healthy": True, "detail": "checkout -> payment: healthy"},
+    )
+    monkeypatch.setattr(
+        cli,
         "storefront_preflight",
         lambda env, **kw: {
             "healthy": False,
@@ -347,6 +352,11 @@ def test_the_cli_passes_the_driver_unless_it_is_switched_off(
             "missing_verified_flags": [],
             "prometheus_series": 300,
         },
+    )
+    monkeypatch.setattr(
+        cli,
+        "payment_path_preflight",
+        lambda env, **kw: {"healthy": True, "detail": "checkout -> payment: healthy"},
     )
     monkeypatch.setattr(
         cli,

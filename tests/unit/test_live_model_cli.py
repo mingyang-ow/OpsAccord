@@ -24,6 +24,11 @@ def _stub_preflights(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     )
     monkeypatch.setattr(
         cli,
+        "payment_path_preflight",
+        lambda env, **kw: {"healthy": True, "detail": "checkout -> payment: healthy"},
+    )
+    monkeypatch.setattr(
+        cli,
         "storefront_preflight",
         lambda env, **kw: {
             "healthy": True,

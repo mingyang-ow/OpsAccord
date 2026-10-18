@@ -1704,6 +1704,46 @@ STOREFRONT_ERROR_SHARE_LIMIT = 0.5
 STOREFRONT_WINDOW = "5m"
 
 
+def payment_path_preflight(
+    environment: Environment, *, timeout_seconds: float = 8.0
+) -> dict[str, Any]:
+    """Refuse a stack whose checkout -> payment path fails while every fault flag is off.
+
+    Found on 2026-10-18: after P1-01 turned ``paymentUnreachable`` off, checkout kept
+    failing every Charge without reaching payment. Its flagd provider caches flag values
+    and learns of changes through an event stream; with the stream broken, the cache kept
+    the old "on". The flag store read ``off`` throughout, so the baseline check passed,
+    and five later paths each waited out their traffic budget for orders that could never
+    reach payment.
+
+    So this reads the caller's own view of the edge over the verification window. With
+    every fault flag already confirmed safe, a *failing* edge means the demo is not in
+    the state its flags say. ``healthy`` is None when there were no calls to judge.
+    """
+    live = _as_live(environment)
+    edge = live.read_dependency(
+        target="checkout-service",
+        dependency="payment-service",
+        window_seconds=LIVE_VERIFICATION_WINDOW_SECONDS,
+        timeout_seconds=timeout_seconds,
+    )
+    if not edge.succeeded:
+        return {"healthy": None, "detail": f"checkout -> payment could not be read ({edge.error})"}
+    verdict = classify_dependency_edge(edge.value)
+    if verdict.failing:
+        return {
+            "healthy": False,
+            "detail": (
+                f"checkout -> payment is failing with every fault flag off ({verdict.detail}); "
+                "checkout is acting on a stale flag value"
+            ),
+        }
+    return {
+        "healthy": True if verdict.healthy else None,
+        "detail": f"checkout -> payment: {verdict.detail}",
+    }
+
+
 def _fetch_status(url: str, timeout_seconds: float) -> int:
     """One bounded GET; the HTTP status, or an exception on timeout or transport failure."""
     import httpx
@@ -2180,6 +2220,7 @@ __all__ = [
     "checkout_driver_factory",
     "detect_residual_faults",
     "live_settings",
+    "payment_path_preflight",
     "preflight",
     "reset_fault_flags",
     "restore_owned_fault",

@@ -245,3 +245,25 @@ were extended to `product-catalog` and `astronomy-db`. Evidence:
 found the read-as-action defect in the first paid simulated run (`6c2dcd1`). This time the
 fix that defect prompted refused it at validation, before policy and before any
 dispatch.
+
+### First eight-path run (`05bed75`): checkout's flag cache went stale, 2/8
+
+[Evidence](phase2/live-scenarios-20261018T070609-stale-flag-cache.json). Nothing unsafe
+happened, and the model made 3 calls for $0.004.
+
+- **What went wrong:** after P1-01 turned `paymentUnreachable` off, checkout kept failing
+  every `Charge` without reaching payment. That went on for the rest of the run and was
+  still happening afterwards (2.78 errors/min, 0 successes), with every flag reading
+  `off`. Checkout's `flagd.NewProvider()` caches flag values and relies on an event
+  stream to hear about changes, and `flagd` event-stream errors were present. The cache
+  kept the old value.
+- **The controls held.** In P1-01 the fix was confirmed applied, the flag really was off,
+  but verification on checkout's own calls saw the path still failing and recorded
+  `VERIFICATION_FAILURE`. **The incident was not marked resolved.** A system that
+  treated a successful write as recovery would have reported a false fix.
+- **The harness missed it.** Five paths (P1-03, P1-05, P1-06, P1-07, P2-01) each waited out
+  the 300 s traffic budget for orders that could never reach payment.
+
+**Fix:** `payment_path_preflight` reads checkout's own calls to payment before any
+scenario. If they are failing while every fault flag is confirmed off, the run is refused
+(exit 2), with `scripts/demo.sh restart checkout` as the recovery.
