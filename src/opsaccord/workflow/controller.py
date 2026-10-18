@@ -665,8 +665,30 @@ class WorkflowController:
                 event_type="workflow.actioning",
                 payload={"action_id": action_id},
             )
-        execution = self.gateway.execute_action(action_id=action_id)
         notes = list(state.get("notes", []))
+        with self.db.session() as session:
+            pending = repo.get_action(session, action_id)
+            workflow = repo.get_workflow(session, incident_id)
+            assert pending is not None and workflow is not None
+            waited_for_a_human = pending.approval_id is not None
+        if waited_for_a_human:
+            # Approval takes time, and a fault can clear while the fix waits. Running a
+            # change that is no longer needed is a side effect with no purpose, so the
+            # need is re-checked here. Only a proven recovery withholds the action; an
+            # unproven one leaves the human's approval standing.
+            need = self.gateway.assess_need(
+                incident_id=incident_id, workflow_id=workflow.id, target=pending.target
+            )
+            if need.recovered:
+                with self.db.session() as session:
+                    withheld = repo.withhold_action(
+                        session, action_id=action_id, reason=f"no longer needed: {need.detail}"
+                    )
+                if withheld is not None:
+                    notes.append(f"withheld: {need.detail}")
+                    return {"notes": notes}
+            notes.append(f"need check: {need.detail}")
+        execution = self.gateway.execute_action(action_id=action_id)
         notes.append(f"execute: {execution.detail}")
         if execution.action.status is ActionStatus.UNCERTAIN:
             reconciled = self.gateway.reconcile_action(action_id=action_id)

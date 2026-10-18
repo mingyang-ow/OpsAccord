@@ -161,6 +161,15 @@ def run_scenario(
     outcome = controller.run(incident_id)
     notes.extend(outcome.notes)
 
+    if spec.fault_clears_while_pending and outcome.approval_id:
+        target, flag_id = spec.fault_clears_while_pending
+        clear = getattr(environment, "clear_fault_externally", None)
+        if clear is not None:
+            clear(target=target, flag_id=flag_id)
+            notes.append(
+                f"external: {flag_id} on {target} was cleared while the fix awaited approval"
+            )
+
     decision = spec.human_decision
     if approve is not None and decision is not None:
         decision = ApprovalDecision.APPROVED if approve else ApprovalDecision.REJECTED
@@ -270,6 +279,17 @@ def evaluate(trace: ScenarioTrace) -> tuple[ScenarioOutcome, list[str]]:
         v.outcome is VerificationOutcome.VERIFICATION_FAILURE for v in trace.verifications
     ):
         failures.append("expected a recorded verification failure")
+
+    if spec.expect_action_withheld:
+        withheld = [
+            a
+            for a in trace.actions
+            if a.status is ActionStatus.CANCELLED
+            and a.external_outcome is ActionOutcome.CONFIRMED_NOT_APPLIED
+            and a.dispatch_started_at is None
+        ]
+        if not withheld:
+            failures.append("expected the approved action to be withheld as no longer needed")
 
     if spec.expect_collection_error and not any(
         e.kind.value == "COLLECTION_ERROR" for e in trace.evidence
