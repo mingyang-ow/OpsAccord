@@ -494,3 +494,14 @@ runs, with a correct description of the evidence. The human approved and it ran.
 *not* add a rule tying the fix to the fault signature: that would move diagnosis into
 policy on the strength of two runs. It is recorded as the limit of human approval, and a
 candidate for later.
+
+## 2026-10-18 - The README and write-up updated for Phase 2
+
+**Decision:** the README leads with the Phase 2 headline (a real model deciding live, 8/8)
+and the safety holes it exposed, and it states the model's failures as plainly as its
+successes. *Why:* the point of the project is to show judgment about safety, and hiding
+the 2-of-6 wrong-flag result would undercut exactly that. A one-page
+[Phase 2 summary](docs/reports/phase2-summary.md) sits beside the Phase 1 one.
+
+**On keys:** the README tells readers to bring their own provider key. The repository has
+never contained one, and a history audit confirmed it.
