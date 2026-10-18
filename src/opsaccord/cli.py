@@ -23,6 +23,7 @@ from opsaccord.scenarios.live import (
     LiveProgress,
     checkout_driver_factory,
     live_settings,
+    payment_path_preflight,
     preflight,
     run_live_suite,
     storefront_preflight,
@@ -199,6 +200,22 @@ def cmd_run_live_scenarios(args: argparse.Namespace) -> int:
         print(
             "recover it with: bash scripts/demo.sh restart product-catalog checkout && "
             "bash scripts/demo.sh verify-recovery product-catalog checkout"
+        )
+        return 2
+    try:
+        payment_path = payment_path_preflight(LiveEnvironment(settings=settings))
+    except Exception as exc:
+        print(f"live preflight FAILED reading checkout -> payment: {exc}")
+        return 2
+    print(f"# payment-path preflight: {payment_path['detail']}")
+    if payment_path["healthy"] is False:
+        print(
+            "live preflight REFUSED: the payment path is failing with every fault flag off, "
+            "so no Payment path could be measured"
+        )
+        print(
+            "recover it with: bash scripts/demo.sh restart checkout && "
+            "bash scripts/demo.sh verify-recovery checkout"
         )
         return 2
     driver_factory = None if args.no_checkout_driver else checkout_driver_factory(settings)

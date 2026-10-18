@@ -54,7 +54,12 @@ from opsaccord.scenarios.live_evidence import (
 from opsaccord.scenarios.model_eval import decision_summary
 from opsaccord.scenarios.runner import ScenarioTrace, evaluate, run_scenario
 from opsaccord.scenarios.traffic import CheckoutDriver, describe, storefront_origin
-from opsaccord.tools.contracts import TELEMETRY_ERROR_BOUND, Environment
+from opsaccord.tools.contracts import (
+    TELEMETRY_ERROR_BOUND,
+    Environment,
+    classify_dependency_edge,
+    dependency_callers,
+)
 from opsaccord.tools.live_environment import (
     CALLS_METRIC_CANDIDATES,
     FLAG_SAFE_VARIANT,
@@ -85,6 +90,10 @@ UNROUTABLE_HOST = "http://10.255.255.1"
 # flagd is not visible in Prometheus for a minute or two. Waiting for it is the
 # difference between measuring the scenario and measuring the previous one.
 FAULT_VISIBILITY_TIMEOUT_SECONDS = 420
+# P2-01: how long the harness waits, after clearing the fault behind a pending approval,
+# for recovery to be observable on the caller's path. The verification window is 120 s,
+# so the failures need that long to age out of it, plus export cadence.
+EXTERNAL_RECOVERY_TIMEOUT_SECONDS = 300
 FAULT_VISIBILITY_POLL_SECONDS = 20
 
 # Window for the caller-side dependency reading the payment premise requires. The
@@ -337,6 +346,18 @@ LIVE_PLANS: dict[str, LivePlan] = {
         corroborating_dependency="checkout-service",
         drive_checkout=True,
     ),
+    "P2-01": LivePlan(
+        scenario_id="P2-01",
+        setup=(
+            "flagd-ui: paymentUnreachable=on; cleared by the harness while the approval is "
+            "pending, then approved"
+        ),
+        fault_flag="paymentUnreachable",
+        induced_failure="fault_cleared_while_pending",
+        corroborating_target="checkout-service",
+        corroborating_dependency="checkout-service",
+        drive_checkout=True,
+    ),
     "P1-07": LivePlan(
         scenario_id="P1-07",
         setup="flagd-ui: paymentUnreachable=on; the fault is re-armed right after dispatch",
@@ -385,6 +406,84 @@ class FaultRearmingEnvironment:
             )
             self.rearmed = True
         return result
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._environment, name)
+
+
+class ExternalRecoveryEnvironment:
+    """Live surface on which the fault is fixed by someone else while a fix awaits approval.
+
+    Harness for ``P2-01``. ``clear_fault_externally`` turns the fault flag off, as an
+    operator outside OpsAccord would, and reads it back. It then waits, bounded, until
+    the caller's own calls to the target are observably succeeding again over the
+    verification window, so the approval that follows comes after a realistic delay.
+    It is not an action: it writes no ledger row, and the incident must find out from
+    fresh evidence that its approved fix is no longer needed.
+
+    If recovery never becomes observable inside the bound, it returns anyway. The need
+    check then cannot prove recovery, the approved fix runs, and the scenario fails on
+    its own expectation, which is the honest outcome.
+    """
+
+    is_simulated = False
+
+    def __init__(
+        self,
+        *,
+        environment: LiveEnvironment,
+        timeout_seconds: float = EXTERNAL_RECOVERY_TIMEOUT_SECONDS,
+        poll_seconds: float = FAULT_VISIBILITY_POLL_SECONDS,
+        progress: LiveProgress | None = None,
+    ) -> None:
+        self._environment = environment
+        self._timeout_seconds = timeout_seconds
+        self._poll_seconds = poll_seconds
+        self._progress = progress
+        self.cleared: dict[str, Any] | None = None
+
+    @property
+    def revision(self) -> str:
+        return self._environment.revision
+
+    @property
+    def revision_source(self) -> str:
+        return self._environment.revision_source
+
+    def _say(self, message: str) -> None:
+        if self._progress is not None:
+            self._progress.observation(message)
+
+    def clear_fault_externally(self, *, target: str, flag_id: str) -> None:
+        self._environment.set_flag_variant(
+            flag_id=flag_id,
+            variant=FLAG_SAFE_VARIANT[flag_id],
+            timeout_seconds=FAULT_WRITE_TIMEOUT_SECONDS,
+        )
+        self._say(f"external: {flag_id} cleared outside OpsAccord while the fix awaits approval")
+        callers = dependency_callers(target)
+        deadline = time.monotonic() + self._timeout_seconds
+        verdict = None
+        while callers and time.monotonic() < deadline:
+            edge = self._environment.read_dependency(
+                target=callers[0],
+                dependency=target,
+                window_seconds=LIVE_VERIFICATION_WINDOW_SECONDS,
+                timeout_seconds=8.0,
+            )
+            verdict = classify_dependency_edge(edge.value) if edge.succeeded else None
+            self._say(
+                f"external: waiting for {callers[0]} -> {target} to recover: "
+                + (verdict.detail if verdict is not None else f"read failed ({edge.error})")
+            )
+            if verdict is not None and verdict.healthy:
+                break
+            time.sleep(self._poll_seconds)
+        self.cleared = {
+            "flag_id": flag_id,
+            "target": target,
+            "recovered_before_decision": bool(verdict is not None and verdict.healthy),
+        }
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._environment, name)
@@ -675,7 +774,56 @@ def _fault_is_new(signal: str, probe: dict[str, Any], baseline: dict[str, Any] |
     previous = _reading(baseline.get(key))
     if current is None or previous is None:
         return False
-    return current > previous
+    # A rise has to be a rise. On 2026-10-18, P2-01 accepted 0.5714285714285714 over a
+    # pre-injection 0.5714285714285712: floating-point noise on the previous path's
+    # failures, still inside the window. The margin is the bound a reading must clear to
+    # count as a fault at all.
+    return current > previous + RISE_MARGIN.get(key, TELEMETRY_ERROR_BOUND)
+
+
+#: The smallest rise that counts as the armed fault appearing, per signal.
+RISE_MARGIN: dict[str, float] = {"error_rate": TELEMETRY_ERROR_BOUND, "cpu_utilization": 0.10}
+
+
+def wait_for_clean_edge(
+    environment: Environment,
+    *,
+    caller: str,
+    callee: str,
+    window_seconds: int,
+    timeout_seconds: float,
+    poll_seconds: float,
+    observe: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Block until the caller's calls to the callee are not failing, before arming.
+
+    Consecutive Payment paths share one edge and one telemetry window. A path that ends
+    with the fault armed (P1-07 does, by design) leaves failures in the window for the
+    next one, which would otherwise inherit them as its own premise and diagnosis. So a
+    dependency plan arms only once that tail has aged out: the edge must not be *failing*.
+    A window with no calls, or an unattributable one, carries no tail to inherit; whether
+    the armed fault then appears is the fault-visibility stage's question.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        edge = environment.read_dependency(
+            target=caller, dependency=callee, window_seconds=window_seconds, timeout_seconds=8.0
+        )
+        last = _dependency_snapshot(edge.value) if edge.succeeded else {"error": edge.error}
+        verdict = classify_dependency_edge(edge.value) if edge.succeeded else None
+        if verdict is not None and not verdict.failing:
+            return last
+        if observe is not None:
+            observe(
+                f"{caller} -> {callee}: waiting for the previous path's failures to age out "
+                f"({verdict.detail if verdict else last})"
+            )
+        time.sleep(poll_seconds)
+    raise LiveSetupFailed(
+        f"{caller} -> {callee} still carried failures after {timeout_seconds}s, so this "
+        f"path's fault could not be told apart from the previous one's; last read: {last}"
+    )
 
 
 def _health_snapshot(value: dict[str, Any]) -> dict[str, Any]:
@@ -897,6 +1045,9 @@ def build_live_environment(
 
     if plan.induced_failure == "control_plane_timeout":
         return _ControlPlaneTimeoutEnvironment(environment)
+
+    if plan.induced_failure == "fault_cleared_while_pending":
+        return ExternalRecoveryEnvironment(environment=environment)
 
     if plan.induced_failure == "fault_rearmed_after_dispatch":
         assert plan.fault_flag is not None
@@ -1121,6 +1272,9 @@ def run_live_scenario(
     reporter = progress or LiveProgress()
     budget = _ScenarioBudget(budget_seconds)
     environment = build_live_environment(plan, settings)
+    if isinstance(environment, ExternalRecoveryEnvironment):
+        # Its bounded wait for recovery is part of this scenario's progress.
+        environment._progress = reporter
     fault = _ScenarioFault(
         flag_id=plan.fault_flag,
         armed_variant=FAULT_VARIANTS.get(plan.fault_flag) if plan.fault_flag else None,
@@ -1180,6 +1334,27 @@ def run_live_scenario(
                     _traffic_observation(spec.service, probe)
                 ),
             )
+
+            if plan.corroborating_dependency is not None:
+                stage = "baseline-settle"
+                settle_budget = budget.clamp(TRAFFIC_VISIBILITY_TIMEOUT_SECONDS)
+                reporter.enter_stage(
+                    stage,
+                    budget_seconds=settle_budget,
+                    message=(
+                        f"waiting for {plan.corroborating_dependency} -> {spec.service} to "
+                        "carry no failures before arming"
+                    ),
+                )
+                wait_for_clean_edge(
+                    environment,
+                    caller=plan.corroborating_dependency,
+                    callee=spec.service,
+                    window_seconds=DEPENDENCY_PREMISE_WINDOW_SECONDS,
+                    timeout_seconds=settle_budget,
+                    poll_seconds=poll_seconds,
+                    observe=reporter.observation,
+                )
 
             stage = "fault-injection"
             reporter.enter_stage(
@@ -1597,6 +1772,46 @@ def checkout_driver_factory(settings: Settings) -> CheckoutDriverFactory:
 #: so a Payment path would be starved of the traffic its premise needs.
 STOREFRONT_ERROR_SHARE_LIMIT = 0.5
 STOREFRONT_WINDOW = "5m"
+
+
+def payment_path_preflight(
+    environment: Environment, *, timeout_seconds: float = 8.0
+) -> dict[str, Any]:
+    """Refuse a stack whose checkout -> payment path fails while every fault flag is off.
+
+    Found on 2026-10-18: after P1-01 turned ``paymentUnreachable`` off, checkout kept
+    failing every Charge without reaching payment. Its flagd provider caches flag values
+    and learns of changes through an event stream; with the stream broken, the cache kept
+    the old "on". The flag store read ``off`` throughout, so the baseline check passed,
+    and five later paths each waited out their traffic budget for orders that could never
+    reach payment.
+
+    So this reads the caller's own view of the edge over the verification window. With
+    every fault flag already confirmed safe, a *failing* edge means the demo is not in
+    the state its flags say. ``healthy`` is None when there were no calls to judge.
+    """
+    live = _as_live(environment)
+    edge = live.read_dependency(
+        target="checkout-service",
+        dependency="payment-service",
+        window_seconds=LIVE_VERIFICATION_WINDOW_SECONDS,
+        timeout_seconds=timeout_seconds,
+    )
+    if not edge.succeeded:
+        return {"healthy": None, "detail": f"checkout -> payment could not be read ({edge.error})"}
+    verdict = classify_dependency_edge(edge.value)
+    if verdict.failing:
+        return {
+            "healthy": False,
+            "detail": (
+                f"checkout -> payment is failing with every fault flag off ({verdict.detail}); "
+                "checkout is acting on a stale flag value"
+            ),
+        }
+    return {
+        "healthy": True if verdict.healthy else None,
+        "detail": f"checkout -> payment: {verdict.detail}",
+    }
 
 
 def _fetch_status(url: str, timeout_seconds: float) -> int:
@@ -2075,6 +2290,7 @@ __all__ = [
     "checkout_driver_factory",
     "detect_residual_faults",
     "live_settings",
+    "payment_path_preflight",
     "preflight",
     "reset_fault_flags",
     "restore_owned_fault",

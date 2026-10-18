@@ -111,3 +111,19 @@ dependency read where an edge applies. Only a proven recovery returns `recovered
 **Results:** deterministic 3/3 PASS. `deepseek-flash` 3/3 PASS for $0.004, proposing the
 Payment fix each time, withheld each time
 ([evidence](reports/phase2/model-eval-20261018T024607-flash-p2-01.json)).
+
+### P2-01 on the live stack
+
+`LIVE_PLANS["P2-01"]` arms `paymentUnreachable` like P1-01. Its environment is an
+`ExternalRecoveryEnvironment`. While the fix waits for approval, the scenario runner calls
+`clear_fault_externally`, which:
+
+1. turns the flag off and reads it back, as an operator outside OpsAccord would;
+2. waits, bounded at 300 s, until checkout's own calls to payment are observably
+   succeeding over the 120 s verification window;
+3. only then lets the human's approval through.
+
+The incident must then discover from fresh evidence that its fix is no longer needed. If
+recovery never becomes observable inside the bound, the harness says so and returns; the
+need check cannot prove recovery, the fix runs, and the scenario fails honestly. A full
+live run now covers **eight** paths (P1-01..P1-07 and P2-01).

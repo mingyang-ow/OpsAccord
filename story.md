@@ -403,3 +403,66 @@ deterministic adapter and `deepseek-flash` both pass 3/3.
 
 **Not yet done:** P2-01 on the live stack. The live runner approves immediately, so it
 needs a way to clear the flag while the approval is pending.
+
+## 2026-10-18 - P2-01 merged (`phase2c2`), and built for the live stack
+
+**Design decision for the live version:** the harness, not the incident, clears the fault.
+It turns the flag off, then *waits until recovery is visible on checkout's own calls to
+payment* before releasing the human's approval. *Why wait:* the verification window
+spans 120 s, so straight after the flag goes off the window still contains failures. An
+approval that came instantly would test nothing. Waiting models the realistic case, an
+approval that took a few minutes, and gives the need check a fair chance to see the
+recovery. If recovery never shows within 300 s, the harness reports it and lets the
+scenario fail on its own expectation, rather than retrying until green.
+
+## 2026-10-18 - A stale flag cache, and a verification that refused to be fooled
+
+**What happened:** the first eight-path run measured 2/8. After P1-01 turned the Payment
+fault flag off, *checkout kept behaving as if it were on*, for the rest of the run. Its
+flag client caches values and hears about changes over an event stream, and that stream
+had broken. The flag store said `off` and the service did `on`.
+
+**The good part:** P1-01's fix was "confirmed applied", yet OpsAccord's verification read
+checkout's own calls, saw them still failing, and **refused to mark the incident
+resolved**. Verifying on the affected path, rather than trusting a successful write, is
+the Phase 1 design decision this paid off.
+
+**Decision:** add a startup check that refuses to run if checkout's calls to payment are
+failing while every fault flag is off. The cure is to restart checkout, which reloads
+its flags. *Why not have the harness restart it automatically:* the same reason as the
+catalog. A harness that silently repairs the demo hides the very states worth knowing
+about, so it refuses and says what to run.
+
+**Pattern so far:** each new failure of the demo has been caught first by a control
+doing its job (verification, the storefront check), and then made cheaper by a startup
+check that refuses in seconds instead of minutes.
+
+## 2026-10-18 - 8/8 live, and a premise that wasn't P2-01's own
+
+**Result:** after restarting checkout, all eight live paths passed with the model
+deciding, and P2-01 withheld its fix and resolved on verification.
+
+**But I checked the premise, and it didn't hold up.** P2-01's "the fault is now visible"
+check had accepted a failure rate of 0.5714285714285714 over a *before* reading of
+0.5714285714285712. That is a rounding difference, on failures left over from P1-07.
+Our own "a premise must be a rise, not a level" rule had a hole: any increase at all
+counted, including noise.
+
+**Decisions:**
+
+- **A rise must clear a real margin** (5% for error rates, 0.10 for CPU).
+- **Payment paths start from a clean edge:** wait until the previous path's tail has aged
+  out of the window before arming, and refuse if it never does.
+
+*Why not just accept the 8/8:* a pass whose premise came from a different scenario is not
+evidence for that scenario. Reporting it as clean would be exactly the "telemetry the
+write had not caused" mistake Phase 1 recorded.
+
+## 2026-10-18 - P2-01 proven live, on its own fault
+
+**Result:** 8/8 live with clean premises. Every Payment path armed on a fault-free edge
+and saw its own rise. P2-01 withheld its approved fix and resolved on verified recovery,
+with 0 actions executed. The clean-edge wait visibly mattered: P1-06 had to wait out
+P1-05's tail.
+
+**Spend so far:** about $1.45 of the $3 cap.

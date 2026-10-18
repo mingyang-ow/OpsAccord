@@ -67,7 +67,7 @@ while [ $# -gt 0 ]; do
 done
 
 # A scenario selection only means something for the live stage; refusing here is
-# better than silently running all seven paths.
+# better than silently running every live path.
 if [ "${#SCENARIO_IDS[@]}" -gt 0 ] && [ "$MODE" != "live" ]; then
   printf 'refusing to run: --scenario needs --live\n' >&2
   usage
@@ -185,7 +185,7 @@ if [ "$MODE" = "live" ]; then
   if [ "${#SCENARIO_IDS[@]}" -gt 0 ]; then
     LIVE_SELECTION="focused run: ${SCENARIO_IDS[*]}"
   else
-    LIVE_SELECTION="seven paths against the pinned stack"
+    LIVE_SELECTION="every live path against the pinned stack"
   fi
   say "13-live-paths ($LIVE_SELECTION)"
   SCENARIO_ARGS=()

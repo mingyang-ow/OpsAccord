@@ -53,6 +53,11 @@ def _prepare(monkeypatch: pytest.MonkeyPatch, stack: FakeStack, controller: Any 
     )
     monkeypatch.setattr(
         cli,
+        "payment_path_preflight",
+        lambda env, **kw: {"healthy": True, "detail": "checkout -> payment: healthy"},
+    )
+    monkeypatch.setattr(
+        cli,
         "storefront_preflight",
         lambda environment, **kwargs: {
             "healthy": True,

@@ -186,7 +186,7 @@ def _factory(log: list[str]) -> Any:
 
 def test_only_the_payment_plans_drive_checkout() -> None:
     driven = sorted(sid for sid, plan in live_scenarios.LIVE_PLANS.items() if plan.drive_checkout)
-    assert driven == ["P1-01", "P1-05", "P1-06", "P1-07"]
+    assert driven == ["P1-01", "P1-05", "P1-06", "P1-07", "P2-01"]
 
 
 def test_a_payment_plan_starts_and_stops_the_driver_and_records_it(
@@ -318,6 +318,11 @@ def test_the_cli_refuses_a_storefront_that_cannot_reach_the_catalog(
     )
     monkeypatch.setattr(
         cli,
+        "payment_path_preflight",
+        lambda env, **kw: {"healthy": True, "detail": "checkout -> payment: healthy"},
+    )
+    monkeypatch.setattr(
+        cli,
         "storefront_preflight",
         lambda env, **kw: {
             "healthy": False,
@@ -347,6 +352,11 @@ def test_the_cli_passes_the_driver_unless_it_is_switched_off(
             "missing_verified_flags": [],
             "prometheus_series": 300,
         },
+    )
+    monkeypatch.setattr(
+        cli,
+        "payment_path_preflight",
+        lambda env, **kw: {"healthy": True, "detail": "checkout -> payment: healthy"},
     )
     monkeypatch.setattr(
         cli,
