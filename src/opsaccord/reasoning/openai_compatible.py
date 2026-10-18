@@ -52,6 +52,11 @@ SYSTEM_PROMPT = (
 )
 
 
+#: The default prompt cap. Bytes bound tokens from above, so this is also the
+#: input-token ceiling a run budget reserves against.
+DEFAULT_MAX_INPUT_BYTES = 32_000
+
+
 class PaidModelCallsDisabled(RuntimeError):
     pass
 
@@ -272,6 +277,7 @@ class OpenAICompatibleAdapter:
 
 
 __all__ = [
+    "DEFAULT_MAX_INPUT_BYTES",
     "SYSTEM_PROMPT",
     "MalformedModelOutput",
     "OpenAICompatibleAdapter",

@@ -128,6 +128,9 @@ uv run python -m opsaccord.cli eval-model --model deepseek-flash --allow-paid-ca
 ```
 
 `OPSACCORD_MODEL_BASE_URL` and `OPSACCORD_MODEL_API_KEY_ENV` point it at another provider.
+The API server applies the same rule: it refuses to start with a hosted model unless
+`OPSACCORD_MODEL_BUDGET_USD` and the two per-token rates are set, and `/healthz` reports
+the spend so far.
 The live runner takes the same flags (`scripts/validate.sh --live --model ...`). The live
 demo setup is in [docs/development.md](docs/development.md) and
 [docs/astronomy-shop.md](docs/astronomy-shop.md).

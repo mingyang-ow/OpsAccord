@@ -1,0 +1,52 @@
+{
+  "flag": "paymentUnreachable",
+  "scenario": "startup-race",
+  "started_at": "2026-10-18T13:31:12.287967+00:00",
+  "control": {
+    "while_on": [
+      "http_500",
+      "http_500",
+      "http_500"
+    ],
+    "after_off": [
+      "ok",
+      "ok",
+      "ok"
+    ],
+    "follows_on": true,
+    "follows_off": true,
+    "follows": true
+  },
+  "after_flagd_restart": {
+    "while_on": [
+      "http_500",
+      "http_500",
+      "http_500"
+    ],
+    "after_off": [
+      "http_500",
+      "http_500",
+      "http_500"
+    ],
+    "follows_on": true,
+    "follows_off": false,
+    "follows": false
+  },
+  "after_checkout_restart": {
+    "while_on": [
+      "http_500",
+      "http_500",
+      "http_500"
+    ],
+    "after_off": [
+      "ok",
+      "ok",
+      "ok"
+    ],
+    "follows_on": true,
+    "follows_off": true,
+    "follows": true
+  },
+  "cleanup_read_back": "off",
+  "verdict": "REPRODUCED: checkout follows the flag on a healthy stack, stops following it after it starts while flagd is down, and follows again once checkout restarts"
+}

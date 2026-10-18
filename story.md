@@ -506,3 +506,44 @@ the 2-of-6 wrong-flag result would undercut exactly that. A one-page
 
 **On keys:** the README tells readers to bring their own provider key. The repository has
 never contained one, and a history audit confirmed it.
+
+## 2026-10-18 - Follow-ups: the API's spending cap, a stale-flag experiment, a v4-pro live run
+
+**User decision:** do all three deferred items.
+
+- **The API gets the same hard cap as the CLI.** `serve-api` refuses to start a hosted
+  model unless paid calls are allowed, a budget is set and per-token rates are known. It
+  wraps the provider in the same `BudgetedProvider` for the server's lifetime and reports
+  the spend in `/healthz`. *Why refuse rather than warn:* a warning is easy to miss, and a
+  long-running server is the place where an unbounded bill would actually happen.
+- **The stale-flag cause gets an experiment instead of more inference.**
+  `scripts/diagnose-flag-staleness.py` runs three phases, each judged by real orders:
+  1. a control on a healthy stack;
+  2. restarting only `flagd` under a running checkout;
+  3. restarting checkout.
+
+  It names the cause if phase 2 alone breaks flag-following, and says
+  "not reproduced" if it does not.
+- **`deepseek-v4-pro` on the live stack** needed one more flag, `--model-timeout-seconds`.
+  It took about 28 s per answer in simulation, close to the 45 s default.
+
+**Results so far:**
+
+- **The API cap** is in, with tests.
+- **`deepseek-v4-pro` live: 8/8** for $0.10. One call took 62 s, which justified the new
+  timeout flag.
+- **The stale flag:** the first experiment *refuted* the leading explanation. Restarting
+  flagd under a running checkout did not break anything. *Decision:* do not keep the old
+  explanation just because it was written down. Test the remaining candidate, a checkout
+  that starts while flagd is down, with the same experiment.
+
+**The stale flag, proven.** The second experiment reproduced it. A checkout that starts
+while flagd is down still reads the first flag value, but never subscribes to updates, so
+it keeps that value until it restarts. That is exactly what happened at 07:06.
+*Decision:* document the operating rule (restart checkout once flagd is up) and keep the
+payment-path preflight as the safety net. I did not add a startup-ordering change to the
+demo's compose file: the override changes resource limits only, and keeping the pinned
+demo's behaviour intact is worth more than automating one restart.
+
+*Lesson worth keeping:* the first, plausible explanation was wrong. Writing it down as
+"likely" rather than as fact, and then testing it, is what found the real cause.

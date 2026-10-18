@@ -105,6 +105,11 @@ class Settings(BaseSettings):
     model_input_cost_per_1k_usd: float | None = None
     model_output_cost_per_1k_usd: float | None = None
     allow_paid_model_calls: bool = False
+    # A hosted provider built by the API is wrapped in a hard spending cap for the
+    # server's lifetime (opsaccord.reasoning.budget). The API refuses to start one
+    # without a budget; the CLI commands take their budget as flags instead.
+    model_budget_usd: float | None = Field(default=None, gt=0)
+    model_max_calls: int = Field(default=50, ge=1)
 
     # Budgets and limits (deterministic, persisted on the workflow row).
     soft_step_budget: int = Field(default=8, ge=1)

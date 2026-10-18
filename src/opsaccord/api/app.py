@@ -13,8 +13,18 @@ from opsaccord.domain.enums import ApprovalDecision, ConstraintKind
 from opsaccord.persistence import repositories as repo
 from opsaccord.persistence.db import Database
 from opsaccord.reasoning.base import ReasoningProvider
+from opsaccord.reasoning.budget import (
+    BudgetedProvider,
+    ModelBudgetExceeded,
+    SpendLedger,
+    TokenRates,
+)
 from opsaccord.reasoning.deterministic import DeterministicAdapter
-from opsaccord.reasoning.openai_compatible import OpenAICompatibleAdapter
+from opsaccord.reasoning.openai_compatible import (
+    DEFAULT_MAX_INPUT_BYTES,
+    OpenAICompatibleAdapter,
+    PaidModelCallsDisabled,
+)
 from opsaccord.scenarios.fixtures import build_environment_for_scenario
 from opsaccord.scenarios.runner import SCENARIOS
 from opsaccord.tools.contracts import Environment
@@ -45,19 +55,53 @@ class ConstraintRequest(BaseModel):
 
 
 def build_provider(settings: Settings) -> ReasoningProvider:
-    """Select the application runtime model from explicit configuration."""
+    """Select the application runtime model from explicit configuration.
+
+    A hosted provider is only ever returned inside a hard spending cap. The server
+    refuses to start one unless paid calls are explicitly allowed, a budget is set
+    (``OPSACCORD_MODEL_BUDGET_USD``, with ``OPSACCORD_MODEL_MAX_CALLS``) and per-token
+    rates are known, because API-driven incidents are otherwise bounded only by each
+    incident's step budget, not by money.
+    """
     if settings.model_provider == "deterministic":
         return DeterministicAdapter()
     if settings.model_provider == "openai_compatible":
-        return OpenAICompatibleAdapter(
+        if not settings.allow_paid_model_calls:
+            raise PaidModelCallsDisabled(
+                "refusing to start a hosted model provider: set "
+                "OPSACCORD_ALLOW_PAID_MODEL_CALLS=true"
+            )
+        if settings.model_budget_usd is None:
+            raise ModelBudgetExceeded(
+                "refusing to start a hosted model provider without a spending cap: set "
+                "OPSACCORD_MODEL_BUDGET_USD (and optionally OPSACCORD_MODEL_MAX_CALLS)"
+            )
+        rates = (
+            TokenRates(settings.model_input_cost_per_1k_usd, settings.model_output_cost_per_1k_usd)
+            if settings.model_input_cost_per_1k_usd is not None
+            and settings.model_output_cost_per_1k_usd is not None
+            else None
+        )
+        adapter = OpenAICompatibleAdapter(
             base_url=settings.model_base_url,
             model_id=settings.model_id,
             api_key_env=settings.model_api_key_env,
             timeout_seconds=settings.model_timeout_seconds,
             max_output_tokens=settings.model_max_output_tokens,
-            allow_paid_calls=settings.allow_paid_model_calls,
+            allow_paid_calls=True,
             input_cost_per_1k_usd=settings.model_input_cost_per_1k_usd,
             output_cost_per_1k_usd=settings.model_output_cost_per_1k_usd,
+            max_input_bytes=DEFAULT_MAX_INPUT_BYTES,
+        )
+        # Raises ModelBudgetExceeded when rates are missing: no rates, no enforceable cap.
+        return BudgetedProvider(
+            adapter,
+            ledger=SpendLedger(
+                budget_usd=settings.model_budget_usd, max_calls=settings.model_max_calls
+            ),
+            rates=rates,
+            max_input_tokens=DEFAULT_MAX_INPUT_BYTES,
+            max_output_tokens=settings.model_max_output_tokens,
         )
     raise ValueError(f"unsupported model_provider {settings.model_provider!r}")
 
@@ -102,6 +146,9 @@ def create_app(
             "model_provider": settings.model_provider,
             "model_id": settings.model_id,
             "simulated_demo": environment.is_simulated,
+            "model_spend": (
+                provider.ledger.snapshot() if isinstance(provider, BudgetedProvider) else None
+            ),
         }
 
     @app.get("/scenarios")

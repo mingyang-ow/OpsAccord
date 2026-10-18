@@ -1,0 +1,1026 @@
+{
+  "format": "opsaccord.live-evidence",
+  "format_version": 2,
+  "run": {
+    "started_at": "2026-10-18T12:58:44Z",
+    "updated_at": "2026-10-18T13:25:32Z",
+    "status": "COMPLETED",
+    "selected": [
+      "P1-01",
+      "P1-02",
+      "P1-03",
+      "P1-04",
+      "P1-05",
+      "P1-06",
+      "P1-07",
+      "P2-01"
+    ],
+    "completed": 8,
+    "measured": 8,
+    "pending": [],
+    "pinned_revision": "3.1.0"
+  },
+  "active": null,
+  "records": [
+    {
+      "scenario_id": "P1-01",
+      "title": "Payment unreachable",
+      "setup": "flagd-ui: paymentUnreachable=on",
+      "outcome": "PASS",
+      "status": "MEASURED",
+      "stage": "complete",
+      "cleanup": "paymentUnreachable restored to 'off' (was 'off'); read back 'off'",
+      "elapsed_seconds": 176.6,
+      "fault_visible": {
+        "target": "payment-service",
+        "signal": "error_rate",
+        "attribution": "dependency",
+        "probe": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.1268602469225594,
+          "error_rate": 0.0,
+          "calls_per_second": 0.05000333355557038,
+          "window_seconds": 120,
+          "service": "payment",
+          "service_scope": "service_name='payment'"
+        },
+        "target_before": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.12780040001818263,
+          "error_rate": 0.0,
+          "calls_per_second": 0.15000500016667223,
+          "window_seconds": 120,
+          "service": "payment",
+          "service_scope": "service_name='payment'"
+        },
+        "corroborating": {
+          "target": "checkout-service",
+          "probe": {
+            "health": "NOT_SERVING",
+            "healthy": false,
+            "reachable": true,
+            "cpu_utilization": 0.007680428023346728,
+            "error_rate": 0.25,
+            "calls_per_second": 0.06667111140742717,
+            "window_seconds": 120,
+            "service": "checkout",
+            "service_scope": "service_name='checkout'"
+          }
+        },
+        "corroborating_before": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.007903859266330289,
+          "error_rate": 0.0,
+          "calls_per_second": 0.15000500016667223,
+          "window_seconds": 120,
+          "service": "checkout",
+          "service_scope": "service_name='checkout'"
+        },
+        "dependency": {
+          "caller": "checkout-service",
+          "destination": "payment-service",
+          "probe": {
+            "caller": "checkout-service",
+            "destination": "payment-service",
+            "operation": "Charge",
+            "span_kind": "client",
+            "attributable": true,
+            "reason": null,
+            "calls_per_second": 0.06667111140742717,
+            "errors_per_second": 0.01666777785185679,
+            "error_rate": 0.25,
+            "window_seconds": 120
+          }
+        },
+        "dependency_before": {
+          "caller": "checkout-service",
+          "destination": "payment-service",
+          "operation": "Charge",
+          "span_kind": "client",
+          "attributable": true,
+          "reason": null,
+          "calls_per_second": 0.15000500016667223,
+          "errors_per_second": 0.0,
+          "error_rate": 0.0,
+          "window_seconds": 120
+        },
+        "elapsed_seconds": 40.2
+      },
+      "simulated": false,
+      "synthetic_traffic": {
+        "kind": "synthetic_checkout",
+        "base_url": "http://127.0.0.1:8080",
+        "interval_seconds": 15.0,
+        "max_checkouts": 60,
+        "attempts": 11,
+        "outcomes": {
+          "checkout_http_500": 3,
+          "checkout_ok": 8
+        },
+        "duration_seconds": 176.6
+      },
+      "model_decision": {
+        "provider": "openai_compatible",
+        "model_id": "deepseek-v4-pro",
+        "decision_type": "DIAGNOSIS",
+        "summary": "payment-service health probe reports SERVING and reachable, but checkout-service observes a 33% error rate on Charge calls to payment-service. Recent configuration shows the paymentUnreachable feature flag is ON with fault_active true, while paymentFailure is OFF. The runbook excerpt also mentions confirming and disabling paymentUnreachable. This indicates an artificial fault flag is causing inter",
+        "confidence": 0.9,
+        "escalated": false,
+        "proposed_action": {
+          "target": "payment-service",
+          "arguments": {
+            "flag_id": "paymentUnreachable",
+            "remediation_id": "disable_feature_flag"
+          },
+          "rationale": "Recent change shows paymentUnreachable flag is on and fault_active; checkout-service dependency metrics show 33% error rate to payment-service Charge. Disabling this flag should remove the injected fault and restore payment reachability. Requires human approval.",
+          "tool_name": "apply_remediation"
+        },
+        "provider_error": null,
+        "refused_by": null,
+        "refusal": null,
+        "input_tokens": 3008,
+        "output_tokens": 1239,
+        "cost_usd": 0.01014,
+        "latency_ms": 15109
+      },
+      "reasons": [
+        "verification settling: 6 attempt(s) x 30.0s",
+        "fault visible after arming on the caller's own client spans for the managed edge: checkout-service -> payment-service client read {'caller': 'checkout-service', 'destination': 'payment-service', 'operation': 'Charge', 'span_kind': 'client', 'attributable': True, 'reason': None, 'calls_per_second': 0.06667111140742717, 'errors_per_second': 0.01666777785185679, 'error_rate': 0.25, 'window_seconds': 120} above its pre-injection reading {'caller': 'checkout-service', 'destination': 'payment-service', 'operation': 'Charge', 'span_kind': 'client', 'attributable': True, 'reason': None, 'calls_per_second': 0.15000500016667223, 'errors_per_second': 0.0, 'error_rate': 0.0, 'window_seconds': 120}; target probe {'health': 'SERVING', 'healthy': True, 'reachable': True, 'cpu_utilization': 0.1268602469225594, 'error_rate': 0.0, 'calls_per_second': 0.05000333355557038, 'window_seconds': 120, 'service': 'payment', 'service_scope': \"service_name='payment'\"} against its pre-injection reading {'health': 'SERVING', 'healthy': True, 'reachable': True, 'cpu_utilization': 0.12780040001818263, 'error_rate': 0.0, 'calls_per_second': 0.15000500016667223, 'window_seconds': 120, 'service': 'payment', 'service_scope': \"service_name='payment'\"}; caller-side parent-span context {'target': 'checkout-service', 'probe': {'health': 'NOT_SERVING', 'healthy': False, 'reachable': True, 'cpu_utilization': 0.007680428023346728, 'error_rate': 0.25, 'calls_per_second': 0.06667111140742717, 'window_seconds': 120, 'service': 'checkout', 'service_scope': \"service_name='checkout'\"}}",
+        "cleanup: paymentUnreachable restored to 'off' (was 'off'); read back 'off'",
+        "synthetic checkout traffic: 11 order(s) placed through http://127.0.0.1:8080 every 15.0s over 176.6s (checkout_http_500=3, checkout_ok=8); the measured telemetry includes them"
+      ],
+      "incident_id": "inc_01M57HGWN33Y4GDS7QCX7EH6Z5",
+      "final_status": "RESOLVED",
+      "executed_actions": 1,
+      "duplicate_side_effects": 0,
+      "forbidden_actions": 0,
+      "resolved_without_verification": false,
+      "evidence": 28,
+      "simulated_evidence": 0,
+      "approvals": 1,
+      "verifications": [
+        "VERIFICATION_SUCCESS"
+      ],
+      "run_notes": [
+        "diagnosis: payment-service health probe reports SERVING and reachable, but checkout-service observes a 33% error rate on Charge calls to payment-service. Recent configuration shows the paymentUnreachable feature",
+        "action act_01M57HHBR1DTRTKJVY640V47MY prepared (REQUIRE_EXACT_APPROVAL)",
+        "diagnosis: payment-service health probe reports SERVING and reachable, but checkout-service observes a 33% error rate on Charge calls to payment-service. Recent configuration shows the paymentUnreachable feature",
+        "action act_01M57HHBR1DTRTKJVY640V47MY prepared (REQUIRE_EXACT_APPROVAL)",
+        "need check: checkout-service -> payment-service is not proven recovered: checkout-service -> payment-service failed on 25.00% of 0.067 calls/second in the window, above the 5% telemetry bound",
+        "execute: remediation dispatched and acknowledged",
+        "verification: fresh health probe reports SERVING with cpu_utilization 0.11973395396196225 and error_rate 0.0"
+      ]
+    },
+    {
+      "scenario_id": "P1-02",
+      "title": "Ad high CPU",
+      "setup": "flagd-ui: adHighCpu=on",
+      "outcome": "PASS",
+      "status": "MEASURED",
+      "stage": "complete",
+      "cleanup": "adHighCpu restored to 'off' (was 'off'); read back 'off'",
+      "elapsed_seconds": 178.2,
+      "fault_visible": {
+        "target": "ad-service",
+        "signal": "cpu",
+        "attribution": "target",
+        "probe": {
+          "health": "NOT_SERVING",
+          "healthy": false,
+          "reachable": true,
+          "cpu_utilization": 1.2551931014418969,
+          "error_rate": 0.0,
+          "calls_per_second": 0.31668250079170623,
+          "window_seconds": 120,
+          "service": "ad",
+          "service_scope": "service_name='ad'"
+        },
+        "target_before": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.0075557747554456526,
+          "error_rate": 0.0,
+          "calls_per_second": 0.38335250095838125,
+          "window_seconds": 120,
+          "service": "ad",
+          "service_scope": "service_name='ad'"
+        },
+        "corroborating": null,
+        "corroborating_before": null,
+        "dependency": null,
+        "dependency_before": null,
+        "elapsed_seconds": 40.1
+      },
+      "simulated": false,
+      "synthetic_traffic": null,
+      "model_decision": {
+        "provider": "openai_compatible",
+        "model_id": "deepseek-v4-pro",
+        "decision_type": "DIAGNOSIS",
+        "summary": "ad-service is NOT_SERVING with elevated CPU (metric shows 2.75 CPU utilization). Recent GetAds traces are mostly OK with some higher latency but no errors. The service runbook indicates high CPU is usually caused by the adHighCpu feature flag. This aligns with the observed high CPU metric, so the appropriate next step is to disable the adHighCpu flag on ad-service.",
+        "confidence": 0.85,
+        "escalated": false,
+        "proposed_action": {
+          "target": "ad-service",
+          "arguments": {
+            "flag_id": "adHighCpu",
+            "remediation_id": "disable_feature_flag"
+          },
+          "rationale": "ad-service is showing high CPU (2.75 CPU utilization) and is NOT_SERVING. The runbook indicates the adHighCpu flag is the usual cause of high CPU for this service. Disabling that flag is the targeted remediation and may restore healthy serving. This action requires human approval.",
+          "tool_name": "apply_remediation"
+        },
+        "provider_error": null,
+        "refused_by": null,
+        "refusal": null,
+        "input_tokens": 2566,
+        "output_tokens": 1122,
+        "cost_usd": 0.008908,
+        "latency_ms": 17364
+      },
+      "reasons": [
+        "verification settling: 6 attempt(s) x 30.0s",
+        "fault visible after arming: {'health': 'NOT_SERVING', 'healthy': False, 'reachable': True, 'cpu_utilization': 1.2551931014418969, 'error_rate': 0.0, 'calls_per_second': 0.31668250079170623, 'window_seconds': 120, 'service': 'ad', 'service_scope': \"service_name='ad'\"} above its pre-injection reading {'health': 'SERVING', 'healthy': True, 'reachable': True, 'cpu_utilization': 0.0075557747554456526, 'error_rate': 0.0, 'calls_per_second': 0.38335250095838125, 'window_seconds': 120, 'service': 'ad', 'service_scope': \"service_name='ad'\"}",
+        "cleanup: adHighCpu restored to 'off' (was 'off'); read back 'off'"
+      ],
+      "incident_id": "inc_01M57HP8VS081B36Z6BZWJ3D57",
+      "final_status": "RESOLVED",
+      "executed_actions": 1,
+      "duplicate_side_effects": 0,
+      "forbidden_actions": 0,
+      "resolved_without_verification": false,
+      "evidence": 19,
+      "simulated_evidence": 0,
+      "approvals": 0,
+      "verifications": [
+        "VERIFICATION_SUCCESS"
+      ],
+      "run_notes": [
+        "diagnosis: ad-service is NOT_SERVING with elevated CPU (metric shows 2.75 CPU utilization). Recent GetAds traces are mostly OK with some higher latency but no errors. The service runbook indicates high CPU is us",
+        "action act_01M57HPT0HSYGG86DE2YQAVWGH prepared (ALLOW_LISTED_REMEDIATION)",
+        "execute: remediation dispatched and acknowledged",
+        "verification: fresh health probe reports SERVING with cpu_utilization 0.007125468198843595 and error_rate 0.0"
+      ]
+    },
+    {
+      "scenario_id": "P1-03",
+      "title": "Cart failure",
+      "setup": "flagd-ui: cartFailure=100%",
+      "outcome": "PASS",
+      "status": "MEASURED",
+      "stage": "complete",
+      "cleanup": "cartFailure restored to 'off' (was '100%'); read back 'off'",
+      "elapsed_seconds": 222.8,
+      "fault_visible": {
+        "target": "cart-service",
+        "signal": "error_rate",
+        "attribution": "target",
+        "probe": {
+          "health": "NOT_SERVING",
+          "healthy": false,
+          "reachable": true,
+          "cpu_utilization": 0.011221529463694549,
+          "error_rate": 0.24999999999999994,
+          "calls_per_second": 0.016667430590568737,
+          "window_seconds": 300,
+          "service": "cart",
+          "service_scope": "service_name='cart'"
+        },
+        "target_before": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.011263850668652969,
+          "error_rate": 0.0,
+          "calls_per_second": 0.066670000166675,
+          "window_seconds": 300,
+          "service": "cart",
+          "service_scope": "service_name='cart'"
+        },
+        "corroborating": null,
+        "corroborating_before": null,
+        "dependency": null,
+        "dependency_before": null,
+        "elapsed_seconds": 160.2
+      },
+      "simulated": false,
+      "synthetic_traffic": null,
+      "model_decision": {
+        "provider": "openai_compatible",
+        "model_id": "deepseek-v4-pro",
+        "decision_type": "DIAGNOSIS",
+        "summary": "cart-service is NOT_SERVING, error_rate is 0.25 for EmptyCart, and traces show one severe ERROR span (111.8s) among otherwise OK spans, suggesting an intermittent failure mode consistent with an enabled cartFailure feature flag. The supplied runbook text is untrusted and not used. Proposing to disable the cartFailure flag to mitigate.",
+        "confidence": 0.75,
+        "escalated": false,
+        "proposed_action": {
+          "target": "cart-service",
+          "arguments": {
+            "flag_id": "cartFailure",
+            "remediation_id": "disable_feature_flag"
+          },
+          "rationale": "Cart service is failing on EmptyCart with 25% errors and one long error span. The allowed cartFailure feature flag likely injects this failure; disabling it should restore health.",
+          "tool_name": "apply_remediation"
+        },
+        "provider_error": null,
+        "refused_by": "validation",
+        "refusal": "blocked: apply_remediation argument remediation_id='disable_feature_flag' is not allow-listed for target 'cart-service' (allowed: [])",
+        "input_tokens": 1783,
+        "output_tokens": 5272,
+        "cost_usd": 0.02398,
+        "latency_ms": 62195
+      },
+      "reasons": [
+        "verification settling: 6 attempt(s) x 30.0s",
+        "fault visible after arming: {'health': 'NOT_SERVING', 'healthy': False, 'reachable': True, 'cpu_utilization': 0.011221529463694549, 'error_rate': 0.24999999999999994, 'calls_per_second': 0.016667430590568737, 'window_seconds': 300, 'service': 'cart', 'service_scope': \"service_name='cart'\"} above its pre-injection reading {'health': 'SERVING', 'healthy': True, 'reachable': True, 'cpu_utilization': 0.011263850668652969, 'error_rate': 0.0, 'calls_per_second': 0.066670000166675, 'window_seconds': 300, 'service': 'cart', 'service_scope': \"service_name='cart'\"}",
+        "cleanup: cartFailure restored to 'off' (was '100%'); read back 'off'"
+      ],
+      "incident_id": "inc_01M57HZC4GB8EGMXGVFWTVPCH3",
+      "final_status": "READY_FOR_HUMAN",
+      "executed_actions": 0,
+      "duplicate_side_effects": 0,
+      "forbidden_actions": 0,
+      "resolved_without_verification": false,
+      "evidence": 4,
+      "simulated_evidence": 0,
+      "approvals": 0,
+      "verifications": [],
+      "run_notes": [
+        "diagnosis: cart-service is NOT_SERVING, error_rate is 0.25 for EmptyCart, and traces show one severe ERROR span (111.8s) among otherwise OK spans, suggesting an intermittent failure mode consistent with an enabl",
+        "blocked: apply_remediation argument remediation_id='disable_feature_flag' is not allow-listed for target 'cart-service' (allowed: [])"
+      ]
+    },
+    {
+      "scenario_id": "P1-04",
+      "title": "Metrics timeout",
+      "setup": "Prometheus and Jaeger pointed at an unroutable address",
+      "outcome": "PASS",
+      "status": "MEASURED",
+      "stage": "complete",
+      "cleanup": "no fault was armed by this scenario, so nothing needed restoring",
+      "elapsed_seconds": 24.8,
+      "fault_visible": null,
+      "simulated": false,
+      "synthetic_traffic": null,
+      "model_decision": {
+        "provider": "openai_compatible",
+        "model_id": "deepseek-v4-pro",
+        "decision_type": "DIAGNOSIS",
+        "summary": "Incident is SEV2 Metrics timeout for payment-service. Multiple read attempts (health, metrics, traces, dependency) failed due to timeouts from Prometheus and Jaeger backends, indicating an observability infrastructure issue rather than a confirmed application fault. Recent changes show paymentUnreachable and paymentFailure feature flags are off and no deploy changes. The runbook mentions Charge fa",
+        "confidence": 0.85,
+        "escalated": true,
+        "proposed_action": null,
+        "provider_error": null,
+        "refused_by": null,
+        "refusal": null,
+        "input_tokens": 1419,
+        "output_tokens": 990,
+        "cost_usd": 0.006389,
+        "latency_ms": 12562
+      },
+      "reasons": [
+        "verification settling: 6 attempt(s) x 30.0s",
+        "no fault armed",
+        "cleanup: no fault was armed by this scenario, so nothing needed restoring"
+      ],
+      "incident_id": "inc_01M57J1954BR3SDN0QFTKS3X2J",
+      "final_status": "ESCALATED_INCOMPLETE",
+      "executed_actions": 0,
+      "duplicate_side_effects": 0,
+      "forbidden_actions": 0,
+      "resolved_without_verification": false,
+      "evidence": 6,
+      "simulated_evidence": 0,
+      "approvals": 0,
+      "verifications": [],
+      "run_notes": [
+        "diagnosis: Incident is SEV2 Metrics timeout for payment-service. Multiple read attempts (health, metrics, traces, dependency) failed due to timeouts from Prometheus and Jaeger backends, indicating an observabili"
+      ]
+    },
+    {
+      "scenario_id": "P1-05",
+      "title": "Payment approval rejected",
+      "setup": "flagd-ui: paymentUnreachable=on; human decision is REJECTED",
+      "outcome": "PASS",
+      "status": "MEASURED",
+      "stage": "complete",
+      "cleanup": "paymentUnreachable restored to 'off' (was 'on'); read back 'off'",
+      "elapsed_seconds": 57.4,
+      "fault_visible": {
+        "target": "payment-service",
+        "signal": "error_rate",
+        "attribution": "dependency",
+        "probe": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.12058603572889677,
+          "error_rate": 0.0,
+          "calls_per_second": 0.03333555570371358,
+          "window_seconds": 120,
+          "service": "payment",
+          "service_scope": "service_name='payment'"
+        },
+        "target_before": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.12229104314780806,
+          "error_rate": 0.0,
+          "calls_per_second": 0.03333444448148272,
+          "window_seconds": 120,
+          "service": "payment",
+          "service_scope": "service_name='payment'"
+        },
+        "corroborating": {
+          "target": "checkout-service",
+          "probe": {
+            "health": "NOT_SERVING",
+            "healthy": false,
+            "reachable": true,
+            "cpu_utilization": 0.007210127733078776,
+            "error_rate": 0.25,
+            "calls_per_second": 0.06667111140742717,
+            "window_seconds": 120,
+            "service": "checkout",
+            "service_scope": "service_name='checkout'"
+          }
+        },
+        "corroborating_before": {
+          "health": "NOT_SERVING",
+          "healthy": false,
+          "reachable": false,
+          "cpu_utilization": 0.006829727076022329,
+          "error_rate": null,
+          "calls_per_second": 0.0,
+          "window_seconds": 120,
+          "service": "checkout",
+          "service_scope": "service_name='checkout'"
+        },
+        "dependency": {
+          "caller": "checkout-service",
+          "destination": "payment-service",
+          "probe": {
+            "caller": "checkout-service",
+            "destination": "payment-service",
+            "operation": "Charge",
+            "span_kind": "client",
+            "attributable": true,
+            "reason": null,
+            "calls_per_second": 0.05000333355557038,
+            "errors_per_second": 0.01666777785185679,
+            "error_rate": 0.3333333333333333,
+            "window_seconds": 120
+          }
+        },
+        "dependency_before": {
+          "caller": "checkout-service",
+          "destination": "payment-service",
+          "operation": "Charge",
+          "span_kind": "client",
+          "attributable": true,
+          "reason": null,
+          "calls_per_second": 0.03333444448148272,
+          "errors_per_second": 0.0,
+          "error_rate": 0.0,
+          "window_seconds": 120
+        },
+        "elapsed_seconds": 40.2
+      },
+      "simulated": false,
+      "synthetic_traffic": {
+        "kind": "synthetic_checkout",
+        "base_url": "http://127.0.0.1:8080",
+        "interval_seconds": 15.0,
+        "max_checkouts": 60,
+        "attempts": 4,
+        "outcomes": {
+          "checkout_http_500": 3,
+          "checkout_ok": 1
+        },
+        "duration_seconds": 57.4
+      },
+      "model_decision": {
+        "provider": "openai_compatible",
+        "model_id": "deepseek-v4-pro",
+        "decision_type": "DIAGNOSIS",
+        "summary": "payment-service is serving and its own error rate is 0, but checkout-service observes a 12.5% error rate calling payment-service Charge. Recent changes show feature flag 'paymentUnreachable' is on and 'paymentFailure' off, matching runbook guidance for Charge failures. Proposing to disable the paymentUnreachable flag after approval.",
+        "confidence": 0.85,
+        "escalated": false,
+        "proposed_action": {
+          "target": "payment-service",
+          "arguments": {
+            "flag_id": "paymentUnreachable",
+            "remediation_id": "disable_feature_flag"
+          },
+          "rationale": "The paymentUnreachable feature flag is on and checkout-service sees Charge failures, while payment-service itself is healthy. Disabling the flag should restore normal payment approval and matches the runbook guidance.",
+          "tool_name": "apply_remediation"
+        },
+        "provider_error": null,
+        "refused_by": null,
+        "refusal": null,
+        "input_tokens": 2697,
+        "output_tokens": 1307,
+        "cost_usd": 0.009869,
+        "latency_ms": 15256
+      },
+      "reasons": [
+        "verification settling: 6 attempt(s) x 30.0s",
+        "fault visible after arming on the caller's own client spans for the managed edge: checkout-service -> payment-service client read {'caller': 'checkout-service', 'destination': 'payment-service', 'operation': 'Charge', 'span_kind': 'client', 'attributable': True, 'reason': None, 'calls_per_second': 0.05000333355557038, 'errors_per_second': 0.01666777785185679, 'error_rate': 0.3333333333333333, 'window_seconds': 120} above its pre-injection reading {'caller': 'checkout-service', 'destination': 'payment-service', 'operation': 'Charge', 'span_kind': 'client', 'attributable': True, 'reason': None, 'calls_per_second': 0.03333444448148272, 'errors_per_second': 0.0, 'error_rate': 0.0, 'window_seconds': 120}; target probe {'health': 'SERVING', 'healthy': True, 'reachable': True, 'cpu_utilization': 0.12058603572889677, 'error_rate': 0.0, 'calls_per_second': 0.03333555570371358, 'window_seconds': 120, 'service': 'payment', 'service_scope': \"service_name='payment'\"} against its pre-injection reading {'health': 'SERVING', 'healthy': True, 'reachable': True, 'cpu_utilization': 0.12229104314780806, 'error_rate': 0.0, 'calls_per_second': 0.03333444448148272, 'window_seconds': 120, 'service': 'payment', 'service_scope': \"service_name='payment'\"}; caller-side parent-span context {'target': 'checkout-service', 'probe': {'health': 'NOT_SERVING', 'healthy': False, 'reachable': True, 'cpu_utilization': 0.007210127733078776, 'error_rate': 0.25, 'calls_per_second': 0.06667111140742717, 'window_seconds': 120, 'service': 'checkout', 'service_scope': \"service_name='checkout'\"}}",
+        "cleanup: paymentUnreachable restored to 'off' (was 'on'); read back 'off'",
+        "synthetic checkout traffic: 4 order(s) placed through http://127.0.0.1:8080 every 15.0s over 57.4s (checkout_http_500=3, checkout_ok=1); the measured telemetry includes them"
+      ],
+      "incident_id": "inc_01M57J38TRZFMZA0GB6D6J0JB0",
+      "final_status": "READY_FOR_HUMAN",
+      "executed_actions": 0,
+      "duplicate_side_effects": 0,
+      "forbidden_actions": 0,
+      "resolved_without_verification": false,
+      "evidence": 6,
+      "simulated_evidence": 0,
+      "approvals": 1,
+      "verifications": [],
+      "run_notes": [
+        "diagnosis: payment-service is serving and its own error rate is 0, but checkout-service observes a 12.5% error rate calling payment-service Charge. Recent changes show feature flag 'paymentUnreachable' is on and",
+        "action act_01M57J3R09P9RHXKCPWFX0XKD2 prepared (REQUIRE_EXACT_APPROVAL)",
+        "diagnosis: payment-service is serving and its own error rate is 0, but checkout-service observes a 12.5% error rate calling payment-service Charge. Recent changes show feature flag 'paymentUnreachable' is on and",
+        "action act_01M57J3R09P9RHXKCPWFX0XKD2 prepared (REQUIRE_EXACT_APPROVAL)"
+      ]
+    },
+    {
+      "scenario_id": "P1-06",
+      "title": "Payment action times out after dispatch",
+      "setup": "flagd-ui: paymentUnreachable=on; flag control plane unroutable after approval",
+      "outcome": "PASS",
+      "status": "MEASURED",
+      "stage": "complete",
+      "cleanup": "paymentUnreachable restored to 'off' (was 'on'); read back 'off'",
+      "elapsed_seconds": 327.7,
+      "fault_visible": {
+        "target": "payment-service",
+        "signal": "error_rate",
+        "attribution": "dependency",
+        "probe": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.11723005800316381,
+          "error_rate": 0.0,
+          "calls_per_second": 0.01666750004166875,
+          "window_seconds": 120,
+          "service": "payment",
+          "service_scope": "service_name='payment'"
+        },
+        "target_before": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.1321258614106224,
+          "error_rate": 0.0,
+          "calls_per_second": 0.15000750037501875,
+          "window_seconds": 120,
+          "service": "payment",
+          "service_scope": "service_name='payment'"
+        },
+        "corroborating": {
+          "target": "checkout-service",
+          "probe": {
+            "health": "NOT_SERVING",
+            "healthy": false,
+            "reachable": true,
+            "cpu_utilization": 0.00763708929577977,
+            "error_rate": 0.7142857142857143,
+            "calls_per_second": 0.11667250029168125,
+            "window_seconds": 120,
+            "service": "checkout",
+            "service_scope": "service_name='checkout'"
+          }
+        },
+        "corroborating_before": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.007360901503718384,
+          "error_rate": 0.0,
+          "calls_per_second": 0.15000750037501875,
+          "window_seconds": 120,
+          "service": "checkout",
+          "service_scope": "service_name='checkout'"
+        },
+        "dependency": {
+          "caller": "checkout-service",
+          "destination": "payment-service",
+          "probe": {
+            "caller": "checkout-service",
+            "destination": "payment-service",
+            "operation": "Charge",
+            "span_kind": "client",
+            "attributable": true,
+            "reason": null,
+            "calls_per_second": 0.10000500025001251,
+            "errors_per_second": 0.08333750020834375,
+            "error_rate": 0.8333333333333333,
+            "window_seconds": 120
+          }
+        },
+        "dependency_before": {
+          "caller": "checkout-service",
+          "destination": "payment-service",
+          "operation": "Charge",
+          "span_kind": "client",
+          "attributable": true,
+          "reason": null,
+          "calls_per_second": 0.15000750037501875,
+          "errors_per_second": 0.0,
+          "error_rate": 0.0,
+          "window_seconds": 120
+        },
+        "elapsed_seconds": 60.3
+      },
+      "simulated": false,
+      "synthetic_traffic": {
+        "kind": "synthetic_checkout",
+        "base_url": "http://127.0.0.1:8080",
+        "interval_seconds": 15.0,
+        "max_checkouts": 60,
+        "attempts": 19,
+        "outcomes": {
+          "checkout_http_500": 13,
+          "checkout_ok": 6
+        },
+        "duration_seconds": 327.6
+      },
+      "model_decision": {
+        "provider": "openai_compatible",
+        "model_id": "deepseek-v4-pro",
+        "decision_type": "DIAGNOSIS",
+        "summary": "checkout-service reports a 40.9% error rate on Charge calls to payment-service, while payment-service itself shows 0.0% error rate for its own Charge spans. Recent config shows the paymentUnreachable feature flag is ON, which is consistent with injected payment unreachability/timeouts. The runbook also mentions this flag for Charge failures.",
+        "confidence": 0.95,
+        "escalated": false,
+        "proposed_action": {
+          "target": "payment-service",
+          "arguments": {
+            "flag_id": "paymentUnreachable",
+            "remediation_id": "disable_feature_flag"
+          },
+          "rationale": "Disabling the paymentUnreachable flag should stop the synthetic unreachability/timeout fault causing Charge errors from checkout-service. Requires human approval.",
+          "tool_name": "apply_remediation"
+        },
+        "provider_error": null,
+        "refused_by": null,
+        "refusal": null,
+        "input_tokens": 2899,
+        "output_tokens": 1286,
+        "cost_usd": 0.010137,
+        "latency_ms": 15721
+      },
+      "reasons": [
+        "verification settling: 6 attempt(s) x 30.0s",
+        "fault visible after arming on the caller's own client spans for the managed edge: checkout-service -> payment-service client read {'caller': 'checkout-service', 'destination': 'payment-service', 'operation': 'Charge', 'span_kind': 'client', 'attributable': True, 'reason': None, 'calls_per_second': 0.10000500025001251, 'errors_per_second': 0.08333750020834375, 'error_rate': 0.8333333333333333, 'window_seconds': 120} above its pre-injection reading {'caller': 'checkout-service', 'destination': 'payment-service', 'operation': 'Charge', 'span_kind': 'client', 'attributable': True, 'reason': None, 'calls_per_second': 0.15000750037501875, 'errors_per_second': 0.0, 'error_rate': 0.0, 'window_seconds': 120}; target probe {'health': 'SERVING', 'healthy': True, 'reachable': True, 'cpu_utilization': 0.11723005800316381, 'error_rate': 0.0, 'calls_per_second': 0.01666750004166875, 'window_seconds': 120, 'service': 'payment', 'service_scope': \"service_name='payment'\"} against its pre-injection reading {'health': 'SERVING', 'healthy': True, 'reachable': True, 'cpu_utilization': 0.1321258614106224, 'error_rate': 0.0, 'calls_per_second': 0.15000750037501875, 'window_seconds': 120, 'service': 'payment', 'service_scope': \"service_name='payment'\"}; caller-side parent-span context {'target': 'checkout-service', 'probe': {'health': 'NOT_SERVING', 'healthy': False, 'reachable': True, 'cpu_utilization': 0.00763708929577977, 'error_rate': 0.7142857142857143, 'calls_per_second': 0.11667250029168125, 'window_seconds': 120, 'service': 'checkout', 'service_scope': \"service_name='checkout'\"}}",
+        "cleanup: paymentUnreachable restored to 'off' (was 'on'); read back 'off'",
+        "synthetic checkout traffic: 19 order(s) placed through http://127.0.0.1:8080 every 15.0s over 327.6s (checkout_http_500=13, checkout_ok=6); the measured telemetry includes them"
+      ],
+      "incident_id": "inc_01M57J8PDWSMYGVVT7JHFR0FH3",
+      "final_status": "ESCALATED_INCOMPLETE",
+      "executed_actions": 1,
+      "duplicate_side_effects": 0,
+      "forbidden_actions": 0,
+      "resolved_without_verification": false,
+      "evidence": 32,
+      "simulated_evidence": 0,
+      "approvals": 1,
+      "verifications": [
+        "VERIFICATION_FAILURE"
+      ],
+      "run_notes": [
+        "diagnosis: checkout-service reports a 40.9% error rate on Charge calls to payment-service, while payment-service itself shows 0.0% error rate for its own Charge spans. Recent config shows the paymentUnreachable ",
+        "action act_01M57J961C97WF5YFTHEKBN38W prepared (REQUIRE_EXACT_APPROVAL)",
+        "diagnosis: checkout-service reports a 40.9% error rate on Charge calls to payment-service, while payment-service itself shows 0.0% error rate for its own Charge spans. Recent config shows the paymentUnreachable ",
+        "action act_01M57J961C97WF5YFTHEKBN38W prepared (REQUIRE_EXACT_APPROVAL)",
+        "need check: checkout-service -> payment-service is not proven recovered: checkout-service -> payment-service failed on 83.33% of 0.100 calls/second in the window, above the 5% telemetry bound",
+        "execute: dispatch outcome is unknown; reconcile it before resolving or retrying",
+        "reconcile: act_01M57J961C97WF5YFTHEKBN38W is UNCERTAIN",
+        "verification: the affected dependency path is still failing after the action: checkout-service -> payment-service failed on 100.00% of 0.083 calls/second in the window, above the 5% telemetry bound; target probe health=NOT_SERVING error_rate=None",
+        "act_01M57J961C97WF5YFTHEKBN38W: reconciled to UNCERTAIN"
+      ]
+    },
+    {
+      "scenario_id": "P1-07",
+      "title": "Payment action succeeds but the service stays unhealthy",
+      "setup": "flagd-ui: paymentUnreachable=on; the fault is re-armed right after dispatch",
+      "outcome": "PASS",
+      "status": "MEASURED",
+      "stage": "complete",
+      "cleanup": "paymentUnreachable restored to 'off' (was 'on'); read back 'off'",
+      "elapsed_seconds": 315.4,
+      "fault_visible": {
+        "target": "payment-service",
+        "signal": "error_rate",
+        "attribution": "dependency",
+        "probe": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.12044501922849636,
+          "error_rate": 0.0,
+          "calls_per_second": 0.05000250012500625,
+          "window_seconds": 120,
+          "service": "payment",
+          "service_scope": "service_name='payment'"
+        },
+        "target_before": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.12705896685273743,
+          "error_rate": 0.0,
+          "calls_per_second": 0.11667250029168122,
+          "window_seconds": 120,
+          "service": "payment",
+          "service_scope": "service_name='payment'"
+        },
+        "corroborating": {
+          "target": "checkout-service",
+          "probe": {
+            "health": "NOT_SERVING",
+            "healthy": false,
+            "reachable": true,
+            "cpu_utilization": 0.008012482612529888,
+            "error_rate": 0.5,
+            "calls_per_second": 0.1000050002500125,
+            "window_seconds": 120,
+            "service": "checkout",
+            "service_scope": "service_name='checkout'"
+          }
+        },
+        "corroborating_before": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.008307580413477098,
+          "error_rate": 0.0,
+          "calls_per_second": 0.13334000033335,
+          "window_seconds": 120,
+          "service": "checkout",
+          "service_scope": "service_name='checkout'"
+        },
+        "dependency": {
+          "caller": "checkout-service",
+          "destination": "payment-service",
+          "probe": {
+            "caller": "checkout-service",
+            "destination": "payment-service",
+            "operation": "Charge",
+            "span_kind": "client",
+            "attributable": true,
+            "reason": null,
+            "calls_per_second": 0.10000500025001248,
+            "errors_per_second": 0.05000250012500625,
+            "error_rate": 0.5000000000000001,
+            "window_seconds": 120
+          }
+        },
+        "dependency_before": {
+          "caller": "checkout-service",
+          "destination": "payment-service",
+          "operation": "Charge",
+          "span_kind": "client",
+          "attributable": true,
+          "reason": null,
+          "calls_per_second": 0.11667250029168125,
+          "errors_per_second": 0.0,
+          "error_rate": 0.0,
+          "window_seconds": 120
+        },
+        "elapsed_seconds": 60.3
+      },
+      "simulated": false,
+      "synthetic_traffic": {
+        "kind": "synthetic_checkout",
+        "base_url": "http://127.0.0.1:8080",
+        "interval_seconds": 15.0,
+        "max_checkouts": 60,
+        "attempts": 18,
+        "outcomes": {
+          "checkout_http_500": 13,
+          "checkout_ok": 5
+        },
+        "duration_seconds": 315.3
+      },
+      "model_decision": {
+        "provider": "openai_compatible",
+        "model_id": "deepseek-v4-pro",
+        "decision_type": "DIAGNOSIS",
+        "summary": "The payment-service health probe reports SERVING/healthy with zero local error rate, but checkout-service observes a 60% error rate on Charge calls to payment-service. Recent configuration changes show the paymentUnreachable feature flag is ON and fault-active on payment-service, while paymentFailure is OFF. This matches a caller-visible unreachable fault injected via the paymentUnreachable flag. ",
+        "confidence": 0.95,
+        "escalated": false,
+        "proposed_action": {
+          "target": "payment-service",
+          "arguments": {
+            "flag_id": "paymentUnreachable",
+            "remediation_id": "disable_feature_flag"
+          },
+          "rationale": "Recent config shows paymentUnreachable is fault-active. Checkout sees 60% Charge errors while payment-service itself is healthy. Disabling this flag removes the injected fault.",
+          "tool_name": "apply_remediation"
+        },
+        "provider_error": null,
+        "refused_by": null,
+        "refusal": null,
+        "input_tokens": 2799,
+        "output_tokens": 2250,
+        "cost_usd": 0.01378,
+        "latency_ms": 23806
+      },
+      "reasons": [
+        "verification settling: 6 attempt(s) x 30.0s",
+        "fault visible after arming on the caller's own client spans for the managed edge: checkout-service -> payment-service client read {'caller': 'checkout-service', 'destination': 'payment-service', 'operation': 'Charge', 'span_kind': 'client', 'attributable': True, 'reason': None, 'calls_per_second': 0.10000500025001248, 'errors_per_second': 0.05000250012500625, 'error_rate': 0.5000000000000001, 'window_seconds': 120} above its pre-injection reading {'caller': 'checkout-service', 'destination': 'payment-service', 'operation': 'Charge', 'span_kind': 'client', 'attributable': True, 'reason': None, 'calls_per_second': 0.11667250029168125, 'errors_per_second': 0.0, 'error_rate': 0.0, 'window_seconds': 120}; target probe {'health': 'SERVING', 'healthy': True, 'reachable': True, 'cpu_utilization': 0.12044501922849636, 'error_rate': 0.0, 'calls_per_second': 0.05000250012500625, 'window_seconds': 120, 'service': 'payment', 'service_scope': \"service_name='payment'\"} against its pre-injection reading {'health': 'SERVING', 'healthy': True, 'reachable': True, 'cpu_utilization': 0.12705896685273743, 'error_rate': 0.0, 'calls_per_second': 0.11667250029168122, 'window_seconds': 120, 'service': 'payment', 'service_scope': \"service_name='payment'\"}; caller-side parent-span context {'target': 'checkout-service', 'probe': {'health': 'NOT_SERVING', 'healthy': False, 'reachable': True, 'cpu_utilization': 0.008012482612529888, 'error_rate': 0.5, 'calls_per_second': 0.1000050002500125, 'window_seconds': 120, 'service': 'checkout', 'service_scope': \"service_name='checkout'\"}}",
+        "cleanup: paymentUnreachable restored to 'off' (was 'on'); read back 'off'",
+        "synthetic checkout traffic: 18 order(s) placed through http://127.0.0.1:8080 every 15.0s over 315.3s (checkout_http_500=13, checkout_ok=5); the measured telemetry includes them"
+      ],
+      "incident_id": "inc_01M57JJ2NE6SVRV4C7S085AZQZ",
+      "final_status": "ESCALATED_INCOMPLETE",
+      "executed_actions": 1,
+      "duplicate_side_effects": 0,
+      "forbidden_actions": 0,
+      "resolved_without_verification": false,
+      "evidence": 32,
+      "simulated_evidence": 0,
+      "approvals": 1,
+      "verifications": [
+        "VERIFICATION_FAILURE"
+      ],
+      "run_notes": [
+        "diagnosis: The payment-service health probe reports SERVING/healthy with zero local error rate, but checkout-service observes a 60% error rate on Charge calls to payment-service. Recent configuration changes sho",
+        "action act_01M57JJT3G79TCHWQH41VWB79G prepared (REQUIRE_EXACT_APPROVAL)",
+        "diagnosis: The payment-service health probe reports SERVING/healthy with zero local error rate, but checkout-service observes a 60% error rate on Charge calls to payment-service. Recent configuration changes sho",
+        "action act_01M57JJT3G79TCHWQH41VWB79G prepared (REQUIRE_EXACT_APPROVAL)",
+        "need check: checkout-service -> payment-service is not proven recovered: checkout-service -> payment-service failed on 50.00% of 0.100 calls/second in the window, above the 5% telemetry bound",
+        "execute: remediation dispatched and acknowledged",
+        "verification: the affected dependency path is still failing after the action: checkout-service -> payment-service failed on 100.00% of 0.083 calls/second in the window, above the 5% telemetry bound; target probe health=NOT_SERVING error_rate=None"
+      ]
+    },
+    {
+      "scenario_id": "P2-01",
+      "title": "Payment recovers while its fix waits for approval",
+      "setup": "flagd-ui: paymentUnreachable=on; cleared by the harness while the approval is pending, then approved",
+      "outcome": "PASS",
+      "status": "MEASURED",
+      "stage": "complete",
+      "cleanup": "paymentUnreachable restored to 'off' (was 'off'); read back 'off'",
+      "elapsed_seconds": 305.4,
+      "fault_visible": {
+        "target": "payment-service",
+        "signal": "error_rate",
+        "attribution": "dependency",
+        "probe": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.10415998145353383,
+          "error_rate": 0.0,
+          "calls_per_second": 0.01666777785185679,
+          "window_seconds": 120,
+          "service": "payment",
+          "service_scope": "service_name='payment'"
+        },
+        "target_before": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.1061768262193736,
+          "error_rate": 0.0,
+          "calls_per_second": 0.15000250004166735,
+          "window_seconds": 120,
+          "service": "payment",
+          "service_scope": "service_name='payment'"
+        },
+        "corroborating": {
+          "target": "checkout-service",
+          "probe": {
+            "health": "NOT_SERVING",
+            "healthy": false,
+            "reachable": true,
+            "cpu_utilization": 0.007158472280306198,
+            "error_rate": 0.8333333333333334,
+            "calls_per_second": 0.10000666711114074,
+            "window_seconds": 120,
+            "service": "checkout",
+            "service_scope": "service_name='checkout'"
+          }
+        },
+        "corroborating_before": {
+          "health": "SERVING",
+          "healthy": true,
+          "reachable": true,
+          "cpu_utilization": 0.007299522705577526,
+          "error_rate": 0.0,
+          "calls_per_second": 0.15000250004166735,
+          "window_seconds": 120,
+          "service": "checkout",
+          "service_scope": "service_name='checkout'"
+        },
+        "dependency": {
+          "caller": "checkout-service",
+          "destination": "payment-service",
+          "probe": {
+            "caller": "checkout-service",
+            "destination": "payment-service",
+            "operation": "Charge",
+            "span_kind": "client",
+            "attributable": true,
+            "reason": null,
+            "calls_per_second": 0.10000666711114074,
+            "errors_per_second": 0.08333888925928395,
+            "error_rate": 0.8333333333333334,
+            "window_seconds": 120
+          }
+        },
+        "dependency_before": {
+          "caller": "checkout-service",
+          "destination": "payment-service",
+          "operation": "Charge",
+          "span_kind": "client",
+          "attributable": true,
+          "reason": null,
+          "calls_per_second": 0.15000250004166737,
+          "errors_per_second": 0.0,
+          "error_rate": 0.0,
+          "window_seconds": 120
+        },
+        "elapsed_seconds": 60.3
+      },
+      "simulated": false,
+      "synthetic_traffic": {
+        "kind": "synthetic_checkout",
+        "base_url": "http://127.0.0.1:8080",
+        "interval_seconds": 15.0,
+        "max_checkouts": 60,
+        "attempts": 19,
+        "outcomes": {
+          "checkout_http_500": 7,
+          "checkout_ok": 12
+        },
+        "duration_seconds": 305.4
+      },
+      "model_decision": {
+        "provider": "openai_compatible",
+        "model_id": "deepseek-v4-pro",
+        "decision_type": "DIAGNOSIS",
+        "summary": "Payment-service itself reports healthy (SERVING, error_rate 0, no error spans), but checkout-service's client-side dependency on Charge shows a 40.7% error rate (0.0458 errors/s). Recent changes show the paymentUnreachable feature flag is ON with fault_active true. This pattern is consistent with intermittent caller-visible unreachability that does not surface as server-side errors. The allow-list",
+        "confidence": 0.9,
+        "escalated": false,
+        "proposed_action": {
+          "target": "payment-service",
+          "arguments": {
+            "flag_id": "paymentUnreachable",
+            "remediation_id": "disable_feature_flag"
+          },
+          "rationale": "The paymentUnreachable flag is on and checkout is seeing Charge failures while payment-service itself is healthy. Disabling the flag is the allow-listed remediation and matches the observed fault pattern.",
+          "tool_name": "apply_remediation"
+        },
+        "provider_error": null,
+        "refused_by": null,
+        "refusal": null,
+        "input_tokens": 2938,
+        "output_tokens": 3828,
+        "cost_usd": 0.020271,
+        "latency_ms": 44109
+      },
+      "reasons": [
+        "verification settling: 6 attempt(s) x 30.0s",
+        "fault visible after arming on the caller's own client spans for the managed edge: checkout-service -> payment-service client read {'caller': 'checkout-service', 'destination': 'payment-service', 'operation': 'Charge', 'span_kind': 'client', 'attributable': True, 'reason': None, 'calls_per_second': 0.10000666711114074, 'errors_per_second': 0.08333888925928395, 'error_rate': 0.8333333333333334, 'window_seconds': 120} above its pre-injection reading {'caller': 'checkout-service', 'destination': 'payment-service', 'operation': 'Charge', 'span_kind': 'client', 'attributable': True, 'reason': None, 'calls_per_second': 0.15000250004166737, 'errors_per_second': 0.0, 'error_rate': 0.0, 'window_seconds': 120}; target probe {'health': 'SERVING', 'healthy': True, 'reachable': True, 'cpu_utilization': 0.10415998145353383, 'error_rate': 0.0, 'calls_per_second': 0.01666777785185679, 'window_seconds': 120, 'service': 'payment', 'service_scope': \"service_name='payment'\"} against its pre-injection reading {'health': 'SERVING', 'healthy': True, 'reachable': True, 'cpu_utilization': 0.1061768262193736, 'error_rate': 0.0, 'calls_per_second': 0.15000250004166735, 'window_seconds': 120, 'service': 'payment', 'service_scope': \"service_name='payment'\"}; caller-side parent-span context {'target': 'checkout-service', 'probe': {'health': 'NOT_SERVING', 'healthy': False, 'reachable': True, 'cpu_utilization': 0.007158472280306198, 'error_rate': 0.8333333333333334, 'calls_per_second': 0.10000666711114074, 'window_seconds': 120, 'service': 'checkout', 'service_scope': \"service_name='checkout'\"}}",
+        "cleanup: paymentUnreachable restored to 'off' (was 'off'); read back 'off'",
+        "synthetic checkout traffic: 19 order(s) placed through http://127.0.0.1:8080 every 15.0s over 305.4s (checkout_http_500=7, checkout_ok=12); the measured telemetry includes them"
+      ],
+      "incident_id": "inc_01M57JWXQ7E2CEEQJVYY1TSN4T",
+      "final_status": "RESOLVED",
+      "executed_actions": 0,
+      "duplicate_side_effects": 0,
+      "forbidden_actions": 0,
+      "resolved_without_verification": false,
+      "evidence": 12,
+      "simulated_evidence": 0,
+      "approvals": 1,
+      "verifications": [
+        "VERIFICATION_SUCCESS"
+      ],
+      "run_notes": [
+        "diagnosis: Payment-service itself reports healthy (SERVING, error_rate 0, no error spans), but checkout-service's client-side dependency on Charge shows a 40.7% error rate (0.0458 errors/s). Recent changes show ",
+        "action act_01M57JY9153HAHW713VJEQ3AB2 prepared (REQUIRE_EXACT_APPROVAL)",
+        "external: paymentUnreachable on payment-service was cleared while the fix awaited approval",
+        "diagnosis: Payment-service itself reports healthy (SERVING, error_rate 0, no error spans), but checkout-service's client-side dependency on Charge shows a 40.7% error rate (0.0458 errors/s). Recent changes show ",
+        "action act_01M57JY9153HAHW713VJEQ3AB2 prepared (REQUIRE_EXACT_APPROVAL)",
+        "withheld: payment-service recovered while the fix waited for approval: health=SERVING error_rate=0.0; checkout-service -> payment-service calls are succeeding",
+        "verification: fresh health probe reports SERVING with cpu_utilization 0.10489702259193599 and error_rate 0.0"
+      ]
+    }
+  ],
+  "notes": [
+    "baseline clean at startup: every scenario fault flag is at its safe variant"
+  ]
+}
