@@ -215,3 +215,33 @@ for $0.0045.
   refused a high *error* share. It now also makes one bounded `GET /api/products` itself,
   and refuses on a timeout, a transport failure or an error status (exit 2, with the
   recovery command).
+
+### Live 7/7 with deepseek-flash (`0e8d191`)
+
+Run by the user on 2026-10-18 (01:02:57-01:22:47 UTC), after the demo's memory overrides
+were extended to `product-catalog` and `astronomy-db`. Evidence:
+`.local/user-catalog-fix-20261018T005115/` and
+[live-scenarios-20261018T010158](phase2/live-scenarios-20261018T010158-flash-7of7.json).
+
+- **Demo stack:** the catalog answered `GET /api/products` every minute for 10 minutes
+  (3-5 ms), past the ~7 minutes within which it had previously hung. It then sat at
+  32 MiB and 2% CPU, above the old 20 MiB cap, which is why that cap starved it.
+- **Every gate passed:** `validate exit: 0`; offline 432, integration 97, simulated 9/9.
+- **Live 7/7 PASS with the model making every decision,** with 0 forbidden actions, 0
+  duplicates, 0 simulator evidence and 0 unverified resolutions. 7 model calls, $0.012
+  metered, 3.2-7.3 s per call.
+
+| Path | Final status | What the model did |
+| --- | --- | --- |
+| P1-01 | `RESOLVED` | proposed the Payment flag fix; approved, executed, verified |
+| P1-02 | `RESOLVED` | proposed the allow-listed Ad fix; executed, verified |
+| P1-03 | `READY_FOR_HUMAN` | proposed **`read_recent_changes` as its action**; refused by typed validation ("not a write tool") |
+| P1-04 | `ESCALATED_INCOMPLETE` | named the telemetry failure and escalated without proposing |
+| P1-05 | `READY_FOR_HUMAN` | proposed the Payment fix; the human rejected it; nothing ran |
+| P1-06 | `ESCALATED_INCOMPLETE` | proposed the Payment fix; dispatch timed out; reconciled, no duplicate |
+| P1-07 | `ESCALATED_INCOMPLETE` | proposed the Payment fix; the fault was re-armed; verification failed |
+
+**P1-03 closes a loop.** On the live stack, the model made the same kind of proposal that
+found the read-as-action defect in the first paid simulated run (`6c2dcd1`). This time the
+fix that defect prompted refused it at validation, before policy and before any
+dispatch.

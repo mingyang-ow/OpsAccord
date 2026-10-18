@@ -360,3 +360,20 @@ start the catalog. **Decision:** raise it to 256 MB as well, with the same justi
 (a measured OOM kill) and the same scope (limits only; the DB reseeds from `init.sql`).
 Three services in the pinned demo have proven undersized for this host: checkout, the
 catalog and its database.
+
+## 2026-10-18 - Phase 2c-1 done: a real model on the real stack, 7/7
+
+**Result:** `deepseek-flash` made every decision on all seven live paths. **7/7 PASS**, with
+nothing forbidden, duplicated or unverified, for $0.012. This is the headline the
+project was missing: a real model, a real microservice system, and controls that held.
+
+**The loop that closed:** on live P1-03 the model proposed a *read* tool as its fix, the
+same behaviour that exposed the read-as-action defect in the first paid simulated run. The
+fix it prompted (`6c2dcd1`) refused it at validation. The model found the hole in
+simulation, and the control caught the same move on the real stack.
+
+**Item 3 is closed for now:** after the overrides (catalog and its database), the catalog
+held for 10 minutes past its old hang window and sat at 32 MB, above the 20 MB that
+starved it. The startup check stays in place in case it ever comes back.
+
+**Spend so far:** about $1.40 of the $3 cap, by the ledger.
