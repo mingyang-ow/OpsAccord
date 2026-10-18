@@ -479,6 +479,29 @@ publishes **no** Go runtime metrics to Prometheus while `checkout` - the same
 language and instrumentation - publishes seven. See
 `docs/reports/phase1-implementation.md`, "The restart pass, measured".
 
+**Update, 2026-10-18: the question is decided, and the override now covers the catalog.**
+A capture taken *during* a hang, before any restart
+(`.local/user-catalog-hang-20261017T234424/`), measured what the quiet-time samples could
+not:
+
+- **CPU and memory:** 621.78% and 423.99% CPU while holding 19.51 MiB and 17.77 MiB of
+  the 20 MiB cap, with `grpc_health_probe` failing.
+- **Symptoms:** every OTLP export timing out, and `GET /api/products` hanging past 8 s.
+- **The database is not the cause:** `astronomy-db` held 11 idle `astronomy_user`
+  connections of 100, none waiting. Its repeated `role "root" does not exist` lines are
+  its own `pg_isready` health check connecting as `root`, not a fault.
+- **A restart alone does not hold:** the catalog was healthy, then hung again within
+  about seven minutes.
+
+That is the `checkout` signature, so `demo/compose.opsaccord.yaml` now gives
+`product-catalog` the same documented pair (256M, `GOMEMLIMIT=192MiB`). Only resource
+limits change. Applying it then exposed the catalog's database: `astronomy-db` was found with
+`oom_killed=true` at 66-68 MiB of its 80 MiB while idle. A killed PostgreSQL backend
+takes every connection down while the server recovers, the `pg_isready` healthcheck reads
+that as unhealthy, and compose would not start the catalog that depends on it. The
+override raises `astronomy-db` to 256M. It has no data volume and reseeds from the
+pinned `init.sql`.
+
 ## Live adapter
 
 `src/opsaccord/tools/live_environment.py` implements the same typed tool surface

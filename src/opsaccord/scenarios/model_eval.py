@@ -89,6 +89,32 @@ def _refusal(notes: Iterable[str]) -> tuple[str | None, str | None]:
     return None, None
 
 
+def decision_summary(db: Database, incident_id: str, notes: Iterable[str]) -> dict[str, Any] | None:
+    """The model's first decision for an incident, in the shape the evidence records keep."""
+    decisions = _model_decisions(db, incident_id)
+    if not decisions:
+        return None
+    first = decisions[0]
+    payload = first.payload or {}
+    refused_by, refusal = _refusal(notes)
+    return {
+        "provider": first.provider,
+        "model_id": first.model_id,
+        "decision_type": str(first.decision_type),
+        "summary": first.rationale[:400],
+        "confidence": payload.get("confidence"),
+        "escalated": payload.get("escalate"),
+        "proposed_action": payload.get("proposed_action"),
+        "provider_error": payload.get("provider_error"),
+        "refused_by": refused_by,
+        "refusal": refusal,
+        "input_tokens": first.input_tokens,
+        "output_tokens": first.output_tokens,
+        "cost_usd": first.cost_usd,
+        "latency_ms": first.latency_ms,
+    }
+
+
 def record_run(
     trace: ScenarioTrace,
     *,
@@ -256,4 +282,12 @@ def write_outputs(
     markdown_path.write_text(render_markdown(records, ledger=ledger, title=title), encoding="utf-8")
 
 
-__all__ = ["EvalRecord", "record_run", "render_markdown", "run_eval", "summarize", "write_outputs"]
+__all__ = [
+    "EvalRecord",
+    "decision_summary",
+    "record_run",
+    "render_markdown",
+    "run_eval",
+    "summarize",
+    "write_outputs",
+]

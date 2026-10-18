@@ -260,3 +260,43 @@ def test_a_cut_off_answer_is_metered_from_the_usage_it_reports(
     assert caught.value.usage is not None and caught.value.usage.output_tokens == 4000
     assert ledger.spent_usd == pytest.approx(0.009)  # 1000 in + 4000 out at the rates
     assert ledger.charged_at_worst_case == 0
+
+
+def test_a_long_rationale_is_trimmed_not_a_reason_to_discard_the_proposal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live P1-03, 2026-10-17: deepseek-flash wrote a rationale over the 600-character field
+    limit, and the whole proposal was discarded as a provider failure."""
+    monkeypatch.setenv("OPSACCORD_TEST_MODEL_KEY", "test-key")
+    long_rationale = "cart failures are confirmed by spans; " * 40
+    content = json.dumps(
+        {
+            "summary": "cart-service is failing EmptyCart",
+            "confidence": 0.7,
+            "escalate": False,
+            "proposed_action": {
+                "tool_name": "apply_remediation",
+                "target": "cart-service",
+                "arguments": {"remediation_id": "disable_feature_flag", "flag_id": "cartFailure"},
+                "rationale": long_rationale,
+            },
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    proposal = _adapter(httpx.Client(transport=httpx.MockTransport(handler))).propose(_request())
+
+    action = proposal.diagnosis.proposed_action
+    assert action is not None
+    assert action.rationale == long_rationale[:600]
+    assert action.arguments == {"remediation_id": "disable_feature_flag", "flag_id": "cartFailure"}
+
+
+def test_the_prompt_states_the_field_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPSACCORD_TEST_MODEL_KEY", "test-key")
+    sent, client = _capture()
+    _adapter(client).propose(_request())
+    prompt = sent[0]["messages"][1]["content"]
+    assert "at most 1200" in prompt and "at most 600" in prompt

@@ -51,6 +51,7 @@ from opsaccord.scenarios.live_evidence import (
     utc_now,
     utc_stamp,
 )
+from opsaccord.scenarios.model_eval import decision_summary
 from opsaccord.scenarios.runner import ScenarioTrace, evaluate, run_scenario
 from opsaccord.scenarios.traffic import CheckoutDriver, describe, storefront_origin
 from opsaccord.tools.contracts import TELEMETRY_ERROR_BOUND, Environment
@@ -961,6 +962,8 @@ class LiveResult:
     # The harness's own orders, if any were placed. Recorded on every result so a
     # reader knows the measured traffic was partly synthetic.
     synthetic_traffic: dict[str, Any] | None = None
+    # What the reasoning provider concluded and proposed, and which layer refused it.
+    model_decision: dict[str, Any] | None = None
 
     @property
     def status(self) -> str:
@@ -985,6 +988,7 @@ class LiveResult:
             "fault_visible": self.fault_visible,
             "simulated": self.simulated,
             "synthetic_traffic": self.synthetic_traffic,
+            "model_decision": self.model_decision,
             "reasons": list(self.reasons),
         }
         trace = self.trace
@@ -1333,6 +1337,14 @@ def run_live_scenario(
         if traffic is not None:
             result.reasons.append(describe(traffic))
             result.synthetic_traffic = traffic
+        try:
+            result.model_decision = decision_summary(db, trace.incident.id, trace.run_notes)
+        except Exception as exc:
+            # The decision enriches the evidence; it is not the measurement. A read
+            # that fails is said so on the record instead of failing the scenario.
+            result.reasons.append(
+                f"model decision could not be read back: {type(exc).__name__}: {exc}"
+            )
     elif traffic is not None:
         _attach_traffic(body_error, traffic)
     if cleanup.failed:
@@ -1587,50 +1599,93 @@ STOREFRONT_ERROR_SHARE_LIMIT = 0.5
 STOREFRONT_WINDOW = "5m"
 
 
-def storefront_preflight(
-    environment: Environment, *, timeout_seconds: float = 8.0
-) -> dict[str, Any]:
-    """Read whether the storefront can reach ``product-catalog``, read-only.
+def _fetch_status(url: str, timeout_seconds: float) -> int:
+    """One bounded GET; the HTTP status, or an exception on timeout or transport failure."""
+    import httpx
 
-    The 2026-10-17 5/7 run was spent on a stack whose ``product-catalog`` had stopped
-    answering: every order failed before it reached payment, so two Payment paths had
-    nothing to measure after 35 minutes. This reads the frontend's own catalog client
-    spans over the last five minutes so that state is refused in seconds instead.
-    ``healthy`` is None when there were no catalog calls to judge.
+    with httpx.Client(timeout=timeout_seconds) as client:
+        return client.get(url).status_code
+
+
+def storefront_preflight(
+    environment: Environment,
+    *,
+    timeout_seconds: float = 8.0,
+    storefront_url: str | None = None,
+    fetch: Callable[[str, float], int] | None = None,
+) -> dict[str, Any]:
+    """Decide, read-only, whether the storefront can reach ``product-catalog``.
+
+    Two readings, because the catalog has failed in two ways:
+
+    * **Failing** (the 2026-10-17 5/7 run): catalog calls completed with errors. The
+      frontend's catalog client spans show it as an error share.
+    * **Hung** (the 2026-10-17 live-model run): catalog calls never completed, so they
+      produced *no* spans at all. The span reading saw "no calls" and could not judge,
+      and a 35-minute run started against a storefront whose every order timed out.
+
+    So, when ``storefront_url`` is given, the shop's own ``GET /api/products`` is called
+    once with a bounded timeout. A timeout, a transport failure or an error status means
+    the storefront cannot serve the path every order takes, and that is a refusal
+    whatever the spans say. ``healthy`` is None only when neither reading can judge.
     """
+    probe: dict[str, Any] | None = None
+    if storefront_url is not None:
+        url = storefront_url.rstrip("/") + "/api/products"
+        try:
+            status = (fetch or _fetch_status)(url, timeout_seconds)
+            probe = {"url": url, "status": status, "ok": status < 400}
+        except Exception as exc:
+            probe = {"url": url, "status": None, "ok": False, "error": type(exc).__name__}
+        if not probe["ok"]:
+            reason = (
+                f"HTTP {probe['status']}"
+                if probe["status"] is not None
+                else f"{probe['error']} within {timeout_seconds:.0f}s"
+            )
+            return {
+                "healthy": False,
+                "calls_per_minute": None,
+                "error_share": None,
+                "probe": probe,
+                "detail": f"GET /api/products failed ({reason}): the catalog is hung or down",
+            }
+
     live = _as_live(environment)
     metric = live.prometheus.resolve_metric(CALLS_METRIC_CANDIDATES, timeout_seconds)
-    if metric is None:
-        return {
-            "healthy": None,
-            "calls_per_minute": None,
-            "error_share": None,
-            "detail": "no span-metric calls series is published",
-        }
-    selector = "service_name='frontend',span_name=~'oteldemo.ProductCatalogService/.*'"
-    window = STOREFRONT_WINDOW
-    calls = live.prometheus.scalar(
-        f"sum(rate({metric}{{{selector}}}[{window}]))*60", timeout_seconds
-    )
-    errors = live.prometheus.scalar(
-        f"sum(rate({metric}{{{selector},status_code='STATUS_CODE_ERROR'}}[{window}]))*60",
-        timeout_seconds,
-    )
+    calls = errors = None
+    if metric is not None:
+        selector = "service_name='frontend',span_name=~'oteldemo.ProductCatalogService/.*'"
+        window = STOREFRONT_WINDOW
+        calls = live.prometheus.scalar(
+            f"sum(rate({metric}{{{selector}}}[{window}]))*60", timeout_seconds
+        )
+        errors = live.prometheus.scalar(
+            f"sum(rate({metric}{{{selector},status_code='STATUS_CODE_ERROR'}}[{window}]))*60",
+            timeout_seconds,
+        )
     if not calls:
+        answered = probe is not None and probe["ok"]
         return {
-            "healthy": None,
+            "healthy": True if answered else None,
             "calls_per_minute": calls,
             "error_share": None,
-            "detail": f"no frontend -> product-catalog calls in the last {window}",
+            "probe": probe,
+            "detail": (
+                f"no frontend -> product-catalog spans in the last {STOREFRONT_WINDOW}"
+                + ("; GET /api/products answered" if answered else "")
+            ),
         }
     share = (errors or 0.0) / calls
     return {
         "healthy": share < STOREFRONT_ERROR_SHARE_LIMIT,
         "calls_per_minute": round(calls, 2),
         "error_share": round(share, 3),
+        "probe": probe,
         "detail": (
             f"frontend -> product-catalog: {calls:.1f} calls/min, "
-            f"{share:.1%} failing over the last {window}"
+            f"{share:.1%} failing over the last {STOREFRONT_WINDOW}"
+            + ("; GET /api/products answered" if probe else "")
         ),
     }
 

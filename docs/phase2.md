@@ -72,3 +72,22 @@ uv run python -m opsaccord.cli eval-model --model deepseek-flash --repeats 3 \
 
 Results are written to `reports/local/model-eval-<timestamp>.{json,md}`. The JSON keeps
 every record. The Markdown has a summary per model and one row per run.
+
+## A hosted model on the live stack
+
+The live runner takes the same budgeted provider as `eval-model`, through explicit flags:
+
+```bash
+scripts/validate.sh --live --model deepseek-flash --allow-paid-calls --budget-usd 0.50 \
+  --max-calls 20 --input-cost-per-1k 0.0003 --output-cost-per-1k 0.0012 --max-output-tokens 8000
+```
+
+- **Flags, not environment variables.** `validate.sh` runs the offline, integration and
+  API acceptance stages in the same shell as the live stage, and the API builds its own
+  provider from `OPSACCORD_MODEL_*` settings. A provider exported for the live run would
+  reach those stages, and through the API it would have no run budget. The model flags
+  are forwarded to the live stage only, and `validate.sh` refuses them without `--live`.
+- Without `--model`, the live run stays deterministic, exactly as in Phase 1.
+- Each live record now carries `model_decision`: what the model concluded and proposed,
+  which layer refused it, and its tokens, cost and latency. The run ends with the spend
+  ledger.
