@@ -26,7 +26,13 @@
 # was quiet could not decide the question; this one could. A restart alone re-entered
 # the hang within about seven minutes.
 #
-# The report and docs/astronomy-shop.md record both as environment deviations.
+# astronomy-db (the catalog's PostgreSQL) was raised from 80M on 2026-10-18 after it was
+# found with oom_killed=true at 66-68 MiB of its 80 MiB while idle: PostgreSQL survives a
+# killed backend by dropping every connection and recovering, which the healthcheck reads
+# as unhealthy, and compose then refused to start the catalog that depends on it. It has
+# no data volume; a recreated container reseeds from the pinned init.sql.
+#
+# The report and docs/astronomy-shop.md record all three as environment deviations.
 services:
   checkout:
     deploy:
@@ -42,3 +48,8 @@ services:
           memory: 256M
     environment:
       GOMEMLIMIT: 192MiB
+  astronomy-db:
+    deploy:
+      resources:
+        limits:
+          memory: 256M

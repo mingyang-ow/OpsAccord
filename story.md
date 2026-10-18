@@ -351,3 +351,12 @@ quiet, and they disagreed, so I recorded that they did *not* justify the change.
 taken during the hang is the measurement that could decide it. *Lesson:* capture before
 you restart. A restart erases the evidence, and that is why this took three freezes to
 diagnose.
+
+**Follow-up the same night: the catalog's database was undersized too.** Applying the
+catalog override failed because `astronomy-db` was unhealthy. A read-only capture showed
+`oom_killed=true` at 66-68 of its 80 MB. PostgreSQL survives a killed process by
+dropping all connections and recovering, so the healthcheck failed, and Docker would not
+start the catalog. **Decision:** raise it to 256 MB as well, with the same justification
+(a measured OOM kill) and the same scope (limits only; the DB reseeds from `init.sql`).
+Three services in the pinned demo have proven undersized for this host: checkout, the
+catalog and its database.

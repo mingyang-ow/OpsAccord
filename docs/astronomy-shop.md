@@ -495,7 +495,12 @@ not:
 
 That is the `checkout` signature, so `demo/compose.opsaccord.yaml` now gives
 `product-catalog` the same documented pair (256M, `GOMEMLIMIT=192MiB`). Only resource
-limits change.
+limits change. Applying it then exposed the catalog's database: `astronomy-db` was found with
+`oom_killed=true` at 66-68 MiB of its 80 MiB while idle. A killed PostgreSQL backend
+takes every connection down while the server recovers, the `pg_isready` healthcheck reads
+that as unhealthy, and compose would not start the catalog that depends on it. The
+override raises `astronomy-db` to 256M. It has no data volume and reseeds from the
+pinned `init.sql`.
 
 ## Live adapter
 
