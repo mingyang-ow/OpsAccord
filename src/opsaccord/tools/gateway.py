@@ -479,6 +479,40 @@ class ToolGateway:
             )
         return action
 
+    @staticmethod
+    def _dispatch_mismatch(session: Any, action: Action) -> str | None:
+        """What would be dispatched must be exactly what was recorded and approved.
+
+        The approval is bound to digests taken when it was requested, and the claim
+        compares those stored digests. Dispatch, however, sends the stored *arguments*.
+        A write that changed the arguments without the digests (P2-03) would therefore
+        pass the claim and dispatch something no human approved. So the digests are
+        recomputed here from the very arguments that would be sent, and compared with
+        the action's record and with its approval.
+        """
+        from opsaccord.config import digest
+
+        intent = Action.compute_intent_digest(action.tool_name, action.target, action.arguments)
+        arguments = digest(action.arguments)
+        if intent != action.intent_digest or arguments != action.arguments_digest:
+            return (
+                "approval mismatch: the action's arguments no longer match its recorded "
+                "intent, so what would run is not what was approved"
+            )
+        if action.approval_id:
+            approval = repo.get_approval(session, action.approval_id)
+            if approval is None:
+                return f"approval mismatch: approval {action.approval_id} does not exist"
+            if (
+                approval.action_id != action.id
+                or approval.intent_digest != intent
+                or approval.arguments_digest != arguments
+            ):
+                return (
+                    "approval mismatch: the approved intent differs from the action that would run"
+                )
+        return None
+
     def execute_action(self, *, action_id: str, actor: str = "tool-gateway") -> ActionExecution:
         """Claim, revalidate, dispatch once, and record the outcome.
 
@@ -496,6 +530,11 @@ class ToolGateway:
             action = repo.get_action(session, action_id)
             if action is None:
                 raise repo.RepositoryError(f"unknown action {action_id}")
+            mismatch = self._dispatch_mismatch(session, action)
+            if mismatch is not None:
+                # Refused before the claim, so the approval is not consumed and nothing
+                # is dispatched (P2-03).
+                return ActionExecution(action, False, mismatch)
             action_spec = self.registry.get(action.tool_name)
             if action_spec is None or action_spec.side_effect is not SideEffect.WRITE:
                 # Defence in depth, before anything is claimed: an action row written

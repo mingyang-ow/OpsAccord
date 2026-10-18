@@ -118,11 +118,14 @@ def test_lone_unreachable_probe_is_not_enough_for_a_critical_service() -> None:
 
 
 def test_measured_payment_failure_share_alone_is_actionable() -> None:
-    """A real failing-RPC share is the live signature of paymentUnreachable.
+    """A measured failure share on payment's *own* spans, while reachable, is actionable.
 
-    The pinned stack shows roughly a third of live Charge attempts failing under
-    the flag, so the diagnosis has to act on a measured share at the probe's own
-    error bound rather than on an arbitrary higher threshold.
+    It must be acted on at the probe's own error bound rather than at an arbitrary higher
+    threshold. Which fix it calls for changed with P2-02 (2026-10-18): health reads are
+    scoped to the target's own spans (e6232c2), and under paymentUnreachable payment's own
+    error share stays 0.0 while only the caller's calls fail. A reachable payment failing
+    its own attempts is therefore the paymentFailure signature, and the unreachable fix
+    would be the wrong action.
     """
     proposal = DeterministicAdapter().propose(
         request_for(
@@ -132,6 +135,24 @@ def test_measured_payment_failure_share_alone_is_actionable() -> None:
                     "read_service_health",
                     "HEALTH",
                     {"reachable": True, "healthy": False, "error_rate": 0.33},
+                ),
+            ],
+        )
+    )
+    action = proposal.diagnosis.proposed_action
+    assert action is not None
+    assert action.arguments["flag_id"] == "paymentFailure"
+
+
+def test_an_unreachable_payment_still_gets_the_unreachable_fix() -> None:
+    proposal = DeterministicAdapter().propose(
+        request_for(
+            "payment-service",
+            [
+                evidence(
+                    "read_service_health",
+                    "HEALTH",
+                    {"reachable": False, "healthy": False, "error_rate": 1.0},
                 ),
             ],
         )

@@ -466,3 +466,31 @@ with 0 actions executed. The clean-edge wait visibly mattered: P1-06 had to wait
 P1-05's tail.
 
 **Spend so far:** about $1.45 of the $3 cap.
+
+## 2026-10-18 - The remaining evaluation concepts: P2-02, P2-03, P2-04
+
+**User decisions:**
+
+- Nothing about the user's DeepSeek account may be public, and people bring their own
+  key. Audited: the key is in no tracked file and no commit in the history. Only the
+  *name* of the environment variable appears.
+- Skip extra live repeats for now, and defer the stale-flag root cause.
+- Build #2, #12 and #7, then update the README and write-up.
+
+**What building them found:**
+
+- **#12 found a real hole.** If an approved action's arguments were rewritten while its
+  digests stayed the same, the claim checked the stored digests, passed, and the altered
+  action ran. *Decision:* recompute the digests from the exact arguments about to be
+  dispatched, before the claim, and compare them with both the action and its approval.
+- **#2 found two problems.** The deterministic adapter always proposed the "unreachable"
+  fix, and the simulator let *any* Payment flag clear *any* Payment fault. Fixed both.
+  *Policy decision:* payment may now have either verified flag disabled; otherwise the
+  correct fix for #2 would be refused while the wrong one stayed allowed.
+- **#7 needed nothing new.** The hard cap refused the proposal, as designed.
+
+**Finding left as a finding:** `deepseek-flash` picked the wrong Payment flag in 2 of 6
+runs, with a correct description of the evidence. The human approved and it ran. I did
+*not* add a rule tying the fix to the fault signature: that would move diagnosis into
+policy on the strength of two runs. It is recorded as the limit of human approval, and a
+candidate for later.

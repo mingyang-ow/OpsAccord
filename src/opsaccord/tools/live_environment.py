@@ -141,6 +141,14 @@ class LiveTarget:
     operation_alias: str
     fault_flag: str
     probe_window_seconds: int = LIVE_HEALTH_WINDOW_SECONDS
+    # Further verified fault flags on the same target. Payment carries two at the pinned
+    # revision: paymentUnreachable (the caller cannot reach it) and paymentFailure (it
+    # answers with errors). They need different fixes.
+    extra_fault_flags: tuple[str, ...] = ()
+
+    @property
+    def fault_flags(self) -> tuple[str, ...]:
+        return (self.fault_flag, *self.extra_fault_flags)
 
 
 LIVE_TARGETS: dict[str, LiveTarget] = {
@@ -151,6 +159,7 @@ LIVE_TARGETS: dict[str, LiveTarget] = {
         operation="oteldemo.PaymentService/Charge",
         operation_alias="Charge",
         fault_flag="paymentUnreachable",
+        extra_fault_flags=("paymentFailure",),
     ),
     "ad-service": LiveTarget(
         target="ad-service",
@@ -1038,15 +1047,17 @@ class LiveEnvironment:
         live = self._target(target)
         document = self.read_flag_document(timeout_seconds=timeout_seconds)
         flags = document.get("flags", {})
-        current = flags.get(live.fault_flag, {}).get("defaultVariant")
-        changes = [
-            {
-                "kind": "feature_flag",
-                "flag_id": live.fault_flag,
-                "state": current,
-                "fault_active": current != FLAG_SAFE_VARIANT.get(live.fault_flag),
-            }
-        ]
+        changes = []
+        for flag_id in live.fault_flags:
+            current = flags.get(flag_id, {}).get("defaultVariant")
+            changes.append(
+                {
+                    "kind": "feature_flag",
+                    "flag_id": flag_id,
+                    "state": current,
+                    "fault_active": current != FLAG_SAFE_VARIANT.get(flag_id),
+                }
+            )
         return ToolResult(
             tool_name="read_recent_changes",
             target=target,
@@ -1141,7 +1152,7 @@ class LiveEnvironment:
                 is_simulated=False,
                 collected_at=self._now(),
             )
-        if flag_id != live.fault_flag:
+        if flag_id not in live.fault_flags:
             return ToolResult(
                 tool_name="apply_remediation",
                 target=target,

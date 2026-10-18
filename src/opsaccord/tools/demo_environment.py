@@ -39,6 +39,11 @@ class ServiceState:
     latency_p95_ms: float = 42.0
     request_rate: float = 130.0
     container_restarts: int = 0
+    # The fault flag actually causing this state, when one is. Turning off a *different*
+    # flag must not repair it: on the real stack the wrong fix changes nothing. Before
+    # this was tracked, disabling any Payment flag cleared every Payment fault, which let
+    # a wrong-flag fix verify as a recovery in simulation (deepseek-flash, P2-02).
+    active_fault: str | None = None
 
     @property
     def healthy(self) -> bool:
@@ -398,11 +403,17 @@ class DemoEnvironment:
         """
         self.external_changes.append({"target": target, "flag_id": flag_id})
         state = self._state(target)
+        if state.active_fault is not None and flag_id != state.active_fault:
+            return
+        state.active_fault = None
         if flag_id == "paymentUnreachable":
             state.reachable = True
             state.health = "SERVING"
             state.error_rate = 0.0
             state.latency_p95_ms = 45.0
+        elif flag_id == "paymentFailure":
+            state.health = "SERVING"
+            state.error_rate = 0.0
         elif flag_id == "adHighCpu":
             state.cpu_utilization = 0.21
         elif flag_id == "cartFailure":
@@ -412,6 +423,9 @@ class DemoEnvironment:
         if self.faults.remediation_ineffective:
             return
         state = self._state(target)
+        if state.active_fault is not None and flag_id != state.active_fault:
+            return
+        state.active_fault = None
         if flag_id == "adHighCpu":
             state.cpu_utilization = 0.21
         elif flag_id == "paymentUnreachable":
@@ -419,6 +433,9 @@ class DemoEnvironment:
             state.health = "SERVING"
             state.error_rate = 0.0
             state.latency_p95_ms = 45.0
+        elif flag_id == "paymentFailure":
+            state.health = "SERVING"
+            state.error_rate = 0.0
         elif flag_id == "cartFailure":
             state.error_rate = 0.0
 
