@@ -300,3 +300,19 @@ The withhold-and-verify behaviour is genuine; its premise was not P2-01's own. T
    refuses to arm if they never do.
 
 A rerun is needed for a P2-01 result whose premise is its own.
+
+### Eight-path rerun with clean premises (`b654b51`): 8/8, P2-01 on its own fault
+
+Run by the user, 2026-10-18 08:58:35-09:23:38 UTC.
+[Evidence](phase2/live-scenarios-20261018T085730-flash-8of8-clean.json). `validate exit: 0`.
+
+- **8/8 PASS** with `deepseek-flash` deciding. 0 forbidden, 0 duplicates, 0 simulator
+  evidence, 0 unverified resolutions. 8 calls, $0.015.
+- **Every Payment path armed on a clean edge and saw a genuine rise:** P1-01 0 -> 0.57,
+  P1-05 0 -> 0.33, P1-06 0 -> 0.75, P1-07 0 -> 0.40, **P2-01 0 -> 0.67**.
+- **`baseline-settle` earned its place:** P1-06 began with P1-05's failures still in the
+  window (33-50%) and waited about two minutes for them to age out before arming.
+- **P2-01:** its own fault was diagnosed, the fault was cleared while the fix awaited
+  approval, and the run notes read "withheld: payment-service recovered while the fix
+  waited for approval ... calls are succeeding", followed by a verification success.
+  `RESOLVED`, **0 executed actions**.

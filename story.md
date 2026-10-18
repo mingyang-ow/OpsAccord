@@ -457,3 +457,12 @@ counted, including noise.
 *Why not just accept the 8/8:* a pass whose premise came from a different scenario is not
 evidence for that scenario. Reporting it as clean would be exactly the "telemetry the
 write had not caused" mistake Phase 1 recorded.
+
+## 2026-10-18 - P2-01 proven live, on its own fault
+
+**Result:** 8/8 live with clean premises. Every Payment path armed on a fault-free edge
+and saw its own rise. P2-01 withheld its approved fix and resolved on verified recovery,
+with 0 actions executed. The clean-edge wait visibly mattered: P1-06 had to wait out
+P1-05's tail.
+
+**Spend so far:** about $1.45 of the $3 cap.
