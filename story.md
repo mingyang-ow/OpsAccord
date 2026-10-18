@@ -14,7 +14,7 @@ matters. The thesis it is built to demonstrate: **a language model may propose, 
 never decides.** A deterministic policy engine, a typed tool gateway and exact human
 approvals decide what actually runs, and PostgreSQL records every step.
 
-It is a learning and portfolio project, meant to be public.
+It is an independent project, published under the MIT licence.
 
 ## Phase 1 decisions (2026-09-23 to 2026-10-17)
 
@@ -89,13 +89,14 @@ memory-limit fix, so this needs new numbers before anything changes.
 with the driver on passed **7/7** (exit 0, 2026-10-17, `6cea3c0`). The order outcomes
 matched each path's design: P1-01's failed under the fault and succeeded after the fix,
 P1-06's all failed, and P1-07's flipped to failing when the fault was re-armed. The
-preflight's refusal path is tested offline but has not yet been triggered live.
+preflight's refusal path was tested offline at this point. *(It was triggered live on
+2026-10-18, when it refused a hung catalog in seconds.)*
 
 ## 2026-10-17 - going public
 
-**Decision:** the repository will be made public as a portfolio project, under the
-**MIT licence** (the user approved it: short, permissive, standard for portfolio work).
-Before the visibility change, a readability pass was done for strangers:
+**Decision:** the repository will be made public under the **MIT licence** (the user approved it:
+short and permissive). Before the visibility change, a readability pass was done for
+first-time readers:
 
 - **The README** now leads with what the project proves, a results table, a Mermaid
   architecture diagram and two real console screenshots.
@@ -106,10 +107,10 @@ Before the visibility change, a readability pass was done for strangers:
 
 *Why a summary rather than rewriting the report:* the report's value is that it is an
 honest, chronological record, including the mistakes. Rewriting it would lose that, so a
-stranger gets a front door instead.
+first-time reader gets a front door instead.
 
 **Still to do before going public:** have the user read the README, the summary and
-`story.md` as a stranger would, then flip the visibility themselves. Visibility is never
+`story.md` as a first-time reader would, then flip the visibility themselves. Visibility is never
 changed without an explicit instruction.
 
 ## 2026-10-17 - Phase 2: what to start with
@@ -126,7 +127,7 @@ scenarios, chosen by what that evaluation reveals.
   actually tested.
 - It needs no new infrastructure: the adapter, the budget accounting and the scenario
   scoring already exist, and simulated mode is cheap and repeatable.
-- It produces the artifact that reads best in a portfolio: a table of what the model
+- It produces the most informative artifact: a table of what the model
   proposed, what policy blocked, outcome per scenario, latency and cost - compared with
   the deterministic baseline.
 - Its findings choose the next scenarios on evidence. For example, if the model often
@@ -139,8 +140,8 @@ scenarios, chosen by what that evaluation reveals.
   each new scenario adds less to the story.
 - *Multi-model routing.* This is interesting, but it is premature until one model's
   behaviour is measured.
-- *Production integrations.* These are out of scope for a portfolio project and would
-  weaken the "isolated, safe" framing.
+- *Production integrations.* These are out of scope for this project and would
+  weaken the "isolated, safe" design.
 
 ## 2026-10-17 - Phase 2a: preparing for a real model
 
