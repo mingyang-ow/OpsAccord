@@ -14,6 +14,11 @@ from opsaccord.config import REPO_ROOT, Settings, get_settings
 from opsaccord.domain.enums import ScenarioOutcome
 from opsaccord.persistence.db import Database
 from opsaccord.reasoning.deterministic import DeterministicAdapter
+
+# Worst-case prompt size per call. Bytes bound tokens from above (see
+# OpenAICompatibleAdapter.max_input_bytes), so this is also the input-token ceiling the
+# run budget reserves against.
+from opsaccord.reasoning.openai_compatible import DEFAULT_MAX_INPUT_BYTES as EVAL_MAX_INPUT_BYTES
 from opsaccord.scenarios.fixtures import SCENARIOS
 from opsaccord.scenarios.live import (
     LIVE_PLANS,
@@ -379,12 +384,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-#: Worst-case prompt size per call. Bytes bound tokens from above (see
-#: OpenAICompatibleAdapter.max_input_bytes), so this is also the input-token ceiling the
-#: run budget reserves against.
-EVAL_MAX_INPUT_BYTES = 32_000
-
-
 def _hosted_provider(settings: Settings, args: argparse.Namespace) -> tuple[Any, Any] | str:
     """A budgeted hosted provider from explicit flags, or the reason one cannot be built.
 
@@ -424,7 +423,8 @@ def _hosted_provider(settings: Settings, args: argparse.Namespace) -> tuple[Any,
         base_url=settings.model_base_url,
         model_id=model_id,
         api_key_env=settings.model_api_key_env,
-        timeout_seconds=settings.model_timeout_seconds,
+        timeout_seconds=getattr(args, "model_timeout_seconds", None)
+        or settings.model_timeout_seconds,
         max_output_tokens=max_output,
         allow_paid_calls=True,
         input_cost_per_1k_usd=rates.input_per_1k_usd,
@@ -455,6 +455,12 @@ def _add_model_arguments(p: argparse.ArgumentParser, *, max_calls: int) -> None:
     p.add_argument("--input-cost-per-1k", type=float, default=None)
     p.add_argument("--output-cost-per-1k", type=float, default=None)
     p.add_argument("--max-output-tokens", type=int, default=None)
+    p.add_argument(
+        "--model-timeout-seconds",
+        type=float,
+        default=None,
+        help="per-call timeout; a slow reasoning model can need more than the default 45 s",
+    )
 
 
 def cmd_eval_model(args: argparse.Namespace) -> int:

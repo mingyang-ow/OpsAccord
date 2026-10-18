@@ -8,6 +8,7 @@
 #   scripts/validate.sh --offline-only  offline, lint, types only (no PostgreSQL needed)
 #   scripts/validate.sh --live --model ID --allow-paid-calls --budget-usd N \
 #       --input-cost-per-1k X --output-cost-per-1k Y [--max-calls N] [--max-output-tokens N]
+#       [--model-timeout-seconds N]
 #                                       the live paths with a hosted model under a hard budget;
 #                                       these flags reach the live stage only, never the
 #                                       offline, integration or API stages
@@ -55,12 +56,12 @@ while [ $# -gt 0 ]; do
       SCENARIO_IDS+=("$1")
       ;;
     --allow-paid-calls ) MODEL_ARGS+=("$1") ;;
-    --model | --budget-usd | --max-calls | --input-cost-per-1k | --output-cost-per-1k | --max-output-tokens )
+    --model | --budget-usd | --max-calls | --input-cost-per-1k | --output-cost-per-1k | --max-output-tokens | --model-timeout-seconds )
       [ $# -gt 1 ] || usage
       MODEL_ARGS+=("$1" "$2")
       shift
       ;;
-    -h | --help ) sed -n '2,34p' "$0"; exit 0 ;;
+    -h | --help ) sed -n '2,35p' "$0"; exit 0 ;;
     * ) usage ;;
   esac
   shift
