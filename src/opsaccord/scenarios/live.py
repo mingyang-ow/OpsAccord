@@ -774,7 +774,56 @@ def _fault_is_new(signal: str, probe: dict[str, Any], baseline: dict[str, Any] |
     previous = _reading(baseline.get(key))
     if current is None or previous is None:
         return False
-    return current > previous
+    # A rise has to be a rise. On 2026-10-18, P2-01 accepted 0.5714285714285714 over a
+    # pre-injection 0.5714285714285712: floating-point noise on the previous path's
+    # failures, still inside the window. The margin is the bound a reading must clear to
+    # count as a fault at all.
+    return current > previous + RISE_MARGIN.get(key, TELEMETRY_ERROR_BOUND)
+
+
+#: The smallest rise that counts as the armed fault appearing, per signal.
+RISE_MARGIN: dict[str, float] = {"error_rate": TELEMETRY_ERROR_BOUND, "cpu_utilization": 0.10}
+
+
+def wait_for_clean_edge(
+    environment: Environment,
+    *,
+    caller: str,
+    callee: str,
+    window_seconds: int,
+    timeout_seconds: float,
+    poll_seconds: float,
+    observe: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Block until the caller's calls to the callee are not failing, before arming.
+
+    Consecutive Payment paths share one edge and one telemetry window. A path that ends
+    with the fault armed (P1-07 does, by design) leaves failures in the window for the
+    next one, which would otherwise inherit them as its own premise and diagnosis. So a
+    dependency plan arms only once that tail has aged out: the edge must not be *failing*.
+    A window with no calls, or an unattributable one, carries no tail to inherit; whether
+    the armed fault then appears is the fault-visibility stage's question.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        edge = environment.read_dependency(
+            target=caller, dependency=callee, window_seconds=window_seconds, timeout_seconds=8.0
+        )
+        last = _dependency_snapshot(edge.value) if edge.succeeded else {"error": edge.error}
+        verdict = classify_dependency_edge(edge.value) if edge.succeeded else None
+        if verdict is not None and not verdict.failing:
+            return last
+        if observe is not None:
+            observe(
+                f"{caller} -> {callee}: waiting for the previous path's failures to age out "
+                f"({verdict.detail if verdict else last})"
+            )
+        time.sleep(poll_seconds)
+    raise LiveSetupFailed(
+        f"{caller} -> {callee} still carried failures after {timeout_seconds}s, so this "
+        f"path's fault could not be told apart from the previous one's; last read: {last}"
+    )
 
 
 def _health_snapshot(value: dict[str, Any]) -> dict[str, Any]:
@@ -1285,6 +1334,27 @@ def run_live_scenario(
                     _traffic_observation(spec.service, probe)
                 ),
             )
+
+            if plan.corroborating_dependency is not None:
+                stage = "baseline-settle"
+                settle_budget = budget.clamp(TRAFFIC_VISIBILITY_TIMEOUT_SECONDS)
+                reporter.enter_stage(
+                    stage,
+                    budget_seconds=settle_budget,
+                    message=(
+                        f"waiting for {plan.corroborating_dependency} -> {spec.service} to "
+                        "carry no failures before arming"
+                    ),
+                )
+                wait_for_clean_edge(
+                    environment,
+                    caller=plan.corroborating_dependency,
+                    callee=spec.service,
+                    window_seconds=DEPENDENCY_PREMISE_WINDOW_SECONDS,
+                    timeout_seconds=settle_budget,
+                    poll_seconds=poll_seconds,
+                    observe=reporter.observation,
+                )
 
             stage = "fault-injection"
             reporter.enter_stage(

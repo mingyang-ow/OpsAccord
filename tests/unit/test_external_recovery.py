@@ -134,3 +134,54 @@ def test_the_cli_refuses_a_stale_payment_path_with_the_recovery_command(
     assert cli.main(["run-live-scenarios"]) == 2
     out = capsys.readouterr().out
     assert "restart checkout" in out and ran == []
+
+
+# -- a premise is a real rise, and Payment paths start from a clean edge -----------------
+
+
+def test_floating_point_noise_is_not_a_rise() -> None:
+    """The exact readings of live P2-01, 2026-10-18: P1-07's failures still in the window."""
+    before = {"error_rate": 0.5714285714285712}
+    after = {"error_rate": 0.5714285714285714}
+    assert not live_scenarios._fault_is_new("error_rate", after, before)
+
+
+def test_a_real_rise_is_a_rise() -> None:
+    assert live_scenarios._fault_is_new("error_rate", {"error_rate": 0.9}, {"error_rate": 0.0})
+    assert not live_scenarios._fault_is_new("error_rate", {"error_rate": 0.04}, {"error_rate": 0.0})
+    assert live_scenarios._fault_is_new("cpu", {"cpu_utilization": 1.2}, {"cpu_utilization": 0.01})
+
+
+def test_the_previous_paths_tail_is_waited_out_before_arming() -> None:
+    stack = _all_off(calls=0.2, share=1.0)  # the edge still carries the last path's failures
+    seen: list[str] = []
+
+    def age_out(message: str) -> None:
+        seen.append(message)
+        stack.dependency_error_share = 0.0  # the tail ages out of the window
+
+    result = live_scenarios.wait_for_clean_edge(
+        stack,  # type: ignore[arg-type]
+        caller="checkout-service",
+        callee="payment-service",
+        window_seconds=120,
+        timeout_seconds=2.0,
+        poll_seconds=0.01,
+        observe=age_out,
+    )
+    assert seen and "age out" in seen[0]
+    assert result["error_rate"] == 0.0
+
+
+def test_a_tail_that_never_ages_out_refuses_to_arm() -> None:
+    import pytest
+
+    with pytest.raises(live_scenarios.LiveSetupFailed, match="could not be told apart"):
+        live_scenarios.wait_for_clean_edge(
+            _all_off(calls=0.2, share=1.0),  # type: ignore[arg-type]
+            caller="checkout-service",
+            callee="payment-service",
+            window_seconds=120,
+            timeout_seconds=0.05,
+            poll_seconds=0.01,
+        )

@@ -267,3 +267,36 @@ happened, and the model made 3 calls for $0.004.
 **Fix:** `payment_path_preflight` reads checkout's own calls to payment before any
 scenario. If they are failing while every fault flag is confirmed off, the run is refused
 (exit 2), with `scripts/demo.sh restart checkout` as the recovery.
+
+### Eight-path run after restarting checkout (`0f06ee0`): 8/8, with one caveat
+
+Recovery first: checkout was restarted, and its calls to payment were succeeding again
+within 60 s. The capture showed `flagd` and checkout both restarted at 07:06, with checkout
+starting about 3 s before `flagd` was listening. That is a plausible way to end up with a
+broken flag event stream. Checkout's logs carried no flag lines, so this stays the likely
+cause, not a proven one.
+
+[Evidence](phase2/live-scenarios-20261018T075231-flash-8of8.json): `validate exit: 0`, and
+all three preflights passed: the flags, the storefront, and checkout -> payment at 0.133
+calls/s with 0% failing.
+
+- **8/8 PASS** with `deepseek-flash` deciding: 0 forbidden, 0 duplicates, 0 simulator
+  evidence, 0 unverified resolutions. 8 calls, $0.014.
+- **P2-01:** `RESOLVED` with **0 executed actions**. The notes read: "withheld:
+  payment-service recovered while the fix waited for approval ...", followed by a
+  verification success.
+
+**Caveat, and the harness defect it exposed.** P2-01's fault-visibility check accepted the
+checkout -> payment edge at 0.5714285714285714 against a pre-injection
+0.5714285714285712. That "rise" was floating-point noise on P1-07's failures, still inside
+the 120 s window, because P1-07 ends with the fault armed by design. The harness then
+cleared the fault 5 s after arming it, so P2-01's incident mostly diagnosed P1-07's tail.
+The withhold-and-verify behaviour is genuine; its premise was not P2-01's own. Two fixes:
+
+1. **A rise must clear a margin:** the 5% telemetry bound for error rates, and 0.10 for
+   CPU.
+2. **Dependency plans arm only on a clean edge:** a new `baseline-settle` stage waits,
+   within the traffic budget, until the previous path's failures have aged out, and
+   refuses to arm if they never do.
+
+A rerun is needed for a P2-01 result whose premise is its own.

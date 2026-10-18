@@ -436,3 +436,24 @@ about, so it refuses and says what to run.
 **Pattern so far:** each new failure of the demo has been caught first by a control
 doing its job (verification, the storefront check), and then made cheaper by a startup
 check that refuses in seconds instead of minutes.
+
+## 2026-10-18 - 8/8 live, and a premise that wasn't P2-01's own
+
+**Result:** after restarting checkout, all eight live paths passed with the model
+deciding, and P2-01 withheld its fix and resolved on verification.
+
+**But I checked the premise, and it didn't hold up.** P2-01's "the fault is now visible"
+check had accepted a failure rate of 0.5714285714285714 over a *before* reading of
+0.5714285714285712. That is a rounding difference, on failures left over from P1-07.
+Our own "a premise must be a rise, not a level" rule had a hole: any increase at all
+counted, including noise.
+
+**Decisions:**
+
+- **A rise must clear a real margin** (5% for error rates, 0.10 for CPU).
+- **Payment paths start from a clean edge:** wait until the previous path's tail has aged
+  out of the window before arming, and refuse if it never does.
+
+*Why not just accept the 8/8:* a pass whose premise came from a different scenario is not
+evidence for that scenario. Reporting it as clean would be exactly the "telemetry the
+write had not caused" mistake Phase 1 recorded.
