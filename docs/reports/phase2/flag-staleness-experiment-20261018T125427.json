@@ -1,0 +1,51 @@
+{
+  "flag": "paymentUnreachable",
+  "started_at": "2026-10-18T12:54:29.738342+00:00",
+  "control": {
+    "while_on": [
+      "http_500",
+      "http_500",
+      "http_500"
+    ],
+    "after_off": [
+      "ok",
+      "ok",
+      "ok"
+    ],
+    "follows_on": true,
+    "follows_off": true,
+    "follows": true
+  },
+  "after_flagd_restart": {
+    "while_on": [
+      "http_500",
+      "http_500",
+      "http_500"
+    ],
+    "after_off": [
+      "ok",
+      "ok",
+      "ok"
+    ],
+    "follows_on": true,
+    "follows_off": true,
+    "follows": true
+  },
+  "after_checkout_restart": {
+    "while_on": [
+      "http_500",
+      "http_500",
+      "http_500"
+    ],
+    "after_off": [
+      "ok",
+      "ok",
+      "ok"
+    ],
+    "follows_on": true,
+    "follows_off": true,
+    "follows": true
+  },
+  "cleanup_read_back": "off",
+  "verdict": "NOT REPRODUCED: checkout kept following the flag after flagd restarted"
+}

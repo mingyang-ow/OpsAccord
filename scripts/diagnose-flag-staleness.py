@@ -22,6 +22,10 @@ restarts only flagd and checkout, through ``scripts/demo.sh``; and on every exit
 turns the flag off and reads it back. It writes ``result.json`` and ``experiment.log`` to
 ``--out``.
 
+``--scenario startup-race`` tests the other reading instead: checkout *starting* while flagd
+is not listening, which is what the 07:06 evidence showed. Phase 2 then stops flagd,
+restarts checkout with flagd down, and starts flagd again before arming the flag.
+
 Exit status: 0 the experiment ran (whatever it found); 1 it could not run or could not
 restore the flag; 2 usage.
 """
@@ -30,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -48,6 +53,10 @@ FLAG = "paymentUnreachable"
 ON, OFF = "on", "off"
 ORDERS_PER_CHECK = 3
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DOCKER = os.environ.get(
+    "OPSACCORD_DOCKER_BIN",
+    "/mnt/c/Users/admin/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe",
+)
 
 _log_lines: list[str] = []
 
@@ -85,6 +94,23 @@ def demo(*args: str) -> None:
     subprocess.run(["bash", "scripts/demo.sh", *args], cwd=REPO_ROOT, check=True)
 
 
+def container_id(service: str) -> str:
+    """This project's container for a service, resolved by label through demo.sh."""
+    out = subprocess.run(
+        ["bash", "scripts/demo.sh", "service-container", service],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return out.split("\t", 1)[1].split()[0]
+
+
+def docker(*args: str) -> None:
+    log(f"  docker {' '.join(args)}")
+    subprocess.run([DOCKER, *args], check=True, capture_output=True)
+
+
 def set_flag(env: LiveEnvironment, variant: str) -> None:
     env.set_flag_variant(flag_id=FLAG, variant=variant, timeout_seconds=10.0)
     log(f"  {FLAG} set to {variant!r}")
@@ -117,6 +143,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--out", required=True, help="directory for result.json and the log")
     parser.add_argument("--settle-seconds", type=float, default=15.0)
+    parser.add_argument(
+        "--scenario",
+        choices=["flagd-restart", "startup-race"],
+        default="flagd-restart",
+        help="what disturbs checkout's flag provider in phase 2",
+    )
     args = parser.parse_args(argv)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -124,7 +156,12 @@ def main(argv: list[str] | None = None) -> int:
     settings = live_settings()
     env = LiveEnvironment(settings=settings)
     base = storefront_origin(settings)
-    result: dict[str, Any] = {"flag": FLAG, "started_at": datetime.now(UTC).isoformat()}
+    result: dict[str, Any] = {
+        "flag": FLAG,
+        "scenario": args.scenario,
+        "started_at": datetime.now(UTC).isoformat(),
+    }
+    flagd_id: str | None = None
     rc = 0
     with httpx.Client(timeout=15.0) as client:
         try:
@@ -133,16 +170,22 @@ def main(argv: list[str] | None = None) -> int:
                 env, client, base, "1/3 control, healthy stack", args.settle_seconds
             )
 
-            log("restarting flagd only; checkout keeps running")
-            demo("restart", "flagd")
-            time.sleep(20)  # flagd listening again, before any flag change
-            result["after_flagd_restart"] = phase(
-                env,
-                client,
-                base,
-                "2/3 after restarting flagd under a running checkout",
-                args.settle_seconds,
-            )
+            if args.scenario == "flagd-restart":
+                log("restarting flagd only; checkout keeps running")
+                demo("restart", "flagd")
+                time.sleep(20)  # flagd listening again, before any flag change
+                label = "2/3 after restarting flagd under a running checkout"
+            else:
+                flagd_id = container_id("flagd")
+                log("stopping flagd, then starting checkout while flagd is down")
+                docker("stop", flagd_id)
+                demo("restart", "checkout")
+                time.sleep(20)  # checkout's provider initialises with no flagd to reach
+                docker("start", flagd_id)
+                flagd_id = None
+                time.sleep(25)  # flagd listening again, before any flag change
+                label = "2/3 after checkout started while flagd was down"
+            result["after_flagd_restart"] = phase(env, client, base, label, args.settle_seconds)
 
             log("restarting checkout so it reconnects with a fresh cache")
             demo("restart", "checkout")
@@ -156,6 +199,12 @@ def main(argv: list[str] | None = None) -> int:
             result["error"] = f"{type(exc).__name__}: {exc}"
             rc = 1
         finally:
+            if flagd_id is not None:
+                try:
+                    docker("start", flagd_id)
+                    time.sleep(20)
+                except Exception as exc:
+                    log(f"could not restart flagd: {exc}; run: bash scripts/demo.sh start")
             try:
                 set_flag(env, OFF)
                 read_back = env.read_flag_document(timeout_seconds=10.0)["flags"][FLAG][
@@ -173,13 +222,18 @@ def main(argv: list[str] | None = None) -> int:
     control = result.get("control", {}).get("follows")
     stale = result.get("after_flagd_restart", {}).get("follows")
     recovered = result.get("after_checkout_restart", {}).get("follows")
+    trigger = (
+        "flagd restarts under it"
+        if args.scenario == "flagd-restart"
+        else "it starts while flagd is down"
+    )
     if control and stale is False and recovered:
         verdict = (
             "REPRODUCED: checkout follows the flag on a healthy stack, stops following it after "
-            "flagd restarts under it, and follows again once checkout restarts"
+            f"{trigger}, and follows again once checkout restarts"
         )
     elif control and stale and recovered:
-        verdict = "NOT REPRODUCED: checkout kept following the flag after flagd restarted"
+        verdict = f"NOT REPRODUCED: checkout kept following the flag after {trigger}"
     else:
         verdict = "INCONCLUSIVE: the control phase or the recovery phase did not behave as expected"
     result["verdict"] = verdict

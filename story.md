@@ -526,3 +526,13 @@ never contained one, and a history audit confirmed it.
   "not reproduced" if it does not.
 - **`deepseek-v4-pro` on the live stack** needed one more flag, `--model-timeout-seconds`.
   It took about 28 s per answer in simulation, close to the 45 s default.
+
+**Results so far:**
+
+- **The API cap** is in, with tests.
+- **`deepseek-v4-pro` live: 8/8** for $0.10. One call took 62 s, which justified the new
+  timeout flag.
+- **The stale flag:** the first experiment *refuted* the leading explanation. Restarting
+  flagd under a running checkout did not break anything. *Decision:* do not keep the old
+  explanation just because it was written down. Test the remaining candidate, a checkout
+  that starts while flagd is down, with the same experiment.
