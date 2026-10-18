@@ -450,6 +450,19 @@ Two changes remove that dependence:
 The driver is harness code. No model, policy decision or gateway call can reach it, and
 its paths and origin are fixed by configuration, never taken from an incident.
 
+### Checkout's flag cache goes stale if checkout starts before flagd
+
+**Proven 2026-10-18** (`scripts/diagnose-flag-staleness.py --scenario startup-race`). When
+checkout starts while flagd is not listening, it still resolves the first flag value it
+asks for, but it never establishes the event stream that invalidates its cache. From then
+on it keeps acting on that first value, and turning `paymentUnreachable` off no longer
+reaches it. Restarting **flagd** under an already-connected checkout does *not* cause this:
+the same experiment's `flagd-restart` scenario was not reproduced.
+
+**Operating rule:** after any stack start or recovery in which flagd may have come up
+late, restart checkout once flagd is listening (`scripts/demo.sh restart checkout`). The
+live runner's payment-path preflight refuses a run that is already in this state.
+
 ### Local override for the checkout container
 
 `compose.yaml` pins `checkout` to `memory: 20M` with `GOMEMLIMIT=16MiB`. Under

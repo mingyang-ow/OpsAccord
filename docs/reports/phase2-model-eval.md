@@ -350,3 +350,22 @@ real orders:
 cache stale, so that explanation is refuted. The one candidate left matches the 07:06
 evidence more closely: checkout *starting* while flagd was not yet listening. The script's
 `--scenario startup-race` tests exactly that.
+
+### The stale flag: root cause reproduced
+
+The `startup-race` scenario
+([result](phase2/flag-staleness-startup-race-20261018T133110.json)), run by the user on
+2026-10-18:
+
+| Phase | Flag on | Flag off | Checkout follows? |
+| --- | --- | --- | --- |
+| 1. control, healthy stack | 500 x3 | ok x3 | yes |
+| 2. **checkout started while flagd was down** | 500 x3 | **500 x3** | **no** |
+| 3. after restarting checkout | 500 x3 | ok x3 | yes |
+
+**Verdict: reproduced.** A checkout that starts before flagd is listening resolves the
+first value it asks for, here `on`, but never subscribes to changes, so `off` never
+reaches it. This is exactly the 07:06 incident: flagd and checkout restarted together,
+with checkout up about 3 s first. The operating rule (restart checkout once flagd is
+listening) and the preflight that catches the state are in
+[astronomy-shop.md](../astronomy-shop.md).

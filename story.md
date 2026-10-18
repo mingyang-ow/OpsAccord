@@ -536,3 +536,14 @@ never contained one, and a history audit confirmed it.
   flagd under a running checkout did not break anything. *Decision:* do not keep the old
   explanation just because it was written down. Test the remaining candidate, a checkout
   that starts while flagd is down, with the same experiment.
+
+**The stale flag, proven.** The second experiment reproduced it. A checkout that starts
+while flagd is down still reads the first flag value, but never subscribes to updates, so
+it keeps that value until it restarts. That is exactly what happened at 07:06.
+*Decision:* document the operating rule (restart checkout once flagd is up) and keep the
+payment-path preflight as the safety net. I did not add a startup-ordering change to the
+demo's compose file: the override changes resource limits only, and keeping the pinned
+demo's behaviour intact is worth more than automating one restart.
+
+*Lesson worth keeping:* the first, plausible explanation was wrong. Writing it down as
+"likely" rather than as fact, and then testing it, is what found the real cause.
